@@ -5,6 +5,7 @@ import json
 import os
 from torchvision import transforms
 
+# 2 clients and 2 tasks (50 classes per task)
 def setup_cifar100_continual_federated(
     root='./data', 
     num_clients=2,      # CHANGED: Set to 2 Clients
