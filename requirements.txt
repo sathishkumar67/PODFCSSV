@@ -7,3 +7,5 @@ numpy
 timm
 scikit-learn
 tqdm
+transformers
+Pillow
