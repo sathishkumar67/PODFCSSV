@@ -1,163 +1,308 @@
+from __future__ import annotations
 import torch
-import torch.nn.functional as F
-import numpy as np
-from sklearn.cluster import KMeans
-from typing import Tuple, List, Optional
+import torch.nn as nn
+from typing import Optional, Tuple, Union, List, Any
+from transformers import PreTrainedModel, ViTMAEForPreTraining
 
-class LocalPrototypeManager:
+
+
+class IBA_Adapter(nn.Module):
     """
-    Manages local prototypes (centroids) for a specific client or node.
+    Information-Bottlenecked Adapter (IBA) module.
+
+    This module implements a bottleneck architecture (Down-project -> Activation -> Up-project)
+    inserted into frozen networks to introduce trainable parameters for efficient adaptation.
     
-    This class handles the initialization, storage, and updating of prototype 
-    vectors based on feature embeddings. It uses K-Means clustering to 
-    identify representative prototypes from the data.
+    Architecture:
+        Input [B, L, D] -> Linear(D, d) -> Activation -> Linear(d, D) -> Dropout -> + Residual
+    
+    Key Design Principles:
+        1. **Bottleneck**: Compresses information to force the model to learn efficient features.
+        2. **Identity Initialization**: The up-projection is initialized to zero, ensuring 
+        the adapter starts as an identity function (Adapter(x) = 0). This prevents 
+        "semantic shock" to the pre-trained backbone at the start of training.
 
     Attributes:
-        K (int): The number of prototypes to maintain.
-        alpha_ema (float): The decay rate for Exponential Moving Average updates.
-        novelty_threshold (float): Threshold distance to consider an embedding 'novel'.
-        embedding_dim (int): The dimensionality of the feature embeddings.
-        prototypes (Optional[torch.Tensor]): The current prototype vectors [K, embedding_dim].
-        prototype_counts (Optional[torch.Tensor]): The number of samples assigned to each prototype [K].
-        novelty_buffer (List[torch.Tensor]): A buffer to store embeddings detected as novel.
+        input_dim (int): Original hidden dimension.
+        bottleneck_dim (int): Compressed dimension.
+        down_project (nn.Linear): Dimensionality reduction layer.
+        activation (nn.Module): Non-linear activation function.
+        up_project (nn.Linear): Dimensionality restoration layer.
+        dropout (nn.Dropout): Regularization layer.
     """
 
     def __init__(
         self, 
-        K: int = 20, 
-        alpha_ema: float = 0.1, 
-        novelty_threshold: float = 0.4, 
-        embedding_dim: int = 768
-    ):
+        input_dim: int, 
+        bottleneck_dim: int = 64, 
+        dropout: float = 0.0,
+        activation: nn.Module = nn.GELU()
+    ) -> None:
         """
-        Initializes the LocalPrototypeManager.
+        Initializes the IBA Adapter.
 
         Args:
-            K (int): Number of prototypes (clusters). Defaults to 20.
-            alpha_ema (float): Momentum factor for EMA updates (0 < alpha < 1). Defaults to 0.1.
-            novelty_threshold (float): Cosine distance threshold for novelty detection. Defaults to 0.4.
-            embedding_dim (int): Size of the embedding vector. Defaults to 768.
+            input_dim (int): The hidden dimension of the backbone model (e.g., 768 for ViT-Base).
+            bottleneck_dim (int): The reduced dimension for the bottleneck. Lower values 
+                compress information more (Information Bottleneck principle). Defaults to 64.
+            dropout (float): Dropout probability applied after the up-projection. Defaults to 0.0.
+            activation (nn.Module): Activation function to use between projections. Defaults to GELU.
         """
-        self.K = K
-        self.alpha_ema = alpha_ema
-        self.novelty_threshold = novelty_threshold
-        self.embedding_dim = embedding_dim
+        super().__init__()
+        self.input_dim = input_dim
+        self.bottleneck_dim = bottleneck_dim
+        self.activation = activation
+
+        # Down-projection: Compress semantic information
+        self.down_project = nn.Linear(input_dim, bottleneck_dim)
         
-        # State variables
-        self.prototypes: Optional[torch.Tensor] = None
-        self.prototype_counts: Optional[torch.Tensor] = None
-        self.novelty_buffer: List[torch.Tensor] = []
-    
-    def compute_local_prototypes_kmeans(
+        # Up-projection: Reconstruct features for the next layer
+        self.up_project = nn.Linear(bottleneck_dim, input_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """
+        Applies specific initialization strategies to ensure stable training start.
+        """
+        # 1. Kaiming Normal for down_project to maintain variance through the non-linearity.
+        nn.init.kaiming_normal_(self.down_project.weight, nonlinearity='linear')
+        
+        # 2. Zeros for up_project. This ensures the adapter output is initially 0.
+        #    result = Input + 0. This preserves the pre-trained behavior exactly.
+        nn.init.zeros_(self.up_project.weight)
+        if self.up_project.bias is not None:
+            nn.init.zeros_(self.up_project.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the adapter.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape [Batch_Size, Seq_Len, Hidden_Dim].
+
+        Returns:
+            torch.Tensor: Adapted features of the same shape as input.
+        """
+        residual = x
+        
+        # Bottleneck compression
+        x = self.down_project(x)
+        x = self.activation(x)
+        
+        # Note: Variational noise injection (e.g., for Zeus/V4 methods) 
+        # would typically be applied here if probabilistic modeling is desired.
+        
+        # Reconstruction & Regularization
+        x = self.up_project(x)
+        x = self.dropout(x)
+        
+        # Residual connection preserves original features while adding adaptation
+        return residual + x
+
+    def __repr__(self) -> str:
+        """Custom string representation for easier debugging."""
+        return f"IBA_Adapter(in={self.input_dim}, btl={self.bottleneck_dim})"
+
+
+class ViTBlockWithAdapter(nn.Module):
+    """
+    Wrapper class to inject an Adapter into a Hugging Face ViTLayer.
+
+    It intercepts the output of the original frozen block, passes the hidden states
+    through the adapter, and repackages the output to match Hugging Face's 
+    return signature exactly.
+    """
+
+    def __init__(self, original_block: nn.Module, adapter: IBA_Adapter) -> None:
+        """
+        Args:
+            original_block (nn.Module): The original, frozen Transformer block.
+            adapter (IBA_Adapter): The trainable adapter instance.
+        """
+        super().__init__()
+        self.original_block = original_block
+        self.adapter = adapter
+
+    def forward(
         self, 
-        embeddings: torch.Tensor, 
-        K: int = 20
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_states: torch.Tensor, 
+        head_mask: Optional[torch.Tensor] = None, 
+        output_attentions: bool = False,
+        **kwargs: Any
+    ) -> Union[Tuple[torch.Tensor], Tuple[torch.Tensor, Any]]:
         """
-        Computes local prototypes using K-Means clustering on the provided embeddings.
+        Forward pass matching standard Hugging Face ViTLayer signature.
         
-        This method normalizes embeddings (forcing spherical K-Means behavior),
-        performs clustering using Scikit-Learn, and calculates the mean vector
-        for each cluster.
-
         Args:
-            embeddings (torch.Tensor): Input tensor of shape [N, embedding_dim].
-            K (int): The number of clusters to form. Defaults to 20.
-        
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: 
-                - prototypes: Tensor of shape [K, embedding_dim].
-                - counts: Tensor of shape [K] containing sample counts per cluster.
-        
-        Raises:
-            ValueError: If the input embeddings tensor is empty.
-        """
-        if embeddings.numel() == 0:
-            raise ValueError("Embeddings tensor is empty. Cannot compute prototypes.")
+            hidden_states (torch.Tensor): Input tensor.
+            head_mask (Optional[torch.Tensor]): Mask for attention heads.
+            output_attentions (bool): Whether to return attention weights.
+            **kwargs: Additional arguments required by specific HF implementations.
 
-        # Ensure we don't try to find more clusters than samples
-        num_samples = embeddings.size(0)
-        actual_K = min(K, num_samples)
-        
-        # Capture the device to ensure outputs match input device
-        device = embeddings.device
-        
-        # 1. Normalize embeddings (L2 norm) so they lie on the hypersphere.
-        # This allows K-Means (Euclidean distance) to approximate Cosine Similarity.
-        embeddings_norm = F.normalize(embeddings, dim=1)
-        
-        # 2. Perform K-means clustering (requires CPU numpy array)
-        # using 'k-means++' for better initialization.
-        embeddings_np = embeddings_norm.detach().cpu().numpy()
-        
-        kmeans = KMeans(
-            n_clusters=actual_K, 
-            init='k-means++',
-            n_init=10, 
-            random_state=42
+        Returns:
+            Tuple containing the modified hidden state and optional attention weights.
+        """
+        # 1. Run the original frozen ViT Block
+        # HF blocks typically return a tuple: (hidden_states, attention_weights (optional), ...)
+        outputs = self.original_block(
+            hidden_states, 
+            head_mask=head_mask, 
+            output_attentions=output_attentions,
+            **kwargs
         )
-        labels = kmeans.fit_predict(embeddings_np)
         
-        # 3. Compute cluster means (Prototypes)
-        prototypes_list = []
-        counts_list = []
+        # 2. Extract Hidden States (Always the first element in HF ViT)
+        # Handle cases where output might be a Tuple or a ModelOutput object
+        if isinstance(outputs, tuple):
+            x = outputs[0]
+        else:
+            x = outputs.hidden_states if hasattr(outputs, "hidden_states") else outputs[0]
         
-        # Convert labels back to tensor for masking
-        labels_tensor = torch.tensor(labels, device=device)
+        # 3. Apply the IBA Adapter
+        x = self.adapter(x)
         
-        for k in range(K):
-            if k < actual_K:
-                mask = (labels_tensor == k)
-                count = mask.sum().item()
-                
-                if count > 0:
-                    # Calculate mean of assigned embeddings
-                    proto = embeddings_norm[mask].mean(dim=0)
-                    # Re-normalize to maintain unit length
-                    proto = F.normalize(proto, dim=0)
-                    
-                    prototypes_list.append(proto)
-                    counts_list.append(count)
-                else:
-                    # Handle empty cluster (rare with k-means++, but possible)
-                    prototypes_list.append(self._get_random_prototype(device))
-                    counts_list.append(0)
-            else:
-                # If N < K, fill remaining slots with random initialized vectors
-                prototypes_list.append(self._get_random_prototype(device))
-                counts_list.append(0)
-        
-        # Stack lists into tensors
-        self.prototypes = torch.stack(prototypes_list)       # [K, embedding_dim]
-        self.prototype_counts = torch.tensor(counts_list, device=device) # [K]
-        
-        return self.prototypes, self.prototype_counts
+        # 4. Repackage output to maintain compatibility with HF pipeline
+        if isinstance(outputs, tuple):
+            # Reconstruct the tuple with the adapted hidden state
+            return (x,) + outputs[1:]
+        else:
+            # If it was a ModelOutput object (unlikely for a single layer, but safer),
+            # we simply return the tuple approximation as this is what the parent block expects.
+            return (x,)
+
+
+def inject_adapters(model: PreTrainedModel, bottleneck_dim: int = 64) -> PreTrainedModel:
+    """
+    Injects IBA Adapters into the Encoder of a ViTMAE (or similar) model.
+
+    This function performs the following operations:
+    1. Freezes all existing parameters in the model.
+    2. Identifies the Encoder layers.
+    3. Wraps each layer with `ViTBlockWithAdapter`.
+    4. Unfreezes ONLY the new Adapter parameters.
+
+    Args:
+        model (PreTrainedModel): The Hugging Face ViTMAE model instance.
+        bottleneck_dim (int): Dimension of the adapter bottleneck.
+
+    Returns:
+        PreTrainedModel: The modified model with adapters injected.
     
-    def initialize_from_first_batch(self, embeddings: torch.Tensor) -> None:
-        """
-        Initializes prototypes using the first available batch of data.
+    Raises:
+        AttributeError: If the model structure does not match standard ViT hierarchies.
+    """
+    print(f"\n{'='*60}")
+    print(f"[System] Starting Adapter Injection Procedure")
+    print(f"{'='*60}")
 
-        Args:
-            embeddings (torch.Tensor): A batch of embeddings [N, embedding_dim].
-        """
-        # Validate dimensionality
-        if embeddings.shape[1] != self.embedding_dim:
-            raise ValueError(
-                f"Embedding dim mismatch. Expected {self.embedding_dim}, "
-                f"got {embeddings.shape[1]}"
-            )
-
-        self.compute_local_prototypes_kmeans(embeddings, K=self.K)
-
-    def _get_random_prototype(self, device: torch.device) -> torch.Tensor:
-        """
-        Helper method to generate a random normalized prototype.
+    # 1. Freeze the entire model backbone
+    print("[Config] Freezing original backbone parameters...")
+    for param in model.parameters():
+        param.requires_grad = False
         
-        Args:
-            device (torch.device): The device to place the tensor on.
+    # 2. Locate the Encoder
+    # We verify structure to prevent runtime errors later
+    if hasattr(model, "vit") and hasattr(model.vit, "encoder"):
+        # Standard ViTMAE structure
+        encoder = model.vit.encoder
+        config = model.config
+    elif hasattr(model, "encoder") and hasattr(model.encoder, "layer"):
+        # Generic BERT/ViT structure fallback
+        encoder = model.encoder
+        config = model.config
+    else:
+        raise AttributeError(
+            "Could not locate 'encoder.layer'. "
+            "Model structure unknown (expected 'vit.encoder' or 'encoder')."
+        )
 
-        Returns:
-            torch.Tensor: Normalized random vector of shape [embedding_dim].
-        """
-        rand_proto = torch.randn(self.embedding_dim, device=device)
-        return F.normalize(rand_proto, dim=0)
+    input_dim = config.hidden_size
+    num_layers = len(encoder.layer)
+
+    print(f"[Config] Model Config: Hidden Dim={input_dim}, Layers={num_layers}")
+    print(f"[Config] Adapter Config: Bottleneck Dim={bottleneck_dim}")
+
+    # 3. Iterate and Replace
+    print("[Action] Injecting adapters into encoder layers...")
+    
+    for i, layer in enumerate(encoder.layer):
+        # Instantiate the adapter
+        adapter = IBA_Adapter(input_dim=input_dim, bottleneck_dim=bottleneck_dim)
+        
+        # CRITICAL: Ensure adapter is on the same device and dtype as the layer it wraps.
+        # This handles cases where the model is already on GPU or in FP16/BF16.
+        ref_param = next(layer.parameters())
+        adapter.to(device=ref_param.device, dtype=ref_param.dtype)
+        
+        # Wrap the original layer
+        wrapped_layer = ViTBlockWithAdapter(original_block=layer, adapter=adapter)
+        
+        # Mutate the ModuleList in-place
+        encoder.layer[i] = wrapped_layer
+        
+        # Simple progress indicator for large models
+        if (i + 1) % 4 == 0 or (i + 1) == num_layers:
+            print(f"  -> Processed layer {i + 1}/{num_layers}")
+
+    print(f"[System] Injection Complete. Decoder layers ignored (if present).")
+    
+    # 4. Verification of Trainable Parameters
+    count_trainable_params(model)
+    
+    return model
+
+
+def count_trainable_params(model: nn.Module) -> None:
+    """
+    Utility to calculate and print the count of frozen vs trainable parameters.
+    
+    Args:
+        model (nn.Module): The model to audit.
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+    
+    ratio = (trainable_params / total_params) * 100 if total_params > 0 else 0
+    
+    print(f"\n[Stats] Parameter Audit:")
+    print(f"  - Total Parameters:     {total_params:,}")
+    print(f"  - Frozen Backbone:      {frozen_params:,}")
+    print(f"  - Trainable (Adapters): {trainable_params:,}")
+    print(f"  - Trainable Ratio:      {ratio:.2f}%")
+    print(f"{'='*60}\n")
+
+
+# =============================================================================
+# Main Execution Block (For Testing)
+# =============================================================================
+if __name__ == "__main__":
+    # Simulate loading a model (mocking correct behavior if transformers is installed)
+    print("[Main] Loading pre-trained ViTMAE...")
+    try:
+        # NOTE: Requires `pip install transformers`
+        model = ViTMAEForPreTraining.from_pretrained("facebook/vit-mae-base")
+        
+        # Inject Adapters
+        model = inject_adapters(model, bottleneck_dim=64)
+        
+        # Sanity Check: Forward pass
+        print("[Main] Running dummy forward pass to verify graph integrity...")
+        dummy_input = torch.randn(1, 3, 224, 224)
+        
+        # Move inputs to same device as model
+        device = next(model.parameters()).device
+        dummy_input = dummy_input.to(device)
+        
+        # Forward pass (ensure gradients flow through adapters)
+        output = model(dummy_input)
+        
+        loss_val = output.loss.item() if hasattr(output, "loss") else "N/A"
+        print(f"[Success] Forward pass complete. Loss: {loss_val}")
+        
+    except ImportError:
+        print("[Error] 'transformers' library not found. Please install it to run this test.")
+    except Exception as e:
+        print(f"[Error] An error occurred during execution: {e}")

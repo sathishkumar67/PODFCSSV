@@ -4,6 +4,8 @@ import numpy as np
 from sklearn.cluster import KMeans
 from typing import Tuple, List, Optional
 
+
+
 class LocalPrototypeManager:
     """
     Manages local prototypes (centroids) for a specific client or node.
