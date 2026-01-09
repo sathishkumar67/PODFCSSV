@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from typing import List, Dict, Tuple, Any, Optional
 
+
 # Assuming LocalPrototypeManager and ExperienceReplayBuffer are imported from previous cells
 # from modules import LocalPrototypeManager, ExperienceReplayBuffer 
 
@@ -78,6 +79,88 @@ class ClientNode:
             lr=config.get('lr', 0.001)
         )
 
+    @torch.no_grad()
+    def align_prototypes_to_global(
+        self, 
+        global_prototypes: torch.Tensor, 
+        global_confidence: torch.Tensor
+    ) -> Dict[str, Any]:
+        """
+        Client Alignment (Passive Phase).
+        
+        Performs "Semantic Translation" by aligning local representations to the 
+        global shared space. This step calculates the nearest global prototype 
+        for every local prototype.
+
+        Purpose:
+        - Establishes a mapping: Local_Proto_ID -> Global_Proto_ID.
+        - Allows the client to know "what the server thinks this concept looks like."
+        - Prepares metadata for the upcoming active training phase (distillation).
+        
+        Process:
+        1. Normalize vectors.
+        2. Compute Cosine Similarity Matrix [K_local, K_global].
+        3. Assign each local prototype to its nearest global neighbor (Argmax).
+        
+        Args:
+            global_prototypes (torch.Tensor): Tensor of shape [K_global, Embedding_Dim].
+            global_confidence (torch.Tensor): Confidence scores of global prototypes [K_global].
+            
+        Returns:
+            Dict[str, Any]: The alignment metadata dictionary.
+        """
+        # 1. Validation and Safety Checks
+        if self.prototype_manager.prototypes is None:
+            print(f"[Client {self.client_id}] Warning: No local prototypes found. Skipping alignment.")
+            return {}
+
+        local_protos = self.prototype_manager.prototypes
+        
+        # 2. Device Management
+        # Global prototypes likely arrived from CPU (server broadcast). 
+        # We must move them to the client's device (GPU) for matrix multiplication.
+        global_protos_device = global_prototypes.to(self.device)
+        global_conf_device = global_confidence.to(self.device)
+        
+        # Verify dimensions
+        if local_protos.shape[1] != global_protos_device.shape[1]:
+            raise ValueError(
+                f"Dimension mismatch: Local {local_protos.shape} vs Global {global_protos_device.shape}"
+            )
+
+        # 3. Compute Similarity Matrix (Cosine Similarity)
+        # Formula: (A . B^T) / (|A| * |B|)
+        # Since we normalize first, this becomes just matrix multiplication.
+        local_norm = F.normalize(local_protos, dim=1)
+        global_norm = F.normalize(global_protos_device, dim=1)
+        
+        # Matrix Multiplication: [K_local, Dim] @ [Dim, K_global] -> [K_local, K_global]
+        similarity_matrix = torch.mm(local_norm, global_norm.T)
+        
+        # 4. Find Best Matches (Nearest Neighbor)
+        # For each local prototype (row), find column with max similarity
+        best_similarity, best_global_idx = similarity_matrix.max(dim=1)
+        
+        # 5. Store Alignment Metadata
+        # We store this in the client state for use in the Loss Function (Step 5)
+        self.prototype_alignment = {
+            'local_to_global_idx': best_global_idx,  # [K_local] (Indices)
+            'similarity_scores': best_similarity,    # [K_local] (Values 0.0 to 1.0)
+            'global_confidence': global_conf_device, # [K_global] (Reference)
+            'global_prototypes': global_protos_device # Store for distillation loss
+        }
+        
+        # Logging statistics
+        avg_sim = best_similarity.mean().item()
+        min_sim = best_similarity.min().item()
+        
+        print(f"[Client {self.client_id}] Alignment Complete:")
+        print(f"  - Mapped {len(local_protos)} local -> {len(global_protos_device)} global prototypes")
+        print(f"  - Similarity stats: Mean={avg_sim:.3f}, Min={min_sim:.3f}")
+        
+        return self.prototype_alignment
+
+    
     def train_round_1(
         self
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
@@ -88,7 +171,7 @@ class ClientNode:
         1. Feature Extraction: Pass all data through the frozen backbone to get embeddings.
         2. Prototype Initialization: Use K-Means on these embeddings to create local prototypes.
         3. Adapter Training: Train only the adapters using MAE Reconstruction Loss.
-           (Note: No prototype-based loss is used in Round 1 as global prototypes don't exist yet).
+        (Note: No prototype-based loss is used in Round 1 as global prototypes don't exist yet).
         
         Returns:
             local_prototypes (torch.Tensor): [K, Dim]
@@ -231,3 +314,19 @@ def federated_round_1(
             continue
 
     return all_local_protos, all_proto_counts, all_updates
+
+
+
+def client_alignment_phase(
+    client: ClientNode, 
+    global_prototypes: torch.Tensor, 
+    global_confidence: torch.Tensor
+) -> Dict[str, Any]:
+    """
+    Wrapper function to execute Step 4 for a specific client.
+    """
+    try:
+        return client.align_prototypes_to_global(global_prototypes, global_confidence)
+    except Exception as e:
+        print(f"[Error] Alignment failed for Client {client.client_id}: {e}")
+        return {}
