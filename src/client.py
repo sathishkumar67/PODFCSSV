@@ -330,3 +330,85 @@ def client_alignment_phase(
     except Exception as e:
         print(f"[Error] Alignment failed for Client {client.client_id}: {e}")
         return {}
+    
+    
+class ClientTrainingRound2Plus:
+    """
+    STEP 5: Complete Round 2+ training with active memory
+    """
+    
+    def train_continual_round(self, round_id, task_id, global_model, 
+                             global_prototypes, global_counts, 
+                             global_confidence):
+        """
+        Train on round ≥ 2 with prototype-guided distillation
+        """
+        
+        # Update model from server
+        self.model.load_state_dict(global_model)
+        
+        # Store global prototypes
+        self.global_prototypes = global_prototypes
+        self.global_confidence = global_confidence
+        
+        # Optimizer
+        optimizer = torch.optim.Adam(
+            [p for name, p in self.model.named_parameters() if 'adapter' in name],
+            lr=0.001
+        )
+        
+        # Loss functions
+        ce_loss = nn.CrossEntropyLoss()
+        proto_loss_fn = GatedPrototypeDistillationLoss(
+            temperature=0.07,
+            distillation_weight=0.5,
+            gating_type='soft_sigmoid',  # Soft gating (RECOMMENDED)
+            tau_threshold=0.5
+        )
+        
+        # Curriculum learning: warm-up prototype loss weight
+        if round_id < 5:
+            lambda_proto = 0.1 * (round_id / 5.0)  # Gradually introduce
+        else:
+            lambda_proto = 1.0  # Full weight after warmup
+        
+        # Training loop
+        num_epochs = self.config['local_epochs']
+        
+        for epoch in range(num_epochs):
+            for batch_idx, (images, labels) in enumerate(self.local_loader):
+                images, labels = images.to(self.device), labels.to(self.device)
+                
+                # Forward pass with prototype assignment
+                results = forward_with_prototype_assignment(
+                    self, images, global_prototypes
+                )
+                
+                embeddings = results['embeddings']
+                logits = results['logits']
+                best_similarity = results['best_similarity']
+                
+                # Loss 1: Standard classification loss (if labels available)
+                # In unsupervised case, can use pseudo-labels or skip
+                L_ce = ce_loss(logits, labels)
+                
+                # Loss 2: Gated Prototype Distillation Loss (NOVEL)
+                L_proto, gate_weights = proto_loss_fn(
+                    embeddings, best_similarity, global_prototypes,
+                    global_confidence, global_counts, task_id
+                )
+                
+                # Combined loss with curriculum scheduling
+                L_total = L_ce + lambda_proto * L_proto
+                
+                optimizer.zero_grad()
+                L_total.backward()
+                optimizer.step()
+                
+                # Logging
+                if batch_idx % 50 == 0:
+                    print(f"[Client {self.client_id}] Round {round_id} Epoch {epoch} "
+                        f"L_ce: {L_ce.item():.4f} L_proto: {L_proto.item():.4f} "
+                        f"gate: {gate_weights.mean().item():.3f}")
+        
+        return self.model.state_dict()
