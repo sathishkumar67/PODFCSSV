@@ -246,4 +246,4 @@ def consolidate_prototypes(server):
         server.task_per_prototype = server.task_per_prototype[active_mask]
         
         print(f"[Server] Consolidated prototypes: "
-              f"{len(server.global_prototypes)} → {active_mask.sum()}")
+            f"{len(server.global_prototypes)} → {active_mask.sum()}")
