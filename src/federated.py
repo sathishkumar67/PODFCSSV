@@ -5,20 +5,47 @@ import os
 
 def setup_distributed(rank, world_size):
     """Initialize process group"""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+    import tempfile
+    import platform
+    from pathlib import Path
     
-    # Initialize Process Group
-    backend = "gloo" if os.name == 'nt' else "nccl"
+    # Force GLOO to use loopback on Windows to avoid 'unsupported device' error
+    if platform.system() == 'Windows':
+        # Try to find loopback interface name if possible, or usually it's Loopback Pseudo-Interface 1
+        # Or just let Gloo default but safer with file init
+        pass 
+
+    # Shared file for initialization (Robust on Windows/CI)
+    init_file = Path(tempfile.gettempdir()) / "gloo_shared_init"
+    # Ensure no old file if we are the first to run (though concurrency makes this racy)
+    # But init_process_group handles it mostly.
+    
+    # URL format: file:///C:/path/to/file
+    # On Windows: file:///C:/...
+    init_method = f"file:///{init_file.absolute().as_posix()}"
+    
+    backend = "gloo" 
+    # Use gloo for compatibility unless user strongly prefers nccl.
+    # On Windows, gloo is safest for CPU/GPU hybrid logic.
+    
     try:
-        # Try NCCL if available (even on Windows with newer torch)
-        if torch.cuda.is_available():
-             dist.init_process_group("nccl", rank=rank, world_size=world_size)
-        else:
-             dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        if rank == 0 and os.path.exists(init_file):
+             try:
+                 os.remove(init_file)
+             except:
+                 pass
+        
+        torch.distributed.init_process_group(
+            backend=backend,
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size
+        )
     except Exception as e:
-        print(f"Failed to init {backend} or nccl: {e}. Fallback to gloo.")
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        print(f"File init failed: {e}. Trying env:// with localhost...")
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '12355'
+        torch.distributed.init_process_group(backend, rank=rank, world_size=world_size)
         
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
@@ -91,28 +118,41 @@ def aggregate_prototypes(local_protos, local_counts, rank, world_size, embedding
              
     return gathered_protos, gathered_counts
 
-def broadcast_global_prototypes(global_protos, rank, embedding_dim=768, device='cuda'):
+def broadcast_global_prototypes(tensor, rank, device='cuda'):
     """
-    Broadcast [M, D] tensor from Rank 0 to all.
+    Generic broadcast for prototypes or confidences.
     """
-    # 1. Broadcast validity/size
+    # 1. Broadcast validity/size/shape
     if rank == 0:
-        if global_protos is None:
-             size = torch.tensor([0], device=device, dtype=torch.long)
+        if tensor is None:
+             shape_tensor = torch.tensor([0], device=device, dtype=torch.long)
         else:
-             size = torch.tensor([global_protos.size(0)], device=device, dtype=torch.long)
+             # Send dimensionality and shape
+             # We assume < 0 means None/Empty?
+             # Let's just send number of dimensions, then shape.
+             dim_count = torch.tensor([tensor.dim()], device=device, dtype=torch.long)
+             shape_tensor = torch.tensor(tensor.shape, device=device, dtype=torch.long)
     else:
-        size = torch.tensor([0], device=device, dtype=torch.long)
+        dim_count = torch.tensor([0], device=device, dtype=torch.long)
+        # We don't know shape size yet
         
-    dist.broadcast(size, src=0)
+    # Broadcast dim count first
+    dist.broadcast(dim_count, src=0)
+    ndim = dim_count.item()
     
-    M = size.item()
-    if M == 0:
-         return torch.zeros(0, embedding_dim, device=device)
-
-    # 2. Broadcast data
+    if ndim == 0:
+         return None # Or empty tensor? 
+         
     if rank != 0:
-        global_protos = torch.zeros(M, embedding_dim, device=device)
+         shape_tensor = torch.zeros(ndim, device=device, dtype=torch.long)
+         
+    dist.broadcast(shape_tensor, src=0)
+    
+    # 2. Broadcast data
+    shape = list(shape_tensor.cpu().numpy())
+    
+    if rank != 0:
+        tensor = torch.zeros(*shape, device=device)
         
-    dist.broadcast(global_protos, src=0)
-    return global_protos
+    dist.broadcast(tensor, src=0)
+    return tensor

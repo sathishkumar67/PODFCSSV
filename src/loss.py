@@ -3,79 +3,93 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class GatedDistillationLoss(nn.Module):
-    def __init__(self, temperature=0.07, tau_base=0.5, lambda_entropy=0.1):
+class GPADLoss(nn.Module):
+    def __init__(self, 
+                 base_tau=0.5, 
+                 temp_gate=0.1, 
+                 lambda_entropy=0.1):
+        """
+        Gated Prototype Anchored Distillation (GPAD) Loss.
+        """
         super().__init__()
-        self.temperature = temperature
-        self.tau_base = tau_base
+        self.base_tau = base_tau
+        self.temp_gate = temp_gate
         self.lambda_entropy = lambda_entropy
 
-    def forward(self, embeddings, prototypes):
+    def forward(self, embeddings, global_prototypes, global_confidences):
         """
         Args:
-            embeddings: [Batch, D]
-            prototypes: [M, D] global prototypes
+            embeddings: [B, D]
+            global_prototypes: [M, D]
+            global_confidences: [M] (raw counts)
             
         Returns:
             loss: scalar
         """
-        if prototypes is None or prototypes.numel() == 0:
+        if global_prototypes is None or global_prototypes.numel() == 0:
             return torch.tensor(0.0, device=embeddings.device)
             
+        B = embeddings.size(0)
+        M = global_prototypes.size(0)
+        
         # 1. Normalize
-        z_norm = F.normalize(embeddings, p=2, dim=1)
-        p_norm = F.normalize(prototypes, p=2, dim=1)
+        z = F.normalize(embeddings, p=2, dim=1)
+        p = F.normalize(global_prototypes, p=2, dim=1)
         
-        # 2. Similarity [Batch, M]
-        sims = torch.mm(z_norm, p_norm.t())
+        # 2. Similarity [B, M]
+        sims = torch.mm(z, p.t())
         
-        # 3. Best matches
-        max_sim, best_idx = sims.max(dim=1)
+        # 3. Soft Assignment & Entropy
+        # Softmax over similarities? Usually with temperature.
+        # User says: "forms a soft assignment... (via a softmax)"
+        softmax_all = F.softmax(sims / 0.1, dim=1) # Fixed temp for assignment?
+        entropy = -torch.sum(softmax_all * torch.log(softmax_all + 1e-8), dim=1) # [B]
         
-        # 4. Entropy calculation for adaptive gating
-        # P(z belongs to k) ~ exp(sim)
-        probs = F.softmax(sims / self.temperature, dim=1)
-        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1)
+        # 4. Adaptive Threshold
+        # "base threshold and adding a term proportional to the normalized entropy"
+        # normalizing entropy to [0,1]? Max entropy is log(M).
+        max_ent = torch.log(torch.tensor(float(M)))
+        ent_norm = entropy / (max_ent + 1e-8)
         
-        # 5. Adaptive Threshold
-        tau_adaptive = self.tau_base - self.lambda_entropy * entropy
+        # User: "adding a term proportional... so detailed uncertain assignments face a stricter threshold"
+        # Stricter = Higher threshold.
+        tau_adaptive = self.base_tau + self.lambda_entropy * ent_norm # [B]
         
-        # 6. Gate
-        # gate = sigmoid((sim - tau) / T)
-        gate_logits = (max_sim - tau_adaptive) / self.temperature
-        gate = torch.sigmoid(gate_logits)
+        # 5. Best Matches
+        max_sim, best_idx = sims.max(dim=1) # [B]
         
-        # 7. Prototype Loss (MSE/Cosine distance on normalized)
-        # ||z - p||^2 = 2 - 2*cos(z,p)
-        # We minimize dist => maximize cos => minimize -cos
-        # loss = gate * (2 - 2*max_sim)  or simply gate * (1 - max_sim) for direction
+        # 6. Anchored Status
+        # "If max sim < adaptive threshold, non-anchored"
+        is_anchored = (max_sim > tau_adaptive).float() # [B] 0 or 1
         
-        # Using Euclidean distance squared on normalized vectors:
-        # dist_sq = ||z - p||^2 = 2(1 - cos)
+        # 7. Gating Weight
+        # "sigmoid( (sim - threshold) / maybe_temp ) * global_conf * anchored"
+        # Need normalized global confidence?
+        # User: "prototype's global confidence... and a hard anchor indicator"
+        # Let's Use global_confidences[best_idx]
+        if global_confidences is not None and global_confidences.numel() > 0:
+             best_confs = global_confidences[best_idx]
+             max_conf = global_confidences.max()
+             conf_norm = best_confs / (max_conf + 1e-8)
+        else:
+             conf_norm = torch.ones_like(max_sim)
         
+        # Sigmoid part
+        # (sim - threshold)
+        gate_logit = (max_sim - tau_adaptive) 
+        # Scale logit 
+        gate_sigmoid = torch.sigmoid(gate_logit / self.temp_gate)
+        
+        # Final Gate
+        gate = gate_sigmoid * conf_norm * is_anchored # [B]
+        
+        # 8. Anchoring Loss
+        # "squared L2 distance between two normalized vectors = 2(1-cos)"
         dist_sq = 2 * (1 - max_sim)
-        loss = (gate * dist_sq).mean()
+        
+        # Weighted mean
+        # "averages this gated anchoring loss over the mini-batch"
+        loss_per_sample = gate * dist_sq
+        loss = loss_per_sample.mean()
         
         return loss
-
-class TotalLoss(nn.Module):
-    def __init__(self, base_criterion=nn.CrossEntropyLoss(), lambda_proto=1.0):
-        super().__init__()
-        self.base_criterion = base_criterion
-        self.proto_criterion = GatedDistillationLoss()
-        self.lambda_proto = lambda_proto
-        
-    def forward(self, outputs, targets, embeddings, prototypes, round_num=None):
-        ce_loss = self.base_criterion(outputs, targets)
-        
-        # Curriculum learning for lambda
-        curr_lambda = self.lambda_proto
-        if round_num is not None:
-             if round_num < 5:
-                  curr_lambda = 0.1 * round_num / 5.0
-             else:
-                  curr_lambda = 1.0
-                  
-        proto_loss = self.proto_criterion(embeddings, prototypes)
-        
-        return ce_loss + curr_lambda * proto_loss, ce_loss, proto_loss
