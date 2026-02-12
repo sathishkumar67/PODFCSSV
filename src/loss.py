@@ -76,11 +76,9 @@ class GPADLoss(nn.Module):
         gate = gate_sigmoid * is_anchored # [B]
         
         # 8. Anchoring Loss
-        # "squared L2 distance between two normalized vectors = 2(1-cos)"
-        # Why 2? 
-        # L2^2 = ||z - p||^2 = (z-p).(z-p) = z.z + p.p - 2z.p
-        # Since z and p are unit normalized: z.z=1, p.p=1
-        # So ||z - p||^2 = 1 + 1 - 2(z.p) = 2 - 2(cos_sim) = 2(1 - cos_sim)
+        # We multiply by 2 so that the loss value equals the square of the straight-line distance
+        # (Euclidean distance) between the two normalized points.
+        # Without the 2, it would simply be the cosine distance.
         dist_sq = 2 * (1 - max_sim)
         
         # Weighted mean
