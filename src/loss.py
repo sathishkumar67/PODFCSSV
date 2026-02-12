@@ -63,16 +63,8 @@ class GPADLoss(nn.Module):
         is_anchored = (max_sim > tau_adaptive).float() # [B] 0 or 1
         
         # 7. Gating Weight
-        # "sigmoid( (sim - threshold) / maybe_temp ) * global_conf * anchored"
-        # Need normalized global confidence?
-        # User: "prototype's global confidence... and a hard anchor indicator"
-        # Let's Use global_confidences[best_idx]
-        if global_confidences is not None and global_confidences.numel() > 0:
-             best_confs = global_confidences[best_idx]
-             max_conf = global_confidences.max()
-             conf_norm = best_confs / (max_conf + 1e-8)
-        else:
-             conf_norm = torch.ones_like(max_sim)
+        # "sigmoid( (sim - threshold) / maybe_temp ) * anchored"
+        # Removed confidence term as requested.
         
         # Sigmoid part
         # (sim - threshold)
@@ -81,10 +73,14 @@ class GPADLoss(nn.Module):
         gate_sigmoid = torch.sigmoid(gate_logit / self.temp_gate)
         
         # Final Gate
-        gate = gate_sigmoid * conf_norm * is_anchored # [B]
+        gate = gate_sigmoid * is_anchored # [B]
         
         # 8. Anchoring Loss
         # "squared L2 distance between two normalized vectors = 2(1-cos)"
+        # Why 2? 
+        # L2^2 = ||z - p||^2 = (z-p).(z-p) = z.z + p.p - 2z.p
+        # Since z and p are unit normalized: z.z=1, p.p=1
+        # So ||z - p||^2 = 1 + 1 - 2(z.p) = 2 - 2(cos_sim) = 2(1 - cos_sim)
         dist_sq = 2 * (1 - max_sim)
         
         # Weighted mean
