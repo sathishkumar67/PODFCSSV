@@ -1,3 +1,0 @@
-* IBA blocks are not added after the bacbone. It is added after each layer/blocks.
-* IBA is used to filter out noise and extract useful information.
-* When added at the end of the backbone, the noise is already passed. Also, when new drift occurs it changes the adapter dramatically. 
