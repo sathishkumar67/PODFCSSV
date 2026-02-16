@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
@@ -18,12 +19,25 @@ logger = logging.getLogger(__name__)
 
 class FederatedClient:
     """
-    Represents a single independent client in the federated system.
-    
-    Each client manages its own:
-    - Model copy (on its specific device)
-    - Optimizer
-    - Local training loop
+    Simulates a Local Client in the Federated Network.
+
+    Each client possesses a private local dataset (or a slice of the global data) 
+    and trains a copy of the global model. 
+
+    Key Responsibilities:
+    1.  **Phased Training**:
+        -   **Round 1**: Learns purely via Masked Autoencoding (MAE), establishing 
+            a strong self-supervised baseline.
+        -   **Round > 1**: Learns via MAE + GPAD. It uses global prototypes received 
+            from the server to regularize its feature space, preventing it from 
+            drifting too far from the global consensus (Continual Learning).
+
+    2.  **Prototype Generation**:
+        -   After training, it extracts latent features from its data.
+        -   Runs an internal K-Means clustering algorithm to identify 'Local Prototypes'
+            representing the distinct visual concepts found in its private data.
+        -   Sends these prototypes (vectors) to the server, preserving data privacy 
+            (raw images are never shared).
     """
     
     def __init__(
@@ -32,18 +46,30 @@ class FederatedClient:
         model: nn.Module,
         device: torch.device,
         optimizer_cls: type = optim.AdamW,
-        optimizer_kwargs: Dict[str, Any] = None
+        optimizer_kwargs: Dict[str, Any] = None,
+        local_update_threshold: float = 0.7,
+        local_ema_alpha: float = 0.1
     ) -> None:
         """
+        Initialize the Client.
+
         Args:
-            client_id: Unique identifier for the client.
-            model: The base model (will be deep-copied to ensure independence).
-            device: The device (CPU/GPU) where this client's model resides.
-            optimizer_cls: The optimizer class to use (default: AdamW).
-            optimizer_kwargs: Arguments for the optimizer (lr, weight_decay, etc.).
+            client_id (int): Unique identifier.
+            model (nn.Module): The base model architecture (ViT-MAE). 
+                            Ideally, this is a deep copy of the global model.
+            device (torch.device): The hardware device (CPU/GPU) this client runs on.
+            optimizer_cls (type): The class of optimizer to use (default: AdamW).
+            optimizer_kwargs (Dict): Configuration for the local optimizer (lr, weight_decay).
+            local_update_threshold (float): Threshold for updating local prototypes.
+            local_ema_alpha (float): Scaling factor for local EMA update.
         """
         self.client_id = client_id
         self.device = device
+        self.local_update_threshold = local_update_threshold
+        self.local_ema_alpha = local_ema_alpha
+        
+        # Local Prototypes State (Initialized as empty, populated/updated during lifecycle)
+        self.local_prototypes: Optional[torch.Tensor] = None
         
         # 1. Independent Model Copy
         # We deepcopy the base model so that this client's training 
@@ -65,19 +91,19 @@ class FederatedClient:
         gpad_loss_fn: nn.Module = None
     ) -> float:
         """
-        Runs one epoch of local training.
-        
-        Phased Logic:
-        - If global_prototypes is None (Round 1): Train with MAE Reconstruction Loss only.
-        - If global_prototypes is provided (Round > 1): Train with MAE + GPAD Loss.
+        Executes one epoch of local training.
+
+        The loss function changes based on the availability of global prototypes:
+        -   **Initialization Phase (No Prototypes)**: Loss = L_mae
+        -   **Continual Phase (Has Prototypes)**: Loss = L_mae + L_gpad
 
         Args:
-            dataloader: Local data for this client.
-            global_prototypes: Global prototypes (M, D) for GPAD.
-            gpad_loss_fn: Loss function instance for GPAD.
+            dataloader (DataLoader): Local data stream.
+            global_prototypes (Tensor, optional): Global concepts from Server.
+            gpad_loss_fn (nn.Module, optional): The distillation loss module.
 
         Returns:
-            float: Average loss for the epoch.
+            float: Average loss across the epoch.
         """
         self.model.train()
         total_loss = 0.0
@@ -93,8 +119,8 @@ class FederatedClient:
                 inputs = batch.to(self.device).float()
 
             # Forward Pass
-            # We need hidden_states if doing GPAD
-            output_hidden = (global_prototypes is not None)
+            # We need hidden_states if doing GPAD or updating Local Prototypes
+            output_hidden = (global_prototypes is not None) or (self.local_prototypes is not None)
             
             if isinstance(inputs, dict):
                 outputs = self.model(**inputs, output_hidden_states=output_hidden)
@@ -109,15 +135,15 @@ class FederatedClient:
 
             final_loss = mae_loss
 
-            # 2. GPAD Loss (if applicable)
-            if global_prototypes is not None and gpad_loss_fn is not None:
+            # --- Feature Extraction (Shared for GPAD and Local Proto Update) ---
+            embeddings = None
+            if output_hidden:
                 # Extract embeddings from last hidden state
                 if hasattr(outputs, "hidden_states"):
                     hidden = outputs.hidden_states[-1] 
                 elif isinstance(outputs, tuple):
-                    # Check tuple structure for HF models (usually loss, logits, hidden_states...)
-                    # Index depends on specific model return signature
-                    hidden = outputs[-1] # Risky, better to rely on object or attribute
+                    # Check tuple structure for HF models
+                    hidden = outputs[-1] 
                 else:
                     hidden = outputs # Fallback
                 
@@ -126,13 +152,49 @@ class FederatedClient:
                     embeddings = hidden.mean(dim=1)
                 else:
                     embeddings = hidden
-                
+
+            # 2. GPAD Loss (if applicable)
+            if global_prototypes is not None and gpad_loss_fn is not None and embeddings is not None:
                 # Compute GPAD
                 # Ensure global prototypes are on same device
                 protos_device = global_prototypes.to(self.device)
                 gpad = gpad_loss_fn(embeddings, protos_device)
                 
                 final_loss = final_loss + gpad
+
+            # 3. Online Local Prototype Update (Separate Logic)
+            # "Check sim with rest of the local prototypes -> Find Best -> EMA if > Threshold"
+            if self.local_prototypes is not None and embeddings is not None:
+                if self.local_prototypes.device != self.device:
+                    self.local_prototypes = self.local_prototypes.to(self.device)
+
+                with torch.no_grad():
+                    # Normalize for Cosine Similarity
+                    z_norm = F.normalize(embeddings, p=2, dim=1)
+                    p_norm = F.normalize(self.local_prototypes, p=2, dim=1)
+                    
+                    # Compute Similarity Matrix: (B, K_local)
+                    sims = torch.mm(z_norm, p_norm.t())
+                    
+                    # Find Best Matching Prototype per sample
+                    max_sim, best_idx = sims.max(dim=1)
+                    
+                    # Mask: Who passes the fixed threshold?
+                    mask = max_sim > self.local_update_threshold
+                    
+                    # Update Loop for matching samples
+                    indices = torch.where(mask)[0]
+                    if len(indices) > 0:
+                        for idx in indices:
+                            sample_emb = z_norm[idx]
+                            proto_idx = best_idx[idx]
+                            
+                            # EMA Update: Old = (1-a)Old + a*New
+                            old_proto = self.local_prototypes[proto_idx]
+                            updated_proto = (1 - self.local_ema_alpha) * old_proto + self.local_ema_alpha * sample_emb
+                            # In-place update (re-normalization happens next time usually, but let's be safe)
+                            # self.local_prototypes[proto_idx] = F.normalize(updated_proto, p=2, dim=0)
+                            self.local_prototypes[proto_idx] = updated_proto
 
             # Backward Pass
             self.optimizer.zero_grad()
@@ -149,14 +211,19 @@ class FederatedClient:
     @torch.no_grad()
     def generate_prototypes(self, dataloader: DataLoader, K_init: int = 10) -> torch.Tensor:
         """
-        Generates local prototypes using K-Means clustering on feature embeddings.
+        Generates 'Local Prototypes' by clustering the client's feature space.
+
+        Process:
+        1.  Inference: Run the local model on all local data to extract embeddings.
+        2.  Clustering: Perform K-Means on these embeddings to find K centroids.
+        3.  These centroids become the 'Local Prototypes' sent to the server.
 
         Args:
-            dataloader: Data to extract features from.
-            K_init: Number of clusters (prototypes) to form.
+            dataloader (DataLoader): Local data.
+            K_init (int): Number of prototypes to generate.
 
         Returns:
-            torch.Tensor: Local prototypes (K_init, D).
+            torch.Tensor: Local prototypes [K, Dim].
         """
         self.model.eval()
         all_features = []
@@ -209,7 +276,12 @@ class FederatedClient:
         embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
         
         # 3. K-Means Clustering (Simple PyTorch Implementation)
-        return self._kmeans(embeddings, K=K_init)
+        centroids = self._kmeans(embeddings, K=K_init)
+        
+        # Save for next round's online updates
+        self.local_prototypes = centroids.detach().clone()
+        
+        return centroids
 
     def _kmeans(self, X: torch.Tensor, K: int, max_iters: int = 100) -> torch.Tensor:
         """
@@ -258,10 +330,19 @@ class FederatedClient:
 
 class ClientManager:
     """
-    Orchestrator for Multi-GPU Client Simulation.
+    Simulates the Orchestration of Multiple Clients.
     
-    This class handles the initialization and management of multiple FederatedClient 
-    instances, assigning them to available GPUs in a round-robin fashion.
+    In a real FL system, this would be distributed across devices. Here, it manages
+    a list of `FederatedClient` objects and orchestrates their training, effectively
+    simulating the "edge" layer.
+
+    Execution Modes:
+    ----------------
+    1.  **Parallel (GPU)**: If GPUs are available (`gpu_count > 0`), it enforces
+        a strict 1:1 mapping (Client i -> GPU i) and runs training in parallel threads.
+    
+    2.  **Sequential (CPU)**: If no GPUs are available, it runs clients one after 
+        another to avoid the overhead of threading on a single CPU resource.
     """
     
     def __init__(
@@ -271,12 +352,12 @@ class ClientManager:
         gpu_count: int = 0
     ) -> None:
         """
+        Initializes the Client Manager and spawns the clients.
+
         Args:
-            base_model: The generic model architecture to replicate.
-            num_clients: Total number of clients to spawn.
-            gpu_count: Number of GPUs available.
-                    - If 2 GPUs and 4 clients: Clients 0,2 on GPU0; Clients 1,3 on GPU1.
-                    - If 0 GPUs: All clients on CPU.
+            base_model: The initial global model template.
+            num_clients: Total number of clients to simulate.
+            gpu_count: Number of available GPUs.
         """
         self.clients: List[FederatedClient] = []
         self.num_clients = num_clients
@@ -324,20 +405,21 @@ class ClientManager:
         gpad_loss_fn: nn.Module = None
     ) -> List[float]:
         """
-        Triggers one round of local training for all clients.
+        Triggers one round of local training for ALL clients.
         
-        Execution Strategy:
-        - If GPUs > 0: Parallel execution via ThreadPool (1 client per GPU).
-        - If GPUs == 0: Sequential execution on CPU.
+        Dispatch Logic:
+        -   **GPU Available**: Uses `ThreadPoolExecutor` to launch `N` concurrent threads.
+            Since PyTorch releases the GIL for CUDA operations, this achieves true parallelism.
+        -   **CPU Only**: Iterates sequentially. Python threads + CPU compute usually 
+            degrades performance due to GIL contention, so sequential is faster here.
         
         Args:
-            dataloaders: List of DataLoaders, one for each client.
-                        Must match num_clients.
-            global_prototypes: Global prototypes (if r > 1).
-            gpad_loss_fn: GPAD Loss instance (if r > 1).
+            dataloaders: List of DataLoaders (must match num_clients).
+            global_prototypes: The current global prototype bank (for GPAD).
+            gpad_loss_fn: The loss function instance.
 
         Returns:
-            List[float]: Average loss for each client this round.
+            List[float]: The average training loss for each client.
         """
         if len(dataloaders) != self.num_clients:
             raise ValueError(
@@ -382,7 +464,7 @@ class ClientManager:
                         gpad_loss_fn=gpad_loss_fn
                     )
                     round_losses[i] = loss
-                    logger.info(f"Client {client_idx} (CPU) finished. Loss: {loss:.4f}")
+                    logger.info(f"Client {i} (CPU) finished. Loss: {loss:.4f}")
                 except Exception as e:
                     logger.error(f"Client {i} failed: {e}")
                     round_losses[i] = float('nan')

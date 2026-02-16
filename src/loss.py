@@ -8,24 +8,41 @@ class GPADLoss(nn.Module):
     """
     Gated Prototype Anchored Distillation (GPAD) Loss.
 
-    This loss function is designed for Federated Continual Learning scenarios where
-    local models need to learn from global prototypes without catastrophic forgetting.
-    It encourages the local model's embeddings to be close to the best-matching
-    global prototype, but only if the match is sufficiently "confident".
+    This module implements a regularization loss for Federated Continual Learning that
+    prevent catastrophic forgetting by anchoring the local model's latent representations
+    to a set of globally learned prototypes.
 
-    Key Mechanisms:
-    1.  **Adaptive Thresholding**: The matching threshold is dynamic. It increases
-        when the model is uncertain (high entropy in assignment), preventing
-        noisy or ambiguous anchors from distorting the feature space.
-    2.  **Gating**: A soft gating mechanism (sigmoid) scales the loss. If the
-        similarity is marginally above the threshold, the weight is low. If it strongly
-        exceeds the threshold, the weight approaches 1.0.
-    3.  **Anchoring**: For confident samples, the loss minimizes the distance between the
-        embedding and its matched prototype.
+    Mathematical Formulation:
+    -------------------------
+    The loss for a single embedding 'z' is defined as:
+    
+        L_gpad(z) = Gate(z) * Distance(z, v*)
+    
+    Where:
+    - v*: The "best matching" global prototype for z (highest cosine similarity).
+    - Distance(z, v*): Euclidean distance between normalized z and v*.
+    - Gate(z): A soft gating factor in [0, 1] that determines how strongly to enforce this anchor.
+
+    The Gating Mechanism:
+    ---------------------
+    The gate is designed to be high (near 1.0) only when the model is "confident" that 
+    the embedding z truly belongs to prototype v*. It uses an Adaptive Threshold:
+
+        Gate(z) = Sigmoid( (Sim(z, v*) - Threshold) / Temperature )
+
+    The Threshold is not fixed; it adapts based on the uncertainty of the assignment:
+        
+        Threshold = Base_Tau + Lambda * Entropy(z)
+
+    If the assignment is ambiguous (high entropy across all prototypes), the threshold 
+    increases, making it harder for the gate to open. This prevents the model from 
+    learning from noisy or uncertain matches.
     """
     
-    # Constants for numerical stability and configuration
+    # Small constant to prevent division by zero or log(0) errors
     EPSILON: float = 1e-8
+    
+    # Temperature for the softmax used in entropy calculation (controls sharpness of distribution)
     SOFT_ASSIGNMENT_TEMP: float = 0.1
 
     def __init__(self, 
@@ -33,19 +50,19 @@ class GPADLoss(nn.Module):
                 temp_gate: float = 0.1, 
                 lambda_entropy: float = 0.1):
         """
-        Initialize the GPAD Loss.
+        Initialize the GPAD Loss module.
 
         Args:
-            base_tau (float): The base similarity threshold (0 to 1). Matches with
-                            cosine similarity below this value are considered weak.
-                            Default: 0.5.
-            temp_gate (float): Temperature parameter for the sigmoid gating function.
-                            Controls the sharpness of the transition from 0 to 1
-                            around the threshold. Lower values make it sharper.
+            base_tau (float): The minimum similarity required to consider a match "valid" 
+                            in the most confident case (zero entropy). 
+                            Range: [0, 1]. Default: 0.5.
+            temp_gate (float): Temperature scaling for the sigmoid gate. 
+                            Lower values (e.g., 0.01) make the gate a sharp Step Function.
+                            Higher values (e.g., 1.0) make it a smooth transition.
                             Default: 0.1.
-            lambda_entropy (float): Coefficient for the entropy term in the
-                                    adaptive threshold calculation. Higher values
-                                    make the threshold stricter for uncertain samples.
+            lambda_entropy (float): Scaling factor for the uncertainty penalty. 
+                                    A higher lambda means the threshold rises more steeply 
+                                    as the assignment entropy increases.
                                     Default: 0.1.
         """
         super().__init__()
@@ -57,17 +74,25 @@ class GPADLoss(nn.Module):
                 embeddings: torch.Tensor, 
                 global_prototypes: torch.Tensor) -> torch.Tensor:
         """
-        Compute the GPAD loss for a batch of embeddings.
+        Calculates the batch-averaged GPAD loss.
+
+        Process Flow:
+        1. Normalize inputs (embeddings & prototypes) to unit length.
+        2. Compute Cosine Similarity Matrix (Batch x Num_Prototypes).
+        3. Compute Uncertainty (Entropy) for every sample in the batch.
+        4. Derive Adaptive Thresholds for each sample based on its uncertainty.
+        5. Compute Gating Factors comparing best similarity vs threshold.
+        6. Compute Weighted Distance Loss for valid anchors.
 
         Args:
-            embeddings (torch.Tensor): The feature embeddings from the local model.
-                                        Shape: [Batch_Size (B), Embedding_Dim (D)]
-            global_prototypes (torch.Tensor): The global prototypes (centroids) from the global model.
-                                            Shape: [Num_Prototypes (M), Embedding_Dim (D)]
+            embeddings (torch.Tensor): Latent features from the local student model.
+                                    Shape: [Batch_Size, Embedding_Dim]
+            global_prototypes (torch.Tensor): Global concepts from the server.
+                                            Shape: [Num_Prototypes, Embedding_Dim]
 
         Returns:
-            torch.Tensor: A scalar tensor representing the computed loss (mean over batch).
-                        Returns 0.0 if no prototypes are provided.
+            torch.Tensor: Scalar loss value (mean across the batch).        
+                        Returns 0.0 if global_prototypes is empty.
         """ 
         # 1. Normalization & Similarity
         sims = self._compute_similarity_matrix(embeddings, global_prototypes)
@@ -85,8 +110,13 @@ class GPADLoss(nn.Module):
 
     def _compute_similarity_matrix(self, embeddings: torch.Tensor, prototypes: torch.Tensor) -> torch.Tensor:
         """
-        Computes the cosine similarity matrix between embeddings and prototypes.
-        Both inputs are normalized to the unit hypersphere.
+        Computes the cosine similarity matrix.
+        
+        Since inputs are L2-normalized:
+            Cosine Similarity = Dot Product .
+        
+        Returns:
+            torch.Tensor: Similarity matrix of shape [Batch_Size, Num_Prototypes].
         """
         z = F.normalize(embeddings, p=2, dim=1)
         p = F.normalize(prototypes, p=2, dim=1)
@@ -94,8 +124,16 @@ class GPADLoss(nn.Module):
 
     def _compute_adaptive_threshold(self, sims: torch.Tensor) -> torch.Tensor:
         """
-        Calculates the adaptive threshold based on assignment entropy.
-        Higher entropy (uncertainty) leads to a stricter (higher) threshold.
+        Calculates the dynamic similarity threshold for each sample.
+
+        Logic:
+            1. Convert similarities to a probability distribution (Softmax).
+            2. Compute Entropy of this distribution (Measure of ambiguity).
+            3. Normalize entropy to [0, 1] range.
+            4. Threshold = Base + Lambda * Normalized_Entropy.
+        
+        Returns:
+            torch.Tensor: Threshold values of shape [Batch_Size].
         """
         B, M = sims.shape
         # Soft assignment distribution
@@ -105,6 +143,7 @@ class GPADLoss(nn.Module):
         entropy = -torch.sum(softmax_all * torch.log(softmax_all + self.EPSILON), dim=1)
         
         # Normalize entropy relative to max possible entropy: log(M)
+        # This ensures the entropy penalty scale is consistent regardless of bank size.
         max_ent = torch.log(torch.tensor(float(M), device=sims.device))
         ent_norm = entropy / (max_ent + self.EPSILON)
         
@@ -113,37 +152,56 @@ class GPADLoss(nn.Module):
 
     def _compute_gating(self, sims: torch.Tensor, tau_adaptive: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Determines the gating weights for each sample.
+        Determines the gating weight for each sample based on its best match.
+
+        Logic:
+            1. Identify the 'Best Match' (highest similarity prototype).
+            2. Check if Similarity > Adaptive Threshold.
+            3. Apply Sigmoid to the margin (Sim - Threshold) to get a soft weight [0, 1].
+            4. Mask out (set to 0) any samples that strictly fail the threshold check
+            to ensure sparse, high-quality anchoring.
+
         Returns:
-            max_sim (torch.Tensor): Best similarity score for each sample.
-            gate (torch.Tensor): Computed gating weight [0, 1].
+            max_sim (torch.Tensor): The highest cosine similarity score for each sample.
+            gate (torch.Tensor): The final gating weight in [0, 1].
         """
         max_sim, _ = sims.max(dim=1)
         
-        # Binary Anchor Decision: Is similarity strictly above threshold?
+        # Hard/Binary Check: Is it strictly above the required threshold?
+        # Only valid anchors contribute to the loss.
         is_anchored = (max_sim > tau_adaptive).float()
         
-        # Soft Gating: Sigmoid of the margin
+        # Soft Gating: Sigmoid function centered at the threshold.
+        # This provides a smooth gradient for samples near the boundary.
         gate_logit = (max_sim - tau_adaptive)
         gate_sigmoid = torch.sigmoid(gate_logit / self.temp_gate)
         
-        # Final Gate
+        # Combination: Only apply soft weight if it passes the hard check
         gate = gate_sigmoid * is_anchored
         return max_sim, gate
 
     def _compute_anchored_loss(self, max_sim: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """
-        Computes the weighted Euclidean distance loss.
-        User Formula: L_proto = g * ||z_b - v_j*||
+        Computes the final weighted distance loss.
+
+        Objective: Minimize distance ||z - v*|| for anchored samples.
         
-        Using cosine relation: ||u - v|| = sqrt(2 * (1 - cos_sim))
+        Relation between Cosine Sim (S) and Euclidean Dist (D) for unit vectors:
+            D^2 = ||z - v||^2 = (z-v).(z-v) = z.z - 2z.v + v.v = 1 - 2S + 1 = 2(1 - S)
+            D = sqrt( 2 * (1 - S) )
+
+        Returns:
+            torch.Tensor: Scalar mean loss over the batch.
         """
-        # Distance squared: ||u - v||^2 = 2(1 - cos_cos)
+        # Squared Euclidean Distance derived from Cosine Similarity
         dist_sq = 2 * (1 - max_sim)
         
-        # Linear Distance: ||u - v||
-        # Add epsilon for numerical stability of sqrt near 0
+        # Linear Euclidean Distance (with epsilon for sqrt stability at 0)
         dist = torch.sqrt(dist_sq + self.EPSILON)
         
+        # Apply Gating:
+        # High confidence match -> High Gate -> Full Distance Penalty
+        # Low confidence match -> Low Gate -> Little/No Penalty
         loss_per_sample = gate * dist
+        
         return loss_per_sample.mean()
