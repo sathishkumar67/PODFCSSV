@@ -2,7 +2,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple, Union, List, Any
-from transformers import PreTrainedModel, ViTMAEForPreTraining
+from transformers import PreTrainedModel, ViTMAEForPreTraining, ViTMAEModel
 
 
 
@@ -153,12 +153,13 @@ class ViTBlockWithAdapter(nn.Module):
             **kwargs
         )
         
-        # 2. Extract Hidden States (Always the first element in HF ViT)
-        # Handle cases where output might be a Tuple or a ModelOutput object
+        # 2. Extract Hidden States and Logic for Return Packaging
         if isinstance(outputs, tuple):
             x = outputs[0]
+        elif hasattr(outputs, "hidden_states"):
+            x = outputs.hidden_states
         else:
-            x = outputs.hidden_states if hasattr(outputs, "hidden_states") else outputs[0]
+            x = outputs
         
         # 3. Apply the IBA Adapter
         x = self.adapter(x)
@@ -167,10 +168,24 @@ class ViTBlockWithAdapter(nn.Module):
         if isinstance(outputs, tuple):
             # Reconstruct the tuple with the adapted hidden state
             return (x,) + outputs[1:]
+        elif hasattr(outputs, "hidden_states"):
+            # If it's a ModelOutput, we try to create a new one or modify in place?
+            # Creating a new one is safer but requires knowing the class.
+            # Mutating in place works if it's mutable.
+            # A simpler hack that often works for HF is returning a tuple if it came as ModelOutput,
+            # but some downstream layers check isinstance(ModelOutput).
+            # However, standard ViTEncoder loop handles tuple or ModelOutput.
+            # But if it wasn't a tuple originally, let's try to return what it expects.
+            # Most robust: Just update the hidden_states attribute if mutable.
+            try:
+                outputs.hidden_states = x
+                return outputs
+            except:
+                # If immutable, we fallback to tuple which HF usually accepts
+                return (x,) 
         else:
-            # If it was a ModelOutput object (unlikely for a single layer, but safer),
-            # we simply return the tuple approximation as this is what the parent block expects.
-            return (x,)
+            # It was a Tensor, return a Tensor
+            return x
 
 
 def inject_adapters(model: PreTrainedModel, bottleneck_dim: int = 64) -> PreTrainedModel:
