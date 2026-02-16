@@ -129,6 +129,7 @@ class ViTBlockWithAdapter(nn.Module):
         self, 
         hidden_states: torch.Tensor, 
         head_mask: Optional[torch.Tensor] = None, 
+        output_attentions: bool = False,
         **kwargs: Any
     ) -> Union[Tuple[torch.Tensor], Tuple[torch.Tensor, Any]]:
         """
@@ -137,6 +138,7 @@ class ViTBlockWithAdapter(nn.Module):
         Args:
             hidden_states (torch.Tensor): Input tensor.
             head_mask (Optional[torch.Tensor]): Mask for attention heads.
+            output_attentions (bool): Whether to return attention weights.
             **kwargs: Additional arguments required by specific HF implementations.
 
         Returns:
@@ -144,6 +146,7 @@ class ViTBlockWithAdapter(nn.Module):
         """
         # 1. Run the original frozen ViT Block
         # HF blocks typically return a tuple: (hidden_states, attention_weights (optional), ...)
+        # We explicitly EXCLUDE output_attentions from the call as ViTMAE doesn't support it by default
         outputs = self.original_block(
             hidden_states, 
             head_mask=head_mask, 
