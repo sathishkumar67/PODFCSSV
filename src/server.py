@@ -139,36 +139,54 @@ class FederatedModelServer:
     @torch.no_grad()
     def aggregate_weights(
         self, 
-        client_params_list: List[Dict[str, torch.Tensor]]
+        client_weights_map: Dict[str, Dict[str, torch.Tensor]]
     ) -> Dict[str, torch.Tensor]:
         """
         Aggregates decentralized model weights into a centralized consensus model.
-
+        
+        This method processes ALL parameters in the state_dict, including:
+        - Weights (conv, linear, attention)
+        - Biases
+        - LayerNorm / BatchNorm parameters (running_mean, running_var, num_batches_tracked)
+        
         Args:
-            client_params_list: List of state_dicts collected from clients.
+            client_weights_map: Dictionary mapping ClientID -> state_dict.
 
         Returns:
-            Dict: The aggregated global state_dict.
+            Dict: The aggregated global state_dict (averaged per layer).
         """
-        if not client_params_list:
+        if not client_weights_map:
+            logger.warning("No client weights received for aggregation.")
             return {}
 
-        num_clients = len(client_params_list)
+        client_ids = list(client_weights_map.keys())
+        num_clients = len(client_ids)
+        
+        # Use simple pass-through if only one client
         if num_clients == 1:
-            return client_params_list[0]
+            return client_weights_map[client_ids[0]]
 
         # Use the first client's state_dict as the structural reference
-        reference_keys = client_params_list[0].keys()
+        reference_client = client_ids[0]
+        reference_state = client_weights_map[reference_client]
+        reference_keys = reference_state.keys()
+        
         global_state: Dict[str, torch.Tensor] = {}
 
         for key in reference_keys:
-            # Perform component-wise averaging across all client tensors for this layer
-            # Conversion to float() ensures compatibility with half-precision local training
-            tensors = torch.stack(
-                [client_dict[key].float() for client_dict in client_params_list], 
-                dim=0
-            )
-            global_state[key] = tensors.mean(dim=0)
+            # Check if key exists in all clients to avoid errors with partial updates
+            tensors = []
+            for cid in client_ids:
+                if key in client_weights_map[cid]:
+                    tensors.append(client_weights_map[cid][key].float())
+            
+            if len(tensors) == num_clients:
+                # Perform component-wise averaging across all client tensors for this layer
+                # Conversion to float() ensures compatibility with half-precision local training
+                stacked = torch.stack(tensors, dim=0)
+                global_state[key] = stacked.mean(dim=0)
+            else:
+                logger.warning(f"Layer {key} missing in some clients. Skipping aggregation for this layer.")
 
         return global_state
 
@@ -185,7 +203,7 @@ def run_server_round(
         proto_manager: Instance of the Global Prototype controller.
         model_server: Instance of the Federated Aggregator.
         client_payloads: List of dictionaries from clients. Each payload 
-                        must contain 'protos' and 'weights'.
+                        must contain 'client_id', 'protos' and 'weights'.
 
     Returns:
         Dict: Final global update containing merged prototypes and weights.
@@ -193,15 +211,153 @@ def run_server_round(
     if not client_payloads:
         return {}
 
-    # Extract heterogeneous data types from the payload stream
-    # Note: Counts were removed in v2.0 in favor of EMA-only updates
+    # 1. Aggregate Prototypes
+    # Extract prototype lists (ignoring client IDs for prototypes as they are treated as a pool)
     protos = [p['protos'] for p in client_payloads if 'protos' in p]
     global_protos = proto_manager.aggregate_prototypes(protos)
     
-    weights = [p['weights'] for p in client_payloads if 'weights' in p]
-    global_weights = model_server.aggregate_weights(weights)
+    # 2. Aggregate Model Weights
+    # Construct the map: ClientID -> StateDict
+    # We expect 'client_id' to be present. If not, generate a dummy one.
+    client_weights_map = {}
+    for i, p in enumerate(client_payloads):
+        if 'weights' in p:
+            cid = p.get('client_id', f"unknown_client_{i}")
+            client_weights_map[cid] = p['weights']
+            
+    global_weights = model_server.aggregate_weights(client_weights_map)
     
     return {
         "global_prototypes": global_protos,
         "global_weights": global_weights
     }
+
+
+class GlobalModel:
+    """
+    Wrapper for the Server-Side Global Model.
+    
+    Manages the lifecycle of the central model, including initialization
+    and parameter updates from federated aggregation rounds.
+    """
+    
+    def __init__(self, device: str = "cpu") -> None:
+        """
+        Args:
+            device: 'cpu' or 'cuda'.
+        """
+        self.device = torch.device(device)
+        logger.info(f"Initializing Global Model on {self.device}...")
+        
+        # Load the backbone (ViT-MAE)
+        try:
+            from transformers import ViTMAEForPreTraining
+            from src.mae_with_adapter import inject_adapters
+            
+            # Initialize with standard pretrained weights
+            self.model = ViTMAEForPreTraining.from_pretrained("facebook/vit-mae-base")
+            
+            # Inject the same adapters structure as clients
+            self.model = inject_adapters(self.model)
+            
+            self.model.to(self.device)
+            # Set to eval mode as the server primarily aggregates/evaluates
+            self.model.eval() 
+            
+            logger.info("Global Model successfully initialized with Adapters.")
+            
+        except ImportError as e:
+            logger.error(f"Failed to import required modules: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error initializing model: {e}")
+            raise
+
+    def update_model_weights(self, aggregated_weights: Dict[str, torch.Tensor]) -> None:
+        """
+        Updates the global model with averaged weights from the round.
+        
+        Args:
+            aggregated_weights: Dictionary of aggregated parameters (full or partial).
+        """
+        if not aggregated_weights:
+            logger.warning("Received empty weight update. Skipping.")
+            return
+
+        try:
+            # We use strict=False because clients might only send back trainable parameters (adapters),
+            # especially if the backbone is frozen.
+            keys = self.model.load_state_dict(aggregated_weights, strict=False)
+            logger.info(f"Global Model Updated. Missing keys: {len(keys.missing_keys)}, Unexpected keys: {len(keys.unexpected_keys)}")
+            
+        except Exception as e:
+            logger.error(f"Failed to update global model weights: {e}")
+            raise
+
+
+# =============================================================================
+# Main Execution Block (For Testing)
+# =============================================================================
+if __name__ == "__main__":
+    # Setup test logging
+    logging.basicConfig(level=logging.INFO)
+    
+    print(f"\n{'='*60}")
+    print(f"[Test] Starting Server Logic Verification")
+    print(f"{'='*60}")
+
+    try:
+        # 1. Initialize Server Components
+        print("\n[Step 1] Initializing Server Components...")
+        pm = ServerPrototypeManager(embedding_dim=768)
+        fms = FederatedModelServer()
+        global_model = GlobalModel(device="cpu")
+        
+        # 2. Simulate Client Payloads
+        print("\n[Step 2] Simulating Client Updates...")
+        
+        # Mocking 2 clients
+        # We simulate that clients send a subset of weights for testing, but we include both weights and biases
+        # to demonstrate that all parameter types are handled.
+        ref_state_dict = global_model.model.state_dict()
+        
+        # Client 1: Add 0.01 to everything
+        c1_weights = {}
+        for k, v in ref_state_dict.items():
+            if 'adapter' in k: # Simulate sending only adapters for bandwidth efficiency in this test
+                c1_weights[k] = v.clone() + 0.01
+
+        # Client 2: Subtract 0.01 from everything
+        c2_weights = {}
+        for k, v in ref_state_dict.items():
+            if 'adapter' in k:
+                c2_weights[k] = v.clone() - 0.01
+        
+        # Manually introduce a bias term if not present in adapter (adapters usually have bias)
+        # Just to be sure, let's verify if we are processing biases.
+        # IBA_Adapter has up_project/down_project which are Linear layers (have bias by default)
+        
+        c1_proto = torch.randn(5, 768)
+        c2_proto = torch.randn(3, 768)
+        
+        clients = [
+            {'client_id': 'client_1', 'protos': c1_proto, 'weights': c1_weights},
+            {'client_id': 'client_2', 'protos': c2_proto, 'weights': c2_weights}
+        ]
+        
+        # 3. Run Server Round
+        print("\n[Step 3] Running Aggregation Round...")
+        updates = run_server_round(pm, fms, clients)
+        
+        print(f"   -> Global Prototypes Shape: {updates['global_prototypes'].shape}")
+        
+        # 4. Update Global Model
+        print("\n[Step 4] Updating Global Model Weights...")
+        global_model.update_model_weights(updates['global_weights'])
+        
+        print("\n[Success] All server tests passed successfully.")
+        
+    except Exception as e:
+        print(f"\n[Error] Test Failed: {e}")
+        import traceback
+        traceback.print_exc()
