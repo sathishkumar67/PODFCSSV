@@ -231,7 +231,7 @@ class FederatedClient:
             
             # Similarity matrix: (N, K)
             sims = torch.mm(X, centroids.t())
-             # Distance is monotonic with 1-sim, so maximizing sim is minimizing dist
+            # Distance is monotonic with 1-sim, so maximizing sim is minimizing dist
             
             # Assign clusters
             _, labels = sims.max(dim=1)
@@ -275,8 +275,8 @@ class ClientManager:
             base_model: The generic model architecture to replicate.
             num_clients: Total number of clients to spawn.
             gpu_count: Number of GPUs available.
-                       - If 2 GPUs and 4 clients: Clients 0,2 on GPU0; Clients 1,3 on GPU1.
-                       - If 0 GPUs: All clients on CPU.
+                    - If 2 GPUs and 4 clients: Clients 0,2 on GPU0; Clients 1,3 on GPU1.
+                    - If 0 GPUs: All clients on CPU.
         """
         self.clients: List[FederatedClient] = []
         self.num_clients = num_clients
@@ -286,14 +286,24 @@ class ClientManager:
 
     def _initialize_clients(self, base_model: nn.Module) -> None:
         """Internal helper to spawn clients on appropriate devices."""
-        logger.info(f"Initializing {self.num_clients} clients across {self.gpu_count} GPUs...")
+        logger.info(f"Initializing {self.num_clients} clients...")
         
+        # Enforce 1:1 Mapping rule if GPUs are available
+        if self.gpu_count > 0:
+            if self.num_clients != self.gpu_count:
+                raise ValueError(
+                    f"Strict 1:1 Client-GPU mapping required. "
+                    f"Requested {self.num_clients} clients but found {self.gpu_count} GPUs."
+                )
+            logger.info(f"Parallel Mode: Mapped {self.num_clients} clients to {self.gpu_count} GPUs.")
+        else:
+            logger.info(f"Sequential Mode: Running {self.num_clients} clients on CPU.")
+
         for i in range(self.num_clients):
             # Determine Device
             if self.gpu_count > 0:
-                # Round-robin assignment: 0->GPU0, 1->GPU1, 2->GPU0...
-                device_id = i % self.gpu_count
-                device = torch.device(f"cuda:{device_id}")
+                # 1:1 Mapping: Client i -> GPU i
+                device = torch.device(f"cuda:{i}")
             else:
                 device = torch.device("cpu")
             
@@ -314,11 +324,15 @@ class ClientManager:
         gpad_loss_fn: nn.Module = None
     ) -> List[float]:
         """
-        Triggers one round of local training for all clients in PARALLEL.
+        Triggers one round of local training for all clients.
+        
+        Execution Strategy:
+        - If GPUs > 0: Parallel execution via ThreadPool (1 client per GPU).
+        - If GPUs == 0: Sequential execution on CPU.
         
         Args:
             dataloaders: List of DataLoaders, one for each client.
-                         Must match num_clients.
+                        Must match num_clients.
             global_prototypes: Global prototypes (if r > 1).
             gpad_loss_fn: GPAD Loss instance (if r > 1).
 
@@ -333,30 +347,44 @@ class ClientManager:
 
         round_losses = [0.0] * self.num_clients
         
-        # Use ThreadPoolExecutor for parallel GPU dispatch
-        # Python threads release GIL for C++ CUDA ops, allowing true parallel execution on GPUs
-        from concurrent.futures import ThreadPoolExecutor
-        
-        with ThreadPoolExecutor(max_workers=self.num_clients) as executor:
-            logger.info(f"Spawning {self.num_clients} training threads...")
-            futures = {}
-            for i, client in enumerate(self.clients):
-                # Pass arguments for this client
-                futures[executor.submit(
-                    client.train_epoch, 
-                    dataloaders[i], 
-                    global_prototypes=global_prototypes, 
-                    gpad_loss_fn=gpad_loss_fn
-                )] = i
+        if self.gpu_count > 0:
+            # Parallel Execution for GPUs
+            from concurrent.futures import ThreadPoolExecutor
             
-            for future in futures:
-                client_idx = futures[future]
+            with ThreadPoolExecutor(max_workers=self.num_clients) as executor:
+                logger.info(f"Spawning {self.num_clients} training threads (1 per GPU)...")
+                futures = {}
+                for i, client in enumerate(self.clients):
+                    futures[executor.submit(
+                        client.train_epoch, 
+                        dataloaders[i], 
+                        global_prototypes=global_prototypes, 
+                        gpad_loss_fn=gpad_loss_fn
+                    )] = i
+                
+                for future in futures:
+                    client_idx = futures[future]
+                    try:
+                        loss = future.result()
+                        round_losses[client_idx] = loss
+                        logger.info(f"Client {client_idx} (GPU {client_idx}) finished. Loss: {loss:.4f}")
+                    except Exception as e:
+                        logger.error(f"Client {client_idx} failed: {e}")
+                        round_losses[client_idx] = float('nan')
+        else:
+            # Sequential Execution for CPU
+            logger.info(f"Running sequential training on CPU for {self.num_clients} clients...")
+            for i, client in enumerate(self.clients):
                 try:
-                    loss = future.result()
-                    round_losses[client_idx] = loss
-                    logger.info(f"Client {client_idx} finished. Loss: {loss:.4f}")
+                    loss = client.train_epoch(
+                        dataloaders[i],
+                        global_prototypes=global_prototypes,
+                        gpad_loss_fn=gpad_loss_fn
+                    )
+                    round_losses[i] = loss
+                    logger.info(f"Client {client_idx} (CPU) finished. Loss: {loss:.4f}")
                 except Exception as e:
-                    logger.error(f"Client {client_idx} failed: {e}")
-                    round_losses[client_idx] = float('nan')
+                    logger.error(f"Client {i} failed: {e}")
+                    round_losses[i] = float('nan')
             
         return round_losses
