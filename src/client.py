@@ -46,6 +46,7 @@ class FederatedClient:
         model: nn.Module,
         device: torch.device,
         optimizer_cls: type = optim.AdamW,
+        optimizer_cls: type = optim.AdamW,
         optimizer_kwargs: Dict[str, Any] = None,
         local_update_threshold: float = 0.7,
         local_ema_alpha: float = 0.1
@@ -60,8 +61,6 @@ class FederatedClient:
             device (torch.device): The hardware device (CPU/GPU) this client runs on.
             optimizer_cls (type): The class of optimizer to use (default: AdamW).
             optimizer_kwargs (Dict): Configuration for the local optimizer (lr, weight_decay).
-            local_update_threshold (float): Threshold for updating local prototypes.
-            local_ema_alpha (float): Scaling factor for local EMA update.
         """
         self.client_id = client_id
         self.device = device
@@ -142,8 +141,9 @@ class FederatedClient:
                 if hasattr(outputs, "hidden_states"):
                     hidden = outputs.hidden_states[-1] 
                 elif isinstance(outputs, tuple):
-                    # Check tuple structure for HF models
-                    hidden = outputs[-1] 
+                    # Check tuple structure for HF models (usually loss, logits, hidden_states...)
+                    # Index depends on specific model return signature
+                    hidden = outputs[-1] # Risky, better to rely on object or attribute
                 else:
                     hidden = outputs # Fallback
                 
@@ -192,8 +192,7 @@ class FederatedClient:
                             # EMA Update: Old = (1-a)Old + a*New
                             old_proto = self.local_prototypes[proto_idx]
                             updated_proto = (1 - self.local_ema_alpha) * old_proto + self.local_ema_alpha * sample_emb
-                            # In-place update (re-normalization happens next time usually, but let's be safe)
-                            # self.local_prototypes[proto_idx] = F.normalize(updated_proto, p=2, dim=0)
+                            # In-place update
                             self.local_prototypes[proto_idx] = updated_proto
 
             # Backward Pass
