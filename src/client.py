@@ -61,14 +61,20 @@ class FederatedClient:
     def train_epoch(
         self, 
         dataloader: DataLoader, 
-        criterion: nn.Module = None
+        global_prototypes: torch.Tensor = None,
+        gpad_loss_fn: nn.Module = None
     ) -> float:
         """
         Runs one epoch of local training.
+        
+        Phased Logic:
+        - If global_prototypes is None (Round 1): Train with MAE Reconstruction Loss only.
+        - If global_prototypes is provided (Round > 1): Train with MAE + GPAD Loss.
 
         Args:
             dataloader: Local data for this client.
-            criterion: Loss function. If None, assumes model returns dict with 'loss'.
+            global_prototypes: Global prototypes (M, D) for GPAD.
+            gpad_loss_fn: Loss function instance for GPAD.
 
         Returns:
             float: Average loss for the epoch.
@@ -80,46 +86,174 @@ class FederatedClient:
         for batch in dataloader:
             # Move data to client's device
             if isinstance(batch, (list, tuple)):
-                # Assume standard [inputs, labels] format
-                inputs = batch[0].to(self.device)
-                # Labels might be needed depending on loss, but MAE is self-supervised
-                # outputs = self.model(inputs)
+                inputs = batch[0].to(self.device).float()
             elif isinstance(batch, dict):
-                # Handle HF style dicts
-                inputs = {k: v.to(self.device) for k, v in batch.items()}
+                inputs = {k: v.to(self.device).float() for k, v in batch.items()}
             else:
-                inputs = batch.to(self.device)
+                inputs = batch.to(self.device).float()
 
             # Forward Pass
-            # For MAE/ViTMAE, the model output usually contains 'loss' if labels/pixel_values provided
+            # We need hidden_states if doing GPAD
+            output_hidden = (global_prototypes is not None)
+            
             if isinstance(inputs, dict):
-                outputs = self.model(**inputs)
+                outputs = self.model(**inputs, output_hidden_states=output_hidden)
             else:
-                outputs = self.model(inputs)
+                outputs = self.model(inputs, output_hidden_states=output_hidden)
 
-            # Compute Loss
-            if criterion:
-                # Custom loss (e.g., GPAD) logic would go here
-                # For now, default to internal loss if available, else placeholder
-                loss = getattr(outputs, "loss", None)
-            else:
-                loss = getattr(outputs, "loss", None)
+            # 1. Base MAE Loss
+            mae_loss = getattr(outputs, "loss", None)
+            if mae_loss is None:
+                # Fallback if model doesn't compute loss internally (unlikely for ViTMAEForPreTraining)
+                mae_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
-            if loss is None:
-                # Fallback implementation if no loss returned
-                # This depends heavily on the specific model/task
-                loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            final_loss = mae_loss
+
+            # 2. GPAD Loss (if applicable)
+            if global_prototypes is not None and gpad_loss_fn is not None:
+                # Extract embeddings from last hidden state
+                if hasattr(outputs, "hidden_states"):
+                    hidden = outputs.hidden_states[-1] 
+                elif isinstance(outputs, tuple):
+                    # Check tuple structure for HF models (usually loss, logits, hidden_states...)
+                    # Index depends on specific model return signature
+                    hidden = outputs[-1] # Risky, better to rely on object or attribute
+                else:
+                    hidden = outputs # Fallback
+                
+                # Pool: (B, L, D) -> (B, D)
+                if len(hidden.shape) == 3:
+                    embeddings = hidden.mean(dim=1)
+                else:
+                    embeddings = hidden
+                
+                # Compute GPAD
+                # Ensure global prototypes are on same device
+                protos_device = global_prototypes.to(self.device)
+                gpad = gpad_loss_fn(embeddings, protos_device)
+                
+                final_loss = final_loss + gpad
 
             # Backward Pass
             self.optimizer.zero_grad()
-            loss.backward()
+            final_loss.backward()
             self.optimizer.step()
 
-            total_loss += loss.item()
+            total_loss += final_loss.item()
             num_batches += 1
             
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         return avg_loss
+
+
+    @torch.no_grad()
+    def generate_prototypes(self, dataloader: DataLoader, K_init: int = 10) -> torch.Tensor:
+        """
+        Generates local prototypes using K-Means clustering on feature embeddings.
+
+        Args:
+            dataloader: Data to extract features from.
+            K_init: Number of clusters (prototypes) to form.
+
+        Returns:
+            torch.Tensor: Local prototypes (K_init, D).
+        """
+        self.model.eval()
+        all_features = []
+        
+        # 1. Feature Extraction (Forward Pass)
+        for batch in dataloader:
+            if isinstance(batch, (list, tuple)):
+                inputs = batch[0].to(self.device)
+            elif isinstance(batch, dict):
+                inputs = {k: v.to(self.device) for k, v in batch.items()}
+            else:
+                inputs = batch.to(self.device)
+            
+            # Extract features from the model
+            # Assuming model returns an object with 'hidden_states' or similar, 
+            # or for ViTMAE, we might need to tap into the encoder output.
+            # For simplicity, let's assume the model returns a direct embedding or 'last_hidden_state'
+            # If standard ViTMAE, outputs.last_hidden_state is (B, L, D). We usually pool it (e.g. CLS or mean).
+            # Let's assume Mean Pooling for prototype generation if sequence provided.
+            
+            with torch.no_grad():
+                if isinstance(inputs, dict):
+                    outputs = self.model(**inputs, output_hidden_states=True)
+                else:
+                    # Some models (like standard HF ViT) output tuple if no keys
+                    outputs = self.model(inputs, output_hidden_states=True)
+
+            # Handle HF Output
+            if hasattr(outputs, "hidden_states"):
+                # Use the last encoder layer's hidden state
+                hidden = outputs.hidden_states[-1] 
+            elif isinstance(outputs, tuple):
+                hidden = outputs[0]
+            else:
+                hidden = outputs
+                
+            # Pooling: (B, L, D) -> (B, D)
+            if len(hidden.shape) == 3:
+                # Mean pooling over sequence length
+                features = hidden.mean(dim=1) 
+            else:
+                features = hidden
+                
+            all_features.append(features)
+
+        # Concatenate all features: (N_samples, D)
+        embeddings = torch.cat(all_features, dim=0)
+        
+        # 2. Normalization
+        embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+        
+        # 3. K-Means Clustering (Simple PyTorch Implementation)
+        return self._kmeans(embeddings, K=K_init)
+
+    def _kmeans(self, X: torch.Tensor, K: int, max_iters: int = 100) -> torch.Tensor:
+        """
+        Simple K-Means implementation in PyTorch.
+        """
+        N, D = X.shape
+        
+        # Initialize centroids randomly from data
+        indices = torch.randperm(N)[:K]
+        centroids = X[indices].clone()
+        
+        for _ in range(max_iters):
+            # Compute distances: ||x - c||^2
+            # (Using cosine distance since inputs are normalized)
+            # dist = 1 - cos_sim
+            
+            # Normalize centroids to keep consistent with embedding space (unit sphere)
+            centroids = torch.nn.functional.normalize(centroids, p=2, dim=1)
+            
+            # Similarity matrix: (N, K)
+            sims = torch.mm(X, centroids.t())
+             # Distance is monotonic with 1-sim, so maximizing sim is minimizing dist
+            
+            # Assign clusters
+            _, labels = sims.max(dim=1)
+            
+            # Update centroids
+            new_centroids = torch.zeros_like(centroids)
+            for k in range(K):
+                cluster_mask = (labels == k)
+                if cluster_mask.sum() > 0:
+                    new_centroids[k] = X[cluster_mask].mean(dim=0)
+                else:
+                    # Re-initialize empty cluster
+                    new_idx = torch.randint(0, N, (1,)).item()
+                    new_centroids[k] = X[new_idx]
+            
+            # Check convergence
+            center_shift = torch.norm(new_centroids - centroids)
+            centroids = new_centroids
+            if center_shift < 1e-4:
+                break
+                
+        return torch.nn.functional.normalize(centroids, p=2, dim=1)
 
 
 class ClientManager:
@@ -175,14 +309,18 @@ class ClientManager:
 
     def train_round(
         self, 
-        dataloaders: List[DataLoader]
+        dataloaders: List[DataLoader],
+        global_prototypes: torch.Tensor = None,
+        gpad_loss_fn: nn.Module = None
     ) -> List[float]:
         """
-        Triggers one round of local training for all clients.
+        Triggers one round of local training for all clients in PARALLEL.
         
         Args:
             dataloaders: List of DataLoaders, one for each client.
                          Must match num_clients.
+            global_prototypes: Global prototypes (if r > 1).
+            gpad_loss_fn: GPAD Loss instance (if r > 1).
 
         Returns:
             List[float]: Average loss for each client this round.
@@ -193,18 +331,32 @@ class ClientManager:
                 f"client count ({self.num_clients})"
             )
 
-        round_losses = []
+        round_losses = [0.0] * self.num_clients
         
-        # Parallel Execution Note:
-        # In this Python implementation, this loop is sequential (Client 0 trains, then Client 1...).
-        # However, because they are on different CUDA streams/devices, PyTorch operations 
-        # are asynchronous. To get true parallelism in Python, we'd need multiprocessing, 
-        # but for simulation, this sequential dispatch is standard and effective.
+        # Use ThreadPoolExecutor for parallel GPU dispatch
+        # Python threads release GIL for C++ CUDA ops, allowing true parallel execution on GPUs
+        from concurrent.futures import ThreadPoolExecutor
         
-        for i, client in enumerate(self.clients):
-            logger.info(f"Starting training for Client {i} on {client.device}...")
-            loss = client.train_epoch(dataloaders[i])
-            round_losses.append(loss)
-            logger.info(f"Client {i} finished. Loss: {loss:.4f}")
+        with ThreadPoolExecutor(max_workers=self.num_clients) as executor:
+            logger.info(f"Spawning {self.num_clients} training threads...")
+            futures = {}
+            for i, client in enumerate(self.clients):
+                # Pass arguments for this client
+                futures[executor.submit(
+                    client.train_epoch, 
+                    dataloaders[i], 
+                    global_prototypes=global_prototypes, 
+                    gpad_loss_fn=gpad_loss_fn
+                )] = i
+            
+            for future in futures:
+                client_idx = futures[future]
+                try:
+                    loss = future.result()
+                    round_losses[client_idx] = loss
+                    logger.info(f"Client {client_idx} finished. Loss: {loss:.4f}")
+                except Exception as e:
+                    logger.error(f"Client {client_idx} failed: {e}")
+                    round_losses[client_idx] = float('nan')
             
         return round_losses

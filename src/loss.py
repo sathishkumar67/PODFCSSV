@@ -133,9 +133,17 @@ class GPADLoss(nn.Module):
 
     def _compute_anchored_loss(self, max_sim: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """
-        Computes the weighted squared Euclidean distance loss.
-        ||u - v||^2 = 2(1 - cos_sim)
+        Computes the weighted Euclidean distance loss.
+        User Formula: L_proto = g * ||z_b - v_j*||
+        
+        Using cosine relation: ||u - v|| = sqrt(2 * (1 - cos_sim))
         """
+        # Distance squared: ||u - v||^2 = 2(1 - cos_cos)
         dist_sq = 2 * (1 - max_sim)
-        loss_per_sample = gate * dist_sq
+        
+        # Linear Distance: ||u - v||
+        # Add epsilon for numerical stability of sqrt near 0
+        dist = torch.sqrt(dist_sq + self.EPSILON)
+        
+        loss_per_sample = gate * dist
         return loss_per_sample.mean()
