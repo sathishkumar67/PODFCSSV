@@ -1,11 +1,10 @@
-torch
-torchvision
-torchaudio
-matplotlib
-pyyalm
-numpy
-timm
-scikit-learn
-tqdm
-transformers
-Pillow
+# Core Dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Hugging Face (ViT-MAE backbone)
+transformers>=4.30.0
+
+# Numerical & Scientific
+numpy>=1.21.0
+scikit-learn>=1.0.0
