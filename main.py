@@ -169,6 +169,22 @@ CONFIG = {
     # EMA interpolation factor for online prototype refinement.
     # 0 = no update, 1 = full replacement.
     "client_local_ema_alpha": 0.1,
+
+    # ── GPAD Loss Weighting ──────────────────────────────────────────────────
+    # Scaling factor for the GPAD distillation loss.
+    # total_loss = mae_loss + lambda_proto * gpad_loss.
+    # Higher values enforce stronger alignment to global prototypes.
+    "lambda_proto": 1.0, # should be a power of 10
+
+    # ── Novelty Buffer (client.py) ───────────────────────────────────────────
+    # Number of truly novel embeddings (failing both global and local
+    # threshold checks) to accumulate before triggering a fresh K-Means
+    # clustering to discover new visual concepts.
+    "novelty_buffer_size": 500,
+
+    # K for the buffer K-Means clustering.
+    # This is independent of k_init_prototypes (Round 1 full clustering).
+    "novelty_k": 20,
 }
 
 
@@ -366,6 +382,9 @@ def main():
         },
         local_update_threshold=CONFIG["client_local_update_threshold"],
         local_ema_alpha=CONFIG["client_local_ema_alpha"],
+        lambda_proto=CONFIG["lambda_proto"],
+        novelty_buffer_size=CONFIG["novelty_buffer_size"],
+        novelty_k=CONFIG["novelty_k"],
     )
 
     # 2E. GPAD Distillation Loss
@@ -415,30 +434,47 @@ def main():
         logger.info(f"Client Losses: {losses}")
 
         # ── Step C: Local Prototype Extraction ───────────────────────────
-        # After training, each client extracts feature embeddings from its
-        # data, clusters them via K-Means, and produces K local prototypes.
-        # These prototypes summarize the client's data distribution without
-        # revealing any raw images (privacy-preserving).
-        logger.info(">> Generating Local Prototypes (K-Means)...")
+        # Round 1:  Full K-Means from scratch (initial prototype seeding).
+        # Round > 1: Prototypes are maintained via per-embedding routing
+        #            (online EMA + novelty buffer clustering).  Use
+        #            get_local_prototypes() to retrieve the current state.
         client_payloads = []
 
-        for i, client in enumerate(client_manager.clients):
-            # Extract K local prototype centroids via K-Means
-            local_protos = client.generate_prototypes(
-                dataloader,
-                K_init=CONFIG["k_init_prototypes"]
-            )
-
-            # Collect model weights (moved to CPU for transmission)
-            weights = {k: v.cpu() for k, v in client.model.state_dict().items()}
-
-            # Pack the client's upload payload
-            payload = {
-                "client_id": f"client_{i}",
-                "protos": local_protos.cpu(),
-                "weights": weights,
-            }
-            client_payloads.append(payload)
+        if round_idx == 1:
+            # --- Round 1: Full K-Means Clustering ---
+            logger.info(">> Generating Initial Local Prototypes (K-Means)...")
+            for i, client in enumerate(client_manager.clients):
+                local_protos = client.generate_prototypes(
+                    dataloader,
+                    K_init=CONFIG["k_init_prototypes"]
+                )
+                weights = {k: v.cpu() for k, v in client.model.state_dict().items()}
+                payload = {
+                    "client_id": f"client_{i}",
+                    "protos": local_protos.cpu(),
+                    "weights": weights,
+                }
+                client_payloads.append(payload)
+        else:
+            # --- Round > 1: Collect prototypes from routing/buffer ---
+            logger.info(">> Collecting Local Prototypes (from routing/buffer)...")
+            for i, client in enumerate(client_manager.clients):
+                local_protos = client.get_local_prototypes()
+                weights = {k: v.cpu() for k, v in client.model.state_dict().items()}
+                payload = {
+                    "client_id": f"client_{i}",
+                    "weights": weights,
+                }
+                # Only include prototypes if available
+                if local_protos is not None:
+                    payload["protos"] = local_protos.cpu()
+                    logger.info(
+                        f"  Client {i}: {local_protos.shape[0]} local protos, "
+                        f"buffer={len(client.novelty_buffer)}"
+                    )
+                else:
+                    logger.info(f"  Client {i}: No local prototypes yet")
+                client_payloads.append(payload)
 
         # ── Step D: Server Aggregation ───────────────────────────────────
         # The server receives all client payloads and performs two tasks:
