@@ -204,6 +204,8 @@ class ViTBlockWithAdapter(nn.Module):
     def forward(
         self, 
         hidden_states: torch.Tensor,
+        *args,
+        **kwargs
     ) -> Union[Tuple[torch.Tensor], Tuple[torch.Tensor, Any]]:
         """
         Forward pass that mimics the signature of a standard Hugging Face ViTLayer.
@@ -216,6 +218,10 @@ class ViTBlockWithAdapter(nn.Module):
         ----------
         hidden_states : torch.Tensor
             Input tensor of shape [Batch, SeqLen, Dim].
+        args : tuple
+            Variable positional arguments required by the pipeline.
+        kwargs : dict
+            Variable keyword arguments required by the pipeline.
 
         Returns
         -------
@@ -224,8 +230,8 @@ class ViTBlockWithAdapter(nn.Module):
             adapted hidden states and potentially attention weights.
         """
         # 1. Execute the Original Frozen Block
-        # We pass only hidden_states as ViTMAE layers typically don't accept head_mask/kwargs 
-        # in their forward signature for pre-training.
+        # We explicitly ignored *args and **kwargs (like head_mask) on purpose 
+        # because ViTMAE layers typically reject them.
         outputs = self.original_block(hidden_states)
         
         # 2. Extract the Hidden States
@@ -421,9 +427,7 @@ if __name__ == "__main__":
         output = model(dummy_input)
         
         loss_val = output.loss.item() if hasattr(output, "loss") else "N/A"
-        print(f"[Success] Forward pass complete. Loss: {loss_val}")
-        
-    except ImportError:
-        print("[Error] 'transformers' library not found. Please install it to run this test.")
+        print(f"[Success] Standard Forward pass complete. Loss: {loss_val}")
+
     except Exception as e:
         print(f"[Error] An error occurred during execution: {e}")
