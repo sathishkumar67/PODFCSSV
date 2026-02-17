@@ -492,6 +492,9 @@ class ClientManager:
         num_clients: int,
         gpu_count: int = 0,
         dtype: torch.dtype = torch.float32,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        local_update_threshold: float = 0.7,
+        local_ema_alpha: float = 0.1,
     ) -> None:
         """
         Initialize the Client Manager and spawn all clients.
@@ -507,11 +510,23 @@ class ClientManager:
             mapping. Defaults to 0 (CPU mode).
         dtype : torch.dtype, optional
             Floating-point type used for inputs. Defaults to torch.float32.
+        optimizer_kwargs : Dict[str, Any], optional
+            Keyword arguments passed to each client's optimizer constructor
+            (e.g. {"lr": 1e-4, "weight_decay": 0.05}).
+        local_update_threshold : float, optional
+            Cosine-similarity threshold for online EMA updates of local
+            prototypes. Defaults to 0.7.
+        local_ema_alpha : float, optional
+            EMA interpolation factor for online prototype refinement.
+            Defaults to 0.1.
         """
         self.clients: List[FederatedClient] = []
         self.num_clients = num_clients
         self.gpu_count = gpu_count
         self.dtype = dtype
+        self.optimizer_kwargs = optimizer_kwargs
+        self.local_update_threshold = local_update_threshold
+        self.local_ema_alpha = local_ema_alpha
 
         self._initialize_clients(base_model)
 
@@ -549,7 +564,9 @@ class ClientManager:
                 model=base_model,
                 device=device,
                 dtype=self.dtype,
-                optimizer_kwargs={"lr": 1e-4, "weight_decay": 0.05},
+                optimizer_kwargs=self.optimizer_kwargs,
+                local_update_threshold=self.local_update_threshold,
+                local_ema_alpha=self.local_ema_alpha,
             )
             self.clients.append(client)
 

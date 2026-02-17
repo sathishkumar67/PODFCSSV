@@ -10,19 +10,19 @@ System Overview
 The system consists of three actors:
 
 1. **Server** (central coordinator):
-   - Maintains a Global Prototype Bank — a collection of prototype vectors
-     that represent the visual concepts discovered across all clients.
-   - Aggregates client model weights via FedAvg.
+    - Maintains a Global Prototype Bank — a collection of prototype vectors
+    that represent the visual concepts discovered across all clients.
+    - Aggregates client model weights via FedAvg.
 
 2. **Clients** (edge devices):
-   - Each client holds a private local dataset and an independent copy
-     of the global model.
-   - Clients train locally and never share raw data — only compact
-     prototype vectors and model weights are communicated.
+    - Each client holds a private local dataset and an independent copy
+    of the global model.
+    - Clients train locally and never share raw data — only compact
+    prototype vectors and model weights are communicated.
 
 3. **Orchestrator** (this script):
-   - Manages the round-based communication loop between server and clients.
-   - Handles broadcasting, collection, and state updates.
+    - Manages the round-based communication loop between server and clients.
+    - Handles broadcasting, collection, and state updates.
 
 Training Phases (per round)
 ---------------------------
@@ -37,20 +37,20 @@ Round > 1 — Continual Learning:
 
 Within each round the following steps occur:
 
-    Step A — Broadcast:   Server sends current global prototypes to clients.
+    Step A — Broadcast:   Server sends current global prototypes to clients.        
     Step B — Training:    Clients train on their local data (MAE or MAE+GPAD).
     Step C — Extraction:  Clients cluster their features via K-Means to
-                          produce local prototypes.
+    produce local prototypes.
     Step D — Aggregation: Server merges local prototypes (EMA) and averages
-                          model weights (FedAvg).
+    model weights (FedAvg).
     Step E — Update:      The global model and prototype bank are updated.
 
 Simulation Details
 ------------------
 - Data:      Uses a mock TensorDataset with random noise to simulate
-             image embeddings (no real images needed for pipeline testing).
+    image embeddings (no real images needed for pipeline testing).
 - Model:     Uses ``MockViTMAE`` by default (a lightweight stand-in for
-             ViTMAEForPreTraining that requires no checkpoint download).
+    ViTMAEForPreTraining that requires no checkpoint download).
 - Execution: Supports both sequential (CPU) and parallel (multi-GPU) modes.
 """
 
@@ -79,10 +79,14 @@ logger = logging.getLogger("DistillFed")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HYPERPARAMETERS & CONFIGURATION
+#
+# Every tunable value across the entire pipeline is centralized here.
+# This avoids magic numbers scattered in source files and makes
+# hyperparameter sweeps straightforward.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 CONFIG = {
-    # --- System Configuration ---
+    # ── System ────────────────────────────────────────────────────────────────
     # How many federated clients to simulate in this run
     "num_clients": 2,
 
@@ -93,12 +97,25 @@ CONFIG = {
     # This value is auto-detected at runtime if CUDA is available
     "gpu_count": 0,
 
-    # --- Model & Data Configuration ---
+    # ── Model & Data ─────────────────────────────────────────────────────────
     # Dimensionality of the feature embedding space
     # (small value for mock simulation; real ViT-Base uses 768)
     "embedding_dim": 32,
 
-    # --- Global Prototype Management (Server-Side) ---
+    # Number of synthetic samples in the mock dataset (ignored in production)
+    "num_samples": 20,
+
+    # Mini-batch size for local training and prototype extraction
+    "batch_size": 4,
+
+    # ── Adapter (mae_with_adapter.py) ────────────────────────────────────────
+    # Bottleneck dimension of the IBA adapters injected into the ViT encoder.
+    # Smaller = fewer params / faster, larger = more capacity.
+    # Typical values: 32–128. At dim=64 with ViT-Base the adapters add ~1 %
+    # trainable parameters.
+    "adapter_bottleneck_dim": 64,
+
+    # ── Global Prototype Management (server.py) ──────────────────────────────
     # Cosine similarity threshold: if a new local prototype is this similar
     # to an existing global prototype, they are merged via EMA instead of
     # being added as a new entry
@@ -106,19 +123,40 @@ CONFIG = {
 
     # Exponential Moving Average factor for updating global prototypes
     # Lower values = slower, more stable updates
-    "ema_alpha": 0.1,
+    "server_ema_alpha": 0.1,
 
-    # --- GPAD Distillation Loss ---
+    # ── GPAD Distillation Loss (loss.py) ─────────────────────────────────────
     # Base adaptive threshold for confident anchoring in GPAD
+    # Higher = stricter gating, fewer anchors activated
     "gpad_base_tau": 0.5,
 
-    # Temperature for the soft gating mechanism in GPAD
+    # Temperature for the soft sigmoid gate in GPAD
+    # Lower = sharper (near step-function), higher = smoother
     "gpad_temp_gate": 0.1,
 
-    # --- Client Local Training ---
+    # Scaling factor for the entropy-based penalty that raises the gate
+    # threshold when prototype assignment is ambiguous
+    "gpad_lambda_entropy": 0.1,
+
+    # ── Client Local Training (client.py) ────────────────────────────────────
     # Number of prototype centroids each client generates per round
     # via K-Means clustering
     "k_init_prototypes": 5,
+
+    # Optimizer learning rate for local client training
+    "client_lr": 1e-4,
+
+    # AdamW weight decay for L2 regularization
+    "client_weight_decay": 0.05,
+
+    # Cosine-similarity threshold for online EMA prototype updates.
+    # Only samples more similar than this to their nearest local prototype
+    # trigger an update — prevents noisy refinements.
+    "client_local_update_threshold": 0.7,
+
+    # EMA interpolation factor for online prototype refinement.
+    # 0 = no update, 1 = full replacement.
+    "client_local_ema_alpha": 0.1,
 }
 
 
@@ -225,7 +263,7 @@ class MockViTMAE(nn.Module):
             An object with:
             - ``.loss``: A scalar tensor (mean absolute value of features).
             - ``.hidden_states``: A list containing the features as
-              ``(B, 1, D)`` to mimic real ViT output.
+            (B, 1, D) to mimic real ViT output.
         """
         # Run the simple linear encoder
         feat = self.encoder(x)
@@ -255,11 +293,11 @@ def main():
 
     1. **Environment Setup**: Detect GPUs and configure execution mode.
     2. **Component Initialization**: Create the prototype bank, model server,
-       base model, client manager, and loss function.
+        base model, client manager, and loss function.
     3. **Data Setup**: Create a mock dataset and dataloaders.
-    4. **Training Loop**: Execute ``num_rounds`` of federated training, each
-       consisting of broadcast, local training, prototype extraction,
-       server aggregation, and global model update.
+    4. **Training Loop**: Execute num_rounds of federated training, each
+        consisting of broadcast, local training, prototype extraction,
+        server aggregation, and global model update.
     """
     logger.info("Initializing Federated Continual Learning Pipeline...")
 
@@ -279,7 +317,7 @@ def main():
     proto_bank = GlobalPrototypeBank(
         embedding_dim=CONFIG["embedding_dim"],
         merge_threshold=CONFIG["merge_threshold"],
-        ema_alpha=CONFIG["ema_alpha"],
+        ema_alpha=CONFIG["server_ema_alpha"],
         device="cpu"  # Aggregation on CPU to save GPU memory for training
     )
 
@@ -295,11 +333,18 @@ def main():
     # 2D. Client Manager
     #     Creates N independent clients, each with a deep copy of the base model.
     #     Handles device assignment (1:1 GPU mapping when available).
+    #     Optimizer and local prototype hyperparameters are sourced from CONFIG.
     client_manager = ClientManager(
         base_model=base_model,
         num_clients=CONFIG["num_clients"],
         gpu_count=CONFIG["gpu_count"],
-        dtype=torch.float32
+        dtype=torch.float32,
+        optimizer_kwargs={
+            "lr": CONFIG["client_lr"],
+            "weight_decay": CONFIG["client_weight_decay"],
+        },
+        local_update_threshold=CONFIG["client_local_update_threshold"],
+        local_ema_alpha=CONFIG["client_local_ema_alpha"],
     )
 
     # 2E. GPAD Distillation Loss
@@ -307,14 +352,15 @@ def main():
     #     the global prototype bank, preventing catastrophic forgetting.
     gpad_loss = GPADLoss(
         base_tau=CONFIG["gpad_base_tau"],
-        temp_gate=CONFIG["gpad_temp_gate"]
+        temp_gate=CONFIG["gpad_temp_gate"],
+        lambda_entropy=CONFIG["gpad_lambda_entropy"],
     )
 
     # ── Step 3: Data Setup (Mock) ────────────────────────────────────────────
-    # Create a synthetic dataset of 20 random vectors with 32 dimensions.
+    # Create a synthetic dataset using dimensions from CONFIG.
     # In production, each client would have its own real image dataset.
-    dataset = TensorDataset(torch.randn(20, CONFIG["embedding_dim"]))
-    dataloader = DataLoader(dataset, batch_size=4)
+    dataset = TensorDataset(torch.randn(CONFIG["num_samples"], CONFIG["embedding_dim"]))
+    dataloader = DataLoader(dataset, batch_size=CONFIG["batch_size"])
 
     # For simulation, all clients share the same dataloader.
     # In a real system, each client would have its own private data.
