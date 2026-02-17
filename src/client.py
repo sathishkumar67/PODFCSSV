@@ -376,13 +376,14 @@ class FederatedClient:
     def _cluster_novelty_buffer(self) -> None:
         """
         Run a fresh K-Means on the novelty buffer to produce new local prototypes.
+        Then, merge them into existing local prototypes if similar (EMA), or add them if distinct.
 
         This method is called when the novelty buffer reaches its size threshold.
-        It performs a completely re-initialized clustering (not reusing old
-        centroids) to discover new visual concepts from truly novel samples.
+        Instead of blind replacement, it ensures we don't duplicate existing concepts.
 
         After clustering:
-        - ``self.local_prototypes`` is **replaced** with the new centroids.
+        - Similar centroids are merged into ``self.local_prototypes`` via EMA.
+        - Distinct centroids are appended to ``self.local_prototypes``.
         - The novelty buffer is cleared.
         """
         if len(self.novelty_buffer) == 0:
@@ -400,18 +401,63 @@ class FederatedClient:
             f"{buffer_tensor.shape[0]} samples → K={K}"
         )
 
-        # Fresh K-Means — completely re-initialized centroids
-        new_protos = self._kmeans(buffer_tensor, K=K)
+        # Fresh K-Means — find centroids of the novel data
+        new_centroids = self._kmeans(buffer_tensor, K=K)
 
-        # Replace local prototypes with the newly discovered concepts
-        self.local_prototypes = new_protos.detach().clone()
+        # Merge-or-Add Strategy
+        if self.local_prototypes is None or self.local_prototypes.shape[0] == 0:
+            self.local_prototypes = new_centroids
+            merged_count = 0
+            added_count = K
+        else:
+            # Ensure devices match
+            if self.local_prototypes.device != self.device:
+                self.local_prototypes = self.local_prototypes.to(self.device)
+
+            p_norm = F.normalize(self.local_prototypes, p=2, dim=1)
+            c_norm = F.normalize(new_centroids, p=2, dim=1)
+
+            # Compute similarities: [K_new, K_old]
+            sims = torch.mm(c_norm, p_norm.t())
+            max_sim, best_idx = sims.max(dim=1)  # [K_new]
+
+            # We can't modify self.local_prototypes in-place while iterating easily if we append,
+            # so we'll collect updates and additions first.
+            protos_to_add = []
+            
+            # Create a clone to apply EMA updates safely
+            updated_protos = self.local_prototypes.clone()
+
+            merged_count = 0
+            added_count = 0
+
+            for i in range(new_centroids.shape[0]):
+                if max_sim[i] > self.local_update_threshold:
+                    # Merge: Update the existing prototype
+                    idx = best_idx[i]
+                    old_proto = updated_protos[idx]
+                    # EMA update
+                    updated = (1 - self.local_ema_alpha) * old_proto + self.local_ema_alpha * new_centroids[i]
+                    updated_protos[idx] = updated
+                    merged_count += 1
+                else:
+                    # Add: Append as new prototype
+                    protos_to_add.append(new_centroids[i])
+                    added_count += 1
+            
+            # Combine updated existing protos with completely new ones
+            if len(protos_to_add) > 0:
+                new_stack = torch.stack(protos_to_add, dim=0)
+                self.local_prototypes = torch.cat([updated_protos, new_stack], dim=0)
+            else:
+                self.local_prototypes = updated_protos
 
         # Clear the buffer
         self.novelty_buffer.clear()
 
         logger.info(
             f"[Client {self.client_id}] Buffer clustered → "
-            f"{self.local_prototypes.shape[0]} new local prototypes"
+            f"Merged {merged_count}, Added {added_count} -> Total {self.local_prototypes.shape[0]} local protos"
         )
 
     def get_local_prototypes(self) -> Optional[torch.Tensor]:
