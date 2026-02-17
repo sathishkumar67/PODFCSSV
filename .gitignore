@@ -205,3 +205,30 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ===========================================================================
+# ML / Deep Learning Specific
+# ===========================================================================
+
+# Model checkpoints and weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+checkpoints/
+saved_models/
+
+# Datasets (downloaded at runtime)
+data/
+datasets/
+
+# Experiment tracking
+runs/
+logs/
+wandb/
+mlruns/
+outputs/
+
+# Hugging Face cache
+.cache/
+huggingface/
