@@ -94,6 +94,10 @@ class GPADLoss(nn.Module):
             torch.Tensor: Scalar loss value (mean across the batch).        
                         Returns 0.0 if global_prototypes is empty.
         """ 
+        # Guard: if the global bank is empty, there is nothing to anchor to
+        if global_prototypes.size(0) == 0:
+            return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
+
         # 1. Normalization & Similarity
         sims = self._compute_similarity_matrix(embeddings, global_prototypes)
         
@@ -205,3 +209,43 @@ class GPADLoss(nn.Module):
         loss_per_sample = gate * dist
         
         return loss_per_sample.mean()
+
+    # ------------------------------------------------------------------
+    # Anchor Mask (used by FederatedClient for per-embedding routing)
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def compute_anchor_mask(
+        self,
+        embeddings: torch.Tensor,
+        global_prototypes: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Determine which embeddings are "anchored" to a global prototype.
+
+        An embedding is considered anchored when its maximum cosine similarity
+        to any global prototype exceeds the adaptive threshold computed from
+        the entropy of the similarity distribution.  Anchored samples are
+        "known" concepts that should be regularised toward the global bank;
+        non-anchored samples are potentially novel.
+
+        Parameters
+        ----------
+        embeddings : torch.Tensor
+            Batch of feature vectors, shape ``[B, D]``.
+        global_prototypes : torch.Tensor
+            Global prototype bank, shape ``[M, D]``.
+
+        Returns
+        -------
+        torch.Tensor
+            Boolean mask of shape ``[B]``.  ``True`` = anchored (known),
+            ``False`` = non-anchored (novel).
+        """
+        if global_prototypes.size(0) == 0:
+            return torch.zeros(embeddings.size(0), dtype=torch.bool,
+                            device=embeddings.device)
+
+        sims = self._compute_similarity_matrix(embeddings, global_prototypes)
+        tau_adaptive = self._compute_adaptive_threshold(sims)
+        max_sim, _ = sims.max(dim=1)
+        return max_sim > tau_adaptive
