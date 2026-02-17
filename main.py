@@ -90,12 +90,24 @@ CONFIG = {
     # How many federated clients to simulate in this run
     "num_clients": 2,
 
-    # Total number of server-client communication rounds
+    # Total number of server-client communication rounds to simulate.
+    # Each round consists of: broadcast -> train -> extract -> aggregate -> update.
     "num_rounds": 5,
 
     # Number of GPUs available (0 = CPU-only sequential mode)
     # This value is auto-detected at runtime if CUDA is available
     "gpu_count": 0,
+
+    # Primary computation device for training and inference.
+    # Set to "cuda" to use the first available GPU, or "cuda:N" for a
+    # specific GPU. Auto-updated at runtime when CUDA is detected.
+    "device": "cpu",
+
+    # Floating-point precision used for model parameters and input tensors.
+    # torch.float32 (single precision) is the safe default.
+    # torch.bfloat16 offers ~2x speedup on Ampere+ GPUs with minimal
+    # accuracy loss for most vision models.
+    "dtype": torch.float32,
 
     # ── Model & Data ─────────────────────────────────────────────────────────
     # Dimensionality of the feature embedding space
@@ -302,23 +314,32 @@ def main():
     logger.info("Initializing Federated Continual Learning Pipeline...")
 
     # ── Step 1: Environment Setup ────────────────────────────────────────────
-    # Automatically detect available GPUs for parallel client simulation
+    # Automatically detect available GPUs and update CONFIG accordingly
     if torch.cuda.is_available():
         CONFIG["gpu_count"] = torch.cuda.device_count()
-        logger.info(f"Detected {CONFIG['gpu_count']} GPUs. Parallel mode enabled if Clients <= GPUs.")
+        CONFIG["device"] = "cuda"
+        logger.info(
+            f"Detected {CONFIG['gpu_count']} GPU(s). "
+            f"Device set to '{CONFIG['device']}'. "
+            f"Parallel mode enabled if Clients <= GPUs."
+        )
     else:
-        logger.info("Using CPU Only (Sequential Mode).")
+        CONFIG["device"] = "cpu"
+        logger.info(f"No CUDA GPUs found. Device='{CONFIG['device']}' (Sequential Mode).")
+
+    logger.info(f"Dtype: {CONFIG['dtype']}")
 
     # ── Step 2: Component Initialization ─────────────────────────────────────
 
     # 2A. Server-Side Global Prototype Bank
     #     Manages the global knowledge base of visual concepts.
     #     New local prototypes are merged into this bank each round via EMA.
+    #     Aggregation runs on the configured device.
     proto_bank = GlobalPrototypeBank(
         embedding_dim=CONFIG["embedding_dim"],
         merge_threshold=CONFIG["merge_threshold"],
         ema_alpha=CONFIG["server_ema_alpha"],
-        device="cpu"  # Aggregation on CPU to save GPU memory for training
+        device=CONFIG["device"]
     )
 
     # 2B. Server-Side Model Aggregator
@@ -338,7 +359,7 @@ def main():
         base_model=base_model,
         num_clients=CONFIG["num_clients"],
         gpu_count=CONFIG["gpu_count"],
-        dtype=torch.float32,
+        dtype=CONFIG["dtype"],
         optimizer_kwargs={
             "lr": CONFIG["client_lr"],
             "weight_decay": CONFIG["client_weight_decay"],
