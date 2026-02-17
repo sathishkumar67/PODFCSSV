@@ -91,6 +91,9 @@ class FederatedClient:
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         local_update_threshold: float = 0.7,
         local_ema_alpha: float = 0.1,
+        lambda_proto: float = 1.0,
+        novelty_buffer_size: int = 500,
+        novelty_k: int = 20,
     ) -> None:
         """
         Initialize the Federated Client.
@@ -117,15 +120,36 @@ class FederatedClient:
         local_ema_alpha : float, optional
             EMA interpolation factor for online prototype refinement.
             Defaults to 0.1 (slow, stable updates).
+        lambda_proto : float, optional
+            Scaling factor for the GPAD distillation loss.
+            total_loss = mae_loss + lambda_proto * gpad_loss.
+            Defaults to 1.0.
+        novelty_buffer_size : int, optional
+            Number of non-anchored embeddings to accumulate before triggering
+            a fresh K-Means clustering to update local prototypes.
+            Defaults to 500.
+        novelty_k : int, optional
+            Number of clusters (K) for K-Means when clustering the novelty
+            buffer. This is independent of `k_init_prototypes` used in Round 1.
+            Defaults to 20.
         """
         self.client_id = client_id
         self.device = device
         self.dtype = dtype
         self.local_update_threshold = local_update_threshold
         self.local_ema_alpha = local_ema_alpha
+        self.lambda_proto = lambda_proto
+        self.novelty_buffer_size = novelty_buffer_size
+        self.novelty_k = novelty_k
 
         # Local prototype bank — populated after the first call to generate_prototypes()
         self.local_prototypes: Optional[torch.Tensor] = None
+
+        # Novelty buffer — accumulates truly novel embeddings (those that fail
+        # both the global anchor threshold AND the local prototype threshold).
+        # When len(novelty_buffer) >= novelty_buffer_size, a fresh K-Means is
+        # run on the buffer to produce new local prototypes.
+        self.novelty_buffer: List[torch.Tensor] = []
 
         # 1. Create an independent model copy for this client
         self.model = copy.deepcopy(model).to(self.device)
@@ -138,7 +162,9 @@ class FederatedClient:
         logger.info(
             f"[Client {self.client_id}] Initialized | device={self.device} | "
             f"dtype={self.dtype} | optimizer={optimizer_cls.__name__} | "
-            f"ema_alpha={self.local_ema_alpha} | threshold={self.local_update_threshold}"
+            f"ema_alpha={self.local_ema_alpha} | threshold={self.local_update_threshold} | "
+            f"lambda_proto={self.lambda_proto} | buffer_size={self.novelty_buffer_size} | "
+            f"novelty_k={self.novelty_k}"
         )
 
     # ------------------------------------------------------------------
@@ -181,19 +207,25 @@ class FederatedClient:
         gpad_loss_fn: Optional[nn.Module] = None,
     ) -> float:
         """
-        Execute one epoch of local training on the client's private data.
+        Execute one epoch of local training with per-embedding routing.
+
+        Per-Embedding Decision Flow (Round > 1)
+        ----------------------------------------
+        For each embedding z in the batch:
+
+        1. Compute similarity to global prototypes and adaptive threshold.
+        2. **Anchored** (sim > threshold): Apply GPAD loss toward matched
+            global prototype.  Do NOT update local prototypes or buffer.
+        3. **Non-anchored** (sim <= threshold): Check against local prototypes:
+            a. Local sim > local_update_threshold → EMA-update closest local proto.
+            b. Local sim <= local_update_threshold → Add z to **novelty buffer**.
+        4. If novelty buffer reaches ``novelty_buffer_size``, trigger a fresh
+            K-Means clustering on the buffer to produce new local prototypes.
 
         Loss Composition
         ----------------
-        - **Round 1** (no global_prototypes): Loss = MAE reconstruction loss only.
-        - **Round > 1** (global_prototypes provided): Loss = MAE + GPAD distillation.
-
-        Within each batch the following steps occur:
-        1. Forward pass through the full model to obtain MAE loss.
-        2. Extract feature embeddings via `_extract_features`.
-        3. (If applicable) Compute GPAD loss against global prototypes.
-        4. (If applicable) Perform online EMA refinement of local prototypes.
-        5. Backward pass and optimizer step.
+        - **Round 1** (no global prototypes): Loss = MAE only.
+        - **Round > 1**: Loss = MAE + lambda_proto * GPAD (anchored only).
 
         Parameters
         ----------
@@ -203,7 +235,8 @@ class FederatedClient:
             Global prototype bank from the server, shape [M, D].
             None during Round 1.
         gpad_loss_fn : nn.Module, optional
-            The GPAD distillation loss module.
+            The GPAD distillation loss module.  Must expose
+            ``compute_anchor_mask(embeddings, protos) -> BoolTensor``.
 
         Returns
         -------
@@ -216,41 +249,50 @@ class FederatedClient:
 
         has_gpad = (global_prototypes is not None) and (gpad_loss_fn is not None)
         if has_gpad:
-            logger.info(f"[Client {self.client_id}] Training with MAE + GPAD (global protos: {global_prototypes.shape[0]})")
+            logger.info(
+                f"[Client {self.client_id}] Training with MAE + GPAD "
+                f"(lambda={self.lambda_proto}, global protos: {global_prototypes.shape[0]})"
+            )
         else:
             logger.info(f"[Client {self.client_id}] Training with MAE only (no global prototypes)")
 
         for batch_idx, batch in enumerate(dataloader):
             # ---- Data Preparation ----
-            # TensorDataset yields a tuple/list of tensors; plain Datasets may yield a tensor
             inputs = batch[0] if isinstance(batch, (list, tuple)) else batch
             inputs = inputs.to(self.dtype).to(self.device)
 
             # ---- Step 1: Forward Pass (MAE) ----
             outputs = self.model(inputs)
-
-            # Extract the MAE reconstruction loss computed by the model
             mae_loss = getattr(outputs, "loss", None)
             if mae_loss is None:
-                mae_loss = torch.tensor(0.0, dtype=self.dtype, device=self.device, requires_grad=True)
-
+                mae_loss = torch.tensor(0.0, dtype=self.dtype,
+                                        device=self.device, requires_grad=True)
             final_loss = mae_loss
 
             # ---- Step 2: Feature Extraction ----
-            # Extract pooled embeddings for GPAD and/or local prototype updates
             embeddings = self._extract_features(inputs)
 
-            # ---- Step 3: GPAD Distillation Loss ----
+            # ---- Step 3: Per-Embedding Routing (Round > 1) ----
             if has_gpad and embeddings is not None:
                 protos_on_device = global_prototypes.to(self.device)
-                gpad_loss = gpad_loss_fn(embeddings, protos_on_device)
-                final_loss = final_loss + gpad_loss
 
-            # ---- Step 4: Online Local Prototype Refinement (EMA) ----
-            if self.local_prototypes is not None and embeddings is not None:
-                self._update_local_prototypes_online(embeddings)
+                # 3a. Determine which embeddings are anchored vs novel
+                anchor_mask = gpad_loss_fn.compute_anchor_mask(
+                    embeddings, protos_on_device
+                )  # [B] bool: True = anchored
 
-            # ---- Step 5: Backward Pass ----
+                # 3b. GPAD loss — only for anchored embeddings
+                anchored_embs = embeddings[anchor_mask]
+                if anchored_embs.shape[0] > 0:
+                    gpad_loss = gpad_loss_fn(anchored_embs, protos_on_device)
+                    final_loss = final_loss + self.lambda_proto * gpad_loss
+
+                # 3c. Non-anchored embeddings → check local protos / buffer
+                non_anchored_embs = embeddings[~anchor_mask]
+                if non_anchored_embs.shape[0] > 0:
+                    self._route_non_anchored(non_anchored_embs)
+
+            # ---- Step 4: Backward Pass ----
             self.optimizer.zero_grad()
             final_loss.backward()
             self.optimizer.step()
@@ -259,59 +301,133 @@ class FederatedClient:
             num_batches += 1
 
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-        logger.info(f"[Client {self.client_id}] Epoch complete | avg_loss={avg_loss:.6f} | batches={num_batches}")
+        logger.info(
+            f"[Client {self.client_id}] Epoch complete | avg_loss={avg_loss:.6f} | "
+            f"batches={num_batches} | buffer_size={len(self.novelty_buffer)}"
+        )
         return avg_loss
 
     # ------------------------------------------------------------------
     # Online Local Prototype Update
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def _update_local_prototypes_online(self, embeddings: torch.Tensor) -> None:
+    def _route_non_anchored(self, embeddings: torch.Tensor) -> None:
         """
-        Refine local prototypes using Exponential Moving Average (EMA).
+        Route non-anchored (novel) embeddings through local prototype check.
 
-        For each sample in the batch:
-        1. Normalize both the sample embedding and all local prototypes.
-        2. Compute cosine similarity between the sample and every prototype.
-        3. Find the nearest prototype.
-        4. If similarity >= threshold, update that prototype via EMA:
-           P_new = (1 - alpha) * P_old + alpha * z
+        For each non-anchored embedding:
+        - If it matches a local prototype (cosine sim > local_update_threshold),
+          update that prototype via EMA.
+        - If it matches NO local prototype, add it to the novelty buffer.
 
-        This keeps the prototypes up-to-date as the model's feature space evolves
-        during training, without the overhead of full re-clustering every batch.
+        When the novelty buffer reaches ``novelty_buffer_size``, a fresh
+        K-Means is triggered to produce new local prototypes.
 
         Parameters
         ----------
         embeddings : torch.Tensor
-            Batch of feature embeddings, shape [B, D].
+            Non-anchored embeddings from the current batch, shape [B', D].
         """
-        # Ensure local prototypes are on the correct device
+        z_norm = F.normalize(embeddings.detach(), p=2, dim=1)
+
+        # ---- Case A: No local prototypes yet → all go into buffer ----
+        if self.local_prototypes is None or self.local_prototypes.shape[0] == 0:
+            for i in range(z_norm.shape[0]):
+                self.novelty_buffer.append(z_norm[i].clone())
+            self._maybe_cluster_buffer()
+            return
+
+        # ---- Case B: Compare against local prototypes ----
         if self.local_prototypes.device != self.device:
             self.local_prototypes = self.local_prototypes.to(self.device)
 
-        # L2-normalize for cosine similarity computation
-        z_norm = F.normalize(embeddings, p=2, dim=1)
         p_norm = F.normalize(self.local_prototypes, p=2, dim=1)
+        sims = torch.mm(z_norm, p_norm.t())       # [B', K_local]
+        max_sim, best_idx = sims.max(dim=1)        # [B']
 
-        # Similarity matrix: [B, K_local]
-        sims = torch.mm(z_norm, p_norm.t())
-
-        # Best match per sample
-        max_sim, best_idx = sims.max(dim=1)
-
-        # Filter: only update if similarity exceeds threshold
-        mask = max_sim > self.local_update_threshold
-        indices = torch.where(mask)[0]
-
-        if len(indices) > 0:
-            for idx in indices:
-                sample_emb = z_norm[idx]
-                proto_idx = best_idx[idx]
-
-                # EMA: blend old prototype with new observation
+        for i in range(z_norm.shape[0]):
+            if max_sim[i] > self.local_update_threshold:
+                # EMA-update the closest local prototype
+                proto_idx = best_idx[i]
                 old_proto = self.local_prototypes[proto_idx]
-                updated = (1 - self.local_ema_alpha) * old_proto + self.local_ema_alpha * sample_emb
+                updated = ((1 - self.local_ema_alpha) * old_proto
+                           + self.local_ema_alpha * z_norm[i])
                 self.local_prototypes[proto_idx] = updated
+            else:
+                # Truly novel — add to buffer
+                self.novelty_buffer.append(z_norm[i].clone())
+
+        self._maybe_cluster_buffer()
+
+    def _maybe_cluster_buffer(self) -> None:
+        """
+        Check if the novelty buffer has reached its threshold and trigger
+        clustering if so.
+        """
+        if len(self.novelty_buffer) >= self.novelty_buffer_size:
+            logger.info(
+                f"[Client {self.client_id}] Novelty buffer full "
+                f"({len(self.novelty_buffer)} >= {self.novelty_buffer_size}). "
+                f"Triggering fresh K-Means clustering..."
+            )
+            self._cluster_novelty_buffer()
+
+    @torch.no_grad()
+    def _cluster_novelty_buffer(self) -> None:
+        """
+        Run a fresh K-Means on the novelty buffer to produce new local prototypes.
+
+        This method is called when the novelty buffer reaches its size threshold.
+        It performs a completely re-initialized clustering (not reusing old
+        centroids) to discover new visual concepts from truly novel samples.
+
+        After clustering:
+        - ``self.local_prototypes`` is **replaced** with the new centroids.
+        - The novelty buffer is cleared.
+        """
+        if len(self.novelty_buffer) == 0:
+            return
+
+        # Stack buffer list into a single tensor [N_buffer, D]
+        buffer_tensor = torch.stack(self.novelty_buffer, dim=0).to(self.device)
+        buffer_tensor = F.normalize(buffer_tensor, p=2, dim=1)
+
+        # Use novelty_k (clamped to buffer size)
+        K = min(self.novelty_k, buffer_tensor.shape[0])
+
+        logger.info(
+            f"[Client {self.client_id}] Clustering novelty buffer: "
+            f"{buffer_tensor.shape[0]} samples → K={K}"
+        )
+
+        # Fresh K-Means — completely re-initialized centroids
+        new_protos = self._kmeans(buffer_tensor, K=K)
+
+        # Replace local prototypes with the newly discovered concepts
+        self.local_prototypes = new_protos.detach().clone()
+
+        # Clear the buffer
+        self.novelty_buffer.clear()
+
+        logger.info(
+            f"[Client {self.client_id}] Buffer clustered → "
+            f"{self.local_prototypes.shape[0]} new local prototypes"
+        )
+
+    def get_local_prototypes(self) -> Optional[torch.Tensor]:
+        """
+        Return the current local prototypes without re-clustering.
+
+        Used by the orchestrator in Round > 1 to collect prototypes
+        (which are maintained via online EMA + buffer clustering rather
+        than full post-training K-Means).
+
+        Returns
+        -------
+        Optional[torch.Tensor]
+            Local prototypes of shape [K, D], or None if not yet initialized.
+        """
+        return self.local_prototypes
 
     # ------------------------------------------------------------------
     # Prototype Generation (Post-Training)
@@ -420,6 +536,9 @@ class FederatedClient:
         """
         N, D = X.shape
 
+        # Clamp K to N to avoid index-out-of-bounds when samples < clusters
+        K = min(K, N)
+
         # 1. Random Initialization from data points
         indices = torch.randperm(N, device=X.device)[:K]
         centroids = X[indices].clone()
@@ -495,6 +614,9 @@ class ClientManager:
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         local_update_threshold: float = 0.7,
         local_ema_alpha: float = 0.1,
+        lambda_proto: float = 1.0,
+        novelty_buffer_size: int = 500,
+        novelty_k: int = 20,
     ) -> None:
         """
         Initialize the Client Manager and spawn all clients.
@@ -519,6 +641,12 @@ class ClientManager:
         local_ema_alpha : float, optional
             EMA interpolation factor for online prototype refinement.
             Defaults to 0.1.
+        lambda_proto : float, optional
+            GPAD loss weight: total = mae + lambda_proto * gpad. Defaults to 1.0.
+        novelty_buffer_size : int, optional
+            Buffer size before triggering K-Means on novel samples. Defaults to 500.
+        novelty_k : int, optional
+            K for buffer K-Means clustering. Defaults to 20.
         """
         self.clients: List[FederatedClient] = []
         self.num_clients = num_clients
@@ -527,6 +655,9 @@ class ClientManager:
         self.optimizer_kwargs = optimizer_kwargs
         self.local_update_threshold = local_update_threshold
         self.local_ema_alpha = local_ema_alpha
+        self.lambda_proto = lambda_proto
+        self.novelty_buffer_size = novelty_buffer_size
+        self.novelty_k = novelty_k
 
         self._initialize_clients(base_model)
 
@@ -567,6 +698,9 @@ class ClientManager:
                 optimizer_kwargs=self.optimizer_kwargs,
                 local_update_threshold=self.local_update_threshold,
                 local_ema_alpha=self.local_ema_alpha,
+                lambda_proto=self.lambda_proto,
+                novelty_buffer_size=self.novelty_buffer_size,
+                novelty_k=self.novelty_k,
             )
             self.clients.append(client)
 
