@@ -11,26 +11,26 @@ approach highly communication-efficient for Federated Learning.
 The design draws on three pillars:
 
 1. **Bottleneck Adapters** (Houlsby et al., ICML 2019):
-   Small MLP modules inserted inside transformer blocks that learn a
-   task-specific residual correction to the frozen hidden states.
+    Small MLP modules inserted inside transformer blocks that learn a
+    task-specific residual correction to the frozen hidden states.
 
 2. **Information Bottleneck** (Tishby et al., 2000):
-   The down-projection forces the adapter to retain only information
-   that is relevant to the downstream objective, discarding noise.
+    The down-projection forces the adapter to retain only information
+    that is relevant to the downstream objective, discarding noise.
 
 3. **Masked Autoencoders** (He et al., CVPR 2022):
-   The frozen backbone is a ViTMAE model pre-trained with masked image
-   modelling, providing strong visual features as the starting point.
+    The frozen backbone is a ViTMAE model pre-trained with masked image
+    modelling, providing strong visual features as the starting point.
 
 Module Contents
 ---------------
-- ``IBA_Adapter``           : The bottleneck adapter module itself.
-- ``ViTBlockWithAdapter``   : A wrapper that pairs a frozen encoder layer
-                              with a trainable adapter.
-- ``inject_adapters``       : The main entry-point that surgically inserts
-                              adapters into an existing pre-trained model.
-- ``_log_param_stats``      : A small diagnostic utility that prints the
-                              frozen-vs-trainable parameter split.
+- ``IBA_Adapter``           :   The bottleneck adapter module itself.
+- ``ViTBlockWithAdapter``   :   A wrapper that pairs a frozen encoder layer
+                                with a trainable adapter.
+- ``inject_adapters``       :   The main entry-point that surgically inserts
+                                adapters into an existing pre-trained model.
+- ``_log_param_stats``      :   A small diagnostic utility that prints the
+                                frozen-vs-trainable parameter split.
 
 References
 ----------
@@ -64,27 +64,27 @@ class IBA_Adapter(nn.Module):
     ---------------------------
     Given an input tensor H of shape (Batch, SeqLen, D):
 
-        Step 1 — Down-Project  : H is linearly projected from D dimensions
-                                 down to a much smaller d dimensions (d << D).
-                                 This is the "information bottleneck" that
-                                 forces the adapter to retain only the most
-                                 task-relevant information.
+        Step 1 — Down-Project  :    H is linearly projected from D dimensions
+                                    down to a much smaller d dimensions (d << D).
+                                    This is the "information bottleneck" that
+                                    forces the adapter to retain only the most
+                                    task-relevant information.
 
-        Step 2 — Activation    : A non-linear activation (GELU by default)
-                                 is applied to the compressed representation,
-                                 allowing the adapter to model complex
-                                 non-linear relationships.
+        Step 2 — Activation    :    A non-linear activation (GELU by default)
+                                    is applied to the compressed representation,
+                                    allowing the adapter to model complex
+                                    non-linear relationships.
 
-        Step 3 — Up-Project    : The d-dimensional representation is projected
-                                 back up to the original D dimensions,
-                                 reconstructing a full-size correction vector.
+        Step 3 — Up-Project    :    The d-dimensional representation is projected
+                                    back up to the original D dimensions,
+                                    reconstructing a full-size correction vector.
 
-        Step 4 — Dropout       : Dropout regularization is applied to prevent
-                                 the adapter from overfitting on small local
-                                 datasets (critical in Federated Learning).
+        Step 4 — Dropout       :    Dropout regularization is applied to prevent
+                                    the adapter from overfitting on small local
+                                    datasets (critical in Federated Learning).
 
-        Step 5 — Residual Add  : The adapter output (ΔH) is added back to
-                                 the original input H, forming a skip connection.
+        Step 5 — Residual Add  :    The adapter output (ΔH) is added back to
+                                    the original input H, forming a skip connection.
 
     Identity Initialization
     -----------------------
@@ -223,18 +223,18 @@ class ViTBlockWithAdapter(nn.Module):
     this wrapper:
 
         1. Runs the **original frozen block** to produce its normal output
-           (self-attention → feed-forward → layer norm).
+            (self-attention → feed-forward → layer norm).
 
         2. **Extracts the hidden states** from the output, handling
-           Hugging Face's heterogeneous return types (tuple, ModelOutput,
-           or raw tensor).
+            Hugging Face's heterogeneous return types (tuple, ModelOutput,
+            or raw tensor).
 
         3. **Applies the IBA Adapter** to the hidden states, adding the
-           learned residual correction ΔH.
+            learned residual correction ΔH.
 
         4. **Repackages the result** into the same structure that the
-           original block returned, so that downstream layers and the
-           model pipeline remain completely unaware of the modification.
+            original block returned, so that downstream layers and the
+            model pipeline remain completely unaware of the modification.
 
     Parameters
     ----------
@@ -344,7 +344,7 @@ def inject_adapters(model: PreTrainedModel, bottleneck_dim: int = 64) -> PreTrai
         For every transformer layer in the encoder:
         a) Create a fresh ``IBA_Adapter`` with the correct dimensions.
         b) Move the adapter to the same device and dtype as the layer
-           (handles GPU placement and mixed precision automatically).
+            (handles GPU placement and mixed precision automatically).
         c) Wrap the original layer in ``ViTBlockWithAdapter``.
         d) Replace the layer in the encoder's ``nn.ModuleList``.
 
