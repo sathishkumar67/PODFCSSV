@@ -1,433 +1,496 @@
+"""
+Parameter-Efficient Fine-Tuning via Information-Bottlenecked Adapters (IBA).
+
+This module implements an adapter-based approach to fine-tune large
+Vision Transformer (ViT) models—specifically Hugging Face's ViTMAE—without
+modifying the pre-trained backbone weights. Instead, lightweight bottleneck
+modules called "adapters" are injected after each frozen encoder layer.
+Only these adapter parameters (~1 % of total) are trained, making the
+approach highly communication-efficient for Federated Learning.
+
+The design draws on three pillars:
+
+1. **Bottleneck Adapters** (Houlsby et al., ICML 2019):
+   Small MLP modules inserted inside transformer blocks that learn a
+   task-specific residual correction to the frozen hidden states.
+
+2. **Information Bottleneck** (Tishby et al., 2000):
+   The down-projection forces the adapter to retain only information
+   that is relevant to the downstream objective, discarding noise.
+
+3. **Masked Autoencoders** (He et al., CVPR 2022):
+   The frozen backbone is a ViTMAE model pre-trained with masked image
+   modelling, providing strong visual features as the starting point.
+
+Module Contents
+---------------
+- ``IBA_Adapter``           : The bottleneck adapter module itself.
+- ``ViTBlockWithAdapter``   : A wrapper that pairs a frozen encoder layer
+                              with a trainable adapter.
+- ``inject_adapters``       : The main entry-point that surgically inserts
+                              adapters into an existing pre-trained model.
+- ``_log_param_stats``      : A small diagnostic utility that prints the
+                              frozen-vs-trainable parameter split.
+
+References
+----------
+[1] Houlsby, N. et al., "Parameter-Efficient Transfer Learning for NLP", ICML 2019.
+[2] Tishby, N. et al., "The Information Bottleneck Method", 2000.
+[3] He, K. et al., "Masked Autoencoders Are Scalable Vision Learners", CVPR 2022.
+"""
+
 from __future__ import annotations
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple, Union, List, Any
 from transformers import PreTrainedModel, ViTMAEForPreTraining
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. ADAPTER MODULE
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class IBA_Adapter(nn.Module):
     """
-    Information-Bottlenecked Adapter (IBA) Module for Efficient parameter-efficient Fine-Tuning.
+    Information-Bottlenecked Adapter (IBA) for Parameter-Efficient Fine-Tuning.
 
-    Overview
-    --------
-    The IBA Adapter is a lightweight neural network module designed to be inserted 
-    into pre-trained frozen backbones (like ViT or BERT). It introduces a small 
-    number of trainable parameters to adapt the model to new tasks (or domains) 
-    without retraining the entire massive network.
+    This module implements a two-layer bottleneck MLP that is inserted after
+    each frozen transformer block. It learns a small residual correction
+    ΔH to the hidden states, so that the output of a wrapped block becomes:
 
-    Architectural Design
-    --------------------
-    The adapter follows a "Bottleneck" structure to minimize parameter count while 
-    maximizing adaptation capability. Ideally, it compresses high-dimensional 
-    semantic features into a compact representation and then reconstructs them.
+        H_out = H_frozen + ΔH
 
-    Structure:
-        Input (D) -> Down-Projection (d) -> Non-Linearity -> Up-Projection (D) -> Dropout -> + Residual
+    Architecture (step by step)
+    ---------------------------
+    Given an input tensor H of shape (Batch, SeqLen, D):
 
-    Key Design Principles
-    ---------------------
-    1.  **Information Bottleneck**: By projecting high-dimensional features (D) 
-        down to a smaller dimension (d), the model is forced to learn only the 
-        most salient features relevant to the specific task, ignoring noise.
-    
-    2.  **Identity Initialization**: A critical stability feature for Federated Learning.
-        -   The Up-Projection layer is initialized with **zeros**.
-        -   This ensures that at initialization (step 0), the adapter output is exactly 0.
-        -   Result: `Layer(x) + Adapter(x) = Layer(x) + 0 = Layer(x)`.
-        -   This prevents "catastrophic forgetting" or "semantic shock" where random 
-            initialization would distort the carefully learned features of the 
-            pre-trained backbone.
+        Step 1 — Down-Project  : H is linearly projected from D dimensions
+                                 down to a much smaller d dimensions (d << D).
+                                 This is the "information bottleneck" that
+                                 forces the adapter to retain only the most
+                                 task-relevant information.
 
-    Attributes
+        Step 2 — Activation    : A non-linear activation (GELU by default)
+                                 is applied to the compressed representation,
+                                 allowing the adapter to model complex
+                                 non-linear relationships.
+
+        Step 3 — Up-Project    : The d-dimensional representation is projected
+                                 back up to the original D dimensions,
+                                 reconstructing a full-size correction vector.
+
+        Step 4 — Dropout       : Dropout regularization is applied to prevent
+                                 the adapter from overfitting on small local
+                                 datasets (critical in Federated Learning).
+
+        Step 5 — Residual Add  : The adapter output (ΔH) is added back to
+                                 the original input H, forming a skip connection.
+
+    Identity Initialization
+    -----------------------
+    A crucial detail for stable training: the Up-Projection layer's weights
+    and biases are initialized to **zero**. This means that at the very first
+    training step, the adapter produces ΔH = 0, so the wrapped block behaves
+    exactly like the original frozen block. The adapters then learn to
+    gradually modify the features as training progresses, avoiding any
+    "semantic shock" that would disrupt the pre-trained representations.
+
+    Parameters
     ----------
     input_dim : int
-        The dimensionality of the input features (Hidden Size of the backbone).
+        The hidden dimension of the backbone model (e.g. 768 for ViT-Base/16).
     bottleneck_dim : int
-        The dimensionality of the compressed bottleneck space.
-    down_project : nn.Linear
-        Linear layer reducing dimension from `input_dim` to `bottleneck_dim`.
+        The dimension of the compressed bottleneck space. Smaller values
+        give fewer parameters but may limit the adapter's capacity.
+        Default: 64.
+    dropout : float
+        Dropout probability applied after the up-projection. Default: 0.0.
     activation : nn.Module
-        Non-linear activation function (e.g., GELU, ReLU) to enable learning complex patterns.
-    up_project : nn.Linear
-        Linear layer restoring dimension from `bottleneck_dim` back to `input_dim`.
-    dropout : nn.Dropout
-        Dropout layer for regularization during training.
+        Non-linear activation between the two projections. Default: GELU.
     """
 
     def __init__(
-        self, 
-        input_dim: int, 
-        bottleneck_dim: int = 64, 
+        self,
+        input_dim: int,
+        bottleneck_dim: int = 64,
         dropout: float = 0.0,
         activation: nn.Module = nn.GELU()
     ) -> None:
-        """
-        Initializes the IBA Adapter with the specified configuration.
-
-        Parameters
-        ----------
-        input_dim : int
-            The hidden size of the pre-trained model (e.g., 768 for ViT-Base).
-        bottleneck_dim : int, optional
-            The size of the bottleneck. Smaller values result in fewer parameters 
-            but may limit capacity. Defaults to 64.
-        dropout : float, optional
-            Dropout probability applied to the output of the adapter. Defaults to 0.0.
-        activation : nn.Module, optional
-            The activation function to use within the bottleneck. Defaults to nn.GELU().
-        """
         super().__init__()
         self.input_dim = input_dim
         self.bottleneck_dim = bottleneck_dim
         self.activation = activation
 
-        # 1. Down-Projection Layer
-        # Compresses the input semantic vector into the bottleneck space (D -> d).
+        # Step 1 component: compress D → d
         self.down_project = nn.Linear(input_dim, bottleneck_dim, bias=True)
-        
-        # 2. Up-Projection Layer
-        # Reconstructs the semantic vector from the bottleneck space (d -> D).
+
+        # Step 3 component: reconstruct d → D
         self.up_project = nn.Linear(bottleneck_dim, input_dim, bias=True)
-        
-        # 3. Regularization
+
+        # Step 4 component: regularization
         self.dropout = nn.Dropout(dropout)
-        
-        # 4. Weight Initialization
-        # Apply strict initialization rules to ensure stable convergence.
+
+        # Apply the identity-init strategy immediately after construction
         self._init_weights()
 
     def _init_weights(self) -> None:
         """
-        Applies robust initialization strategies for the adapter layers.
+        Apply carefully chosen weight initialization for training stability.
 
-        Initialization Strategy
-        -----------------------
-        1.  **Down-Projection**: 
-            -   **Weights**: Kaiming Normal (He Initialization) with 'relu' nonlinearity mode. 
-                This maintains the variance of activations through the layer, preventing 
-                vanishing/exploding gradients in the bottleneck.
-            -   **Bias**: Initialized to Zero.
+        Strategy
+        --------
+        - **Down-Projection (W_down)**:
+            Kaiming Normal initialization with ``fan_out`` mode and ``relu``
+            nonlinearity. This preserves the variance of activations flowing
+            through the bottleneck, preventing vanishing or exploding
+            gradients in the early training steps.
 
-        2.  **Up-Projection**:
-            -   **Weights & Bias**: Zero Initialization. 
-            -   **Reasoning**: This ensures the adapter contributes nothing (0) at the 
-                very start of training. The model initially behaves exactly like the 
-                original frozen backbone, allowing the adapter to gradually learn 
-                modifications rather than starting with random noise.
+        - **Down-Projection Bias (b_down)**:
+            Initialized to zero so that the bias does not introduce any
+            constant offset before the activation function.
+
+        - **Up-Projection (W_up) — ZERO INIT**:
+            Both weights and bias are set to zero. This is the single most
+            important initialization choice in the adapter: it guarantees
+            that the adapter output is identically zero at step 0, making
+            the wrapped block behave like the original frozen block.
+            Without this, random initialization would immediately corrupt
+            the pre-trained features.
+
+        - **Up-Projection Bias (b_up) — ZERO INIT**:
+            Also set to zero to complete the identity initialization.
         """
-        # A. Down-Projection Initialization
-        # We use 'mode=fan_out' and 'nonlinearity=relu' as a robust default for linear layers followed by activations.
+        # Down-projection: Kaiming Normal maintains activation variance
         nn.init.kaiming_normal_(self.down_project.weight, mode='fan_out', nonlinearity='relu')
         if self.down_project.bias is not None:
             nn.init.zeros_(self.down_project.bias)
-        
-        # B. Up-Projection Initialization (Identity Init)
-        # This is the most critical step for stability in fine-tuning.
+
+        # Up-projection: Zero initialization for identity behaviour at step 0
         nn.init.zeros_(self.up_project.weight)
         if self.up_project.bias is not None:
             nn.init.zeros_(self.up_project.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Executes the forward pass of the adapter module.
+        Compute the adapted hidden states via the bottleneck residual path.
 
-        The flow is:
-        Input -> [Down Project] -> [Activation] -> [Up Project] -> [Dropout] -> + Input (Residual)
+        Mathematically:
+            H' = H + Dropout( W_up · σ( W_down · H + b_down ) + b_up )
 
         Parameters
         ----------
         x : torch.Tensor
-            The input hidden states from the transformer block.
-            Shape: [Batch_Size, Sequence_Length, Hidden_Dimension]
+            Input hidden states from the transformer block.
+            Shape: ``(Batch, SeqLen, D)``
 
         Returns
         -------
         torch.Tensor
-            The adapted hidden states, with the exact same shape as the input.
+            Adapted hidden states with the same shape as the input.
         """
-        # Save the original input for the residual connection
+        # Save the original input for the residual (skip) connection
         residual = x
-        
-        # 1. Compression: Project down to bottleneck dimension
+
+        # Step 1: Compress from D dimensions down to d dimensions
         x = self.down_project(x)
-        
-        # 2. Non-Linearity: Apply activation function
+
+        # Step 2: Apply non-linear activation
         x = self.activation(x)
-        
-        # 3. Reconstruction: Project back up to original dimension
+
+        # Step 3: Reconstruct back to D dimensions
         x = self.up_project(x)
-        
-        # 4. Regularization: Apply dropout
+
+        # Step 4: Apply dropout for regularization
         x = self.dropout(x)
-        
-        # 5. Residual Connection: Add the learned delta to the original features
+
+        # Step 5: Add the residual — this is the skip connection
         return residual + x
 
     def __repr__(self) -> str:
-        """
-        Returns a string representation of the module for debugging purposes.
-        """
         return f"IBA_Adapter(in_features={self.input_dim}, bottleneck={self.bottleneck_dim})"
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. ADAPTER-INJECTED TRANSFORMER BLOCK WRAPPER
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class ViTBlockWithAdapter(nn.Module):
     """
-    Wrapper Module to Inject an Adapter into a Frozen Transformer Block.
+    Wraps a single frozen ViT encoder layer with a trainable IBA Adapter.
 
-    Purpose
-    -------
-    This class wraps an existing (frozen) `ViTLayer` or `BertLayer` from the 
-    Hugging Face library. It intercepts the forward pass, allows the original 
-    block to process the input, and then applies the `IBA_Adapter` to the output 
-    hidden states.
+    This wrapper transparently replaces the original layer inside the
+    encoder's ``nn.ModuleList``. When the encoder calls ``layer(hidden_states)``,
+    this wrapper:
 
-    It ensures compatibility with Hugging Face's complex return types 
-    (tuples vs ModelOutput objects) so that the rest of the model pipeline 
-    remains unaware of the modification.
+        1. Runs the **original frozen block** to produce its normal output
+           (self-attention → feed-forward → layer norm).
+
+        2. **Extracts the hidden states** from the output, handling
+           Hugging Face's heterogeneous return types (tuple, ModelOutput,
+           or raw tensor).
+
+        3. **Applies the IBA Adapter** to the hidden states, adding the
+           learned residual correction ΔH.
+
+        4. **Repackages the result** into the same structure that the
+           original block returned, so that downstream layers and the
+           model pipeline remain completely unaware of the modification.
+
+    Parameters
+    ----------
+    original_block : nn.Module
+        The frozen transformer layer being wrapped (e.g. ``ViTMAELayer``).
+    adapter : IBA_Adapter
+        The trainable adapter instance to apply after the block.
     """
 
     def __init__(self, original_block: nn.Module, adapter: IBA_Adapter) -> None:
-        """
-        Wraps a transformer block with an adapter.
-
-        Parameters
-        ----------
-        original_block : nn.Module
-            The original, frozen Transformer block (e.g., `ViTLayer`).
-        adapter : IBA_Adapter
-            The trainable adapter instance to be applied after the block.
-        """
         super().__init__()
+        # Store the frozen block and trainable adapter as sub-modules
         self.original_block = original_block
         self.adapter = adapter
 
     def forward(
-        self, 
+        self,
         hidden_states: torch.Tensor,
         *args,
         **kwargs
     ) -> Union[Tuple[torch.Tensor], Tuple[torch.Tensor, Any]]:
         """
-        Forward pass that mimics the signature of a standard Hugging Face ViTLayer.
-        
-        Note: arguments like `head_mask` or `output_attentions` are implicitly handled 
-        or omitted based on the specific requirements of the backbone (e.g., ViTMAE 
-        does not support `head_mask`).
+        Execute the frozen block followed by the trainable adapter.
 
         Parameters
         ----------
         hidden_states : torch.Tensor
-            Input tensor of shape [Batch, SeqLen, Dim].
-        args : tuple
-            Variable positional arguments required by the pipeline.
-        kwargs : dict
-            Variable keyword arguments required by the pipeline.
+            Input tensor of shape ``(Batch, SeqLen, D)``.
+        *args, **kwargs
+            Additional arguments forwarded from the parent ViTEncoder loop
+            (e.g. ``head_mask``, ``output_attentions``). These are captured
+            here to prevent a TypeError but are intentionally NOT passed to
+            the inner block, because ViTMAELayer does not accept them.
 
         Returns
         -------
         Union[Tuple[torch.Tensor], Tuple[torch.Tensor, Any]]
-            The output tuple expected by the transformer model, containing the 
-            adapted hidden states and potentially attention weights.
+            The output in the same format as the original block, but with
+            the hidden states replaced by the adapter-modified version.
         """
-        # 1. Execute the Original Frozen Block
-        # We explicitly ignored *args and **kwargs (like head_mask) on purpose 
-        # because ViTMAE layers typically reject them.
+        # Step 1: Run the original frozen encoder block
+        #         Only hidden_states is passed — extra args like head_mask
+        #         are dropped because ViTMAELayer's forward() rejects them.
         outputs = self.original_block(hidden_states)
-        
-        # 2. Extract the Hidden States
-        # Hugging Face models can return:
-        # - A tuple: (hidden_states, attention_weights, ...)
-        # - A ModelOutput object (like BaseModelOutput)
-        # - A raw Tensor
+
+        # Step 2: Extract hidden states from the return value
+        #         Hugging Face blocks may return:
+        #           - A tuple:       (hidden_states, attention_weights, ...)
+        #           - A ModelOutput:  object with .hidden_states attribute
+        #           - A raw tensor:   just the hidden states directly
         if isinstance(outputs, tuple):
             x = outputs[0]
         elif hasattr(outputs, "hidden_states"):
             x = outputs.hidden_states
         else:
             x = outputs
-        
-        # 3. Apply the Adapter
-        # The adapter modifies the features in-place (conceptually) via residual connection.
+
+        # Step 3: Apply the IBA adapter to add the learned correction ΔH
         x = self.adapter(x)
-        
-        # 4. Repackage Result
-        # We must return exactly what the parent model expects to avoid breaking the pipeline.
+
+        # Step 4: Repackage the result to match the original return type
+        #         so that downstream layers receive the expected structure
         if isinstance(outputs, tuple):
-            # Reconstruct the tuple: (new_hidden_states, *rest_of_tuple)
+            # Replace the first element (hidden states) while keeping the rest
             return (x,) + outputs[1:]
         elif hasattr(outputs, "hidden_states"):
-            # If it's a ModelOutput object, we try to update it.
-            # Some objects are immutable or downstream layers check strict types.
+            # Try to update the ModelOutput object in place
             try:
                 outputs.hidden_states = x
                 return outputs
-            except:
-                # Fallback: Return a tuple, which HF pipelines usually accept as a valid alternative.
-                return (x,) 
+            except (AttributeError, TypeError):
+                # Some ModelOutput objects are immutable — fall back to tuple
+                return (x,)
         else:
-            # If input was just a Tensor, return the new Tensor.
+            # Raw tensor output — return the adapted tensor directly
             return x
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. ADAPTER INJECTION UTILITY
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def inject_adapters(model: PreTrainedModel, bottleneck_dim: int = 64) -> PreTrainedModel:
     """
-    Core Utility: Injects IBA Adapters into the Encoder of a Pre-trained Model.
+    Inject IBA adapters into every encoder layer of a pre-trained ViT model.
 
-    This function performs the precise surgery needed to convert a standard 
-    pre-trained model (like ViTMAE) into an adapter-tuned model.
+    This function performs the surgical modification needed to convert a
+    standard pre-trained model into an adapter-tuned model suitable for
+    Federated Learning. After this function returns, training will only
+    update ~1 % of the total parameters (the adapters), while the backbone
+    remains frozen.
 
-    Procedure
-    ---------
-    1.  **Freeze Backbone**: Sets `requires_grad=False` for ALL original parameters.
-    2.  **Locate Encoder**: Identifies the list of transformer layers (`encoder.layer`).
-    3.  **Inject Adapters**:
-        -   Iterates through each layer.
-        -   Creates a new `IBA_Adapter` matching the layer's dimensions.
-        -   Wraps the original layer in `ViTBlockWithAdapter`.
-        -   Replaces the layer in the model's module list.
-    4.  **Activate Adapters**: Ensures only the new adapter parameters are trainable.
+    Procedure (step by step)
+    ------------------------
+    Step 1 — **Freeze the backbone**:
+        Set ``requires_grad = False`` for every parameter in the model.
+        This ensures the pre-trained weights are never modified during
+        training, preserving the learned representations.
+
+    Step 2 — **Locate the encoder**:
+        Inspect the model structure to find the list of transformer layers.
+        Supports two common layouts:
+        - ``model.vit.encoder.layer`` (ViTMAEForPreTraining)
+        - ``model.encoder.layer``     (generic BERT/ViT)
+
+    Step 3 — **Wrap each layer**:
+        For every transformer layer in the encoder:
+        a) Create a fresh ``IBA_Adapter`` with the correct dimensions.
+        b) Move the adapter to the same device and dtype as the layer
+           (handles GPU placement and mixed precision automatically).
+        c) Wrap the original layer in ``ViTBlockWithAdapter``.
+        d) Replace the layer in the encoder's ``nn.ModuleList``.
+
+    Step 4 — **Audit parameters**:
+        Print a summary of total, frozen, and trainable parameters to
+        verify that only the adapters are trainable.
 
     Parameters
     ----------
     model : PreTrainedModel
-        The Hugging Face model instance (e.g., `ViTMAEForPreTraining`).
-    bottleneck_dim : int, optional
-        The dimension of the adapter bottleneck. Defaults to 64.
+        A Hugging Face pre-trained model (e.g. ``ViTMAEForPreTraining``).
+    bottleneck_dim : int
+        The bottleneck dimension for every adapter. Default: 64.
 
     Returns
     -------
     PreTrainedModel
-        The modified model instance with adapters injected and backbone frozen.
+        The same model object, mutated in-place with adapters injected
+        and the backbone frozen.
 
     Raises
     ------
     AttributeError
-        If the model structure is not recognized (i.e., cannot find the encoder layers).
+        If the model structure is not recognized (i.e. cannot find the
+        encoder's layer list at the expected locations).
     """
     print(f"\n{'='*60}")
-    print(f"[System] Starting Adapter Injection Procedure")
+    print(f"[Adapter Injection] Starting procedure")
     print(f"{'='*60}")
 
-    # 1. Freeze the entire model backbone
-    # This ensures we don't destroy the pre-trained knowledge during fine-tuning.
-    print("[Config] Freezing original backbone parameters...")
+    # Step 1 — Freeze every parameter in the backbone
+    print("[Adapter Injection] Freezing backbone parameters...")
     for param in model.parameters():
         param.requires_grad = False
-        
-    # 2. Locate the Encoder Module
-    # We inspect the model structure to find where the Transformer layers live.
+
+    # Step 2 — Locate the encoder's ModuleList of transformer layers
     if hasattr(model, "vit") and hasattr(model.vit, "encoder"):
-        # Standard ViTMAE structure (Hugging Face)
+        # ViTMAEForPreTraining layout: model.vit.encoder.layer
         encoder = model.vit.encoder
         config = model.config
     elif hasattr(model, "encoder") and hasattr(model.encoder, "layer"):
-        # Generic BERT/ViT structure fallback
+        # Generic BERT/ViT layout: model.encoder.layer
         encoder = model.encoder
         config = model.config
     else:
         raise AttributeError(
-            "Could not locate 'encoder.layer'. "
-            "Model structure unknown (expected 'vit.encoder' or 'encoder')."
+            "Unrecognized model structure — expected `model.vit.encoder` or "
+            "`model.encoder` with a `.layer` ModuleList."
         )
 
     input_dim = config.hidden_size
     num_layers = len(encoder.layer)
+    print(f"[Adapter Injection] Backbone: hidden_dim={input_dim}, num_layers={num_layers}")
+    print(f"[Adapter Injection] Adapter:  bottleneck_dim={bottleneck_dim}")
 
-    print(f"[Config] Model Config: Hidden Dim={input_dim}, Layers={num_layers}")
-    print(f"[Config] Adapter Config: Bottleneck Dim={bottleneck_dim}")
-
-    # 3. Iterate and Replace
-    print("[Action] Injecting adapters into encoder layers...")
-    
+    # Step 3 — Iterate through every encoder layer and wrap it
     for i, layer in enumerate(encoder.layer):
-        # Create the adapter instance
+        # 3a. Create a fresh adapter with matching dimensions
         adapter = IBA_Adapter(input_dim=input_dim, bottleneck_dim=bottleneck_dim)
-        
-        # CRITICAL: Move adapter to the correct device/dtype.
-        # This handles cases where the model is already on GPU or in FP16/BF16.
-        # We take the first parameter of the layer as a reference.
+
+        # 3b. Move adapter to the same device/dtype as the layer it wraps
+        #     (this handles GPU placement and FP16/BF16 mixed precision)
         ref_param = next(layer.parameters())
         adapter.to(device=ref_param.device, dtype=ref_param.dtype)
-        
-        # Wrap the original layer with our adapter-enabled wrapper
-        wrapped_layer = ViTBlockWithAdapter(original_block=layer, adapter=adapter)
-        
-        # Perform the replacement in the ModuleList
-        encoder.layer[i] = wrapped_layer
-        
-        # Progress logging
-        if (i + 1) % 4 == 0 or (i + 1) == num_layers:
-            print(f"  -> Processed layer {i + 1}/{num_layers}")
 
-    print(f"[System] Injection Complete. Decoder layers ignored (if present).")
-    
-    # 4. Verification
-    # Print a summary of trainable vs frozen parameters to confirm success.
-    count_trainable_params(model)
-    
+        # 3c. Replace the original layer with the adapter-wrapped version
+        encoder.layer[i] = ViTBlockWithAdapter(original_block=layer, adapter=adapter)
+
+        # Progress logging every 4 layers and at the end
+        if (i + 1) % 4 == 0 or (i + 1) == num_layers:
+            print(f"  -> Injected layer {i + 1}/{num_layers}")
+
+    print("[Adapter Injection] Complete (decoder layers untouched).")
+
+    # Step 4 — Print parameter audit to verify the freeze/inject split
+    _log_param_stats(model)
     return model
 
 
-def count_trainable_params(model: nn.Module) -> None:
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. PARAMETER AUDIT UTILITY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _log_param_stats(model: nn.Module) -> None:
     """
-    Audit Utility: Prints the distribution of Frozen vs Trainable parameters.
-    
-    Useful for verifying that:
-    1.  The backbone is indeed frozen (0 gradients).
-    2.  The adapters are trainable (requires_grad=True).
-    
+    Print a summary of frozen vs. trainable parameters.
+
+    This diagnostic utility is called after adapter injection to verify
+    that the backbone is fully frozen and only the adapter weights are
+    trainable. A healthy adapter-tuned ViT-Base should show approximately
+    ~1 % trainable parameters.
+
     Parameters
     ----------
     model : nn.Module
         The model to inspect.
     """
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    frozen_params = total_params - trainable_params
-    
-    ratio = (trainable_params / total_params) * 100 if total_params > 0 else 0
-    
-    print(f"\n[Stats] Parameter Audit:")
-    print(f"  - Total Parameters:     {total_params:,}")
-    print(f"  - Frozen Backbone:      {frozen_params:,}")
-    print(f"  - Trainable (Adapters): {trainable_params:,}")
-    print(f"  - Trainable Ratio:      {ratio:.2f}%")
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = total - trainable
+    ratio = (trainable / total) * 100 if total > 0 else 0.0
+
+    print(f"\n[Param Audit]")
+    print(f"  Total:     {total:>12,}")
+    print(f"  Frozen:    {frozen:>12,}")
+    print(f"  Trainable: {trainable:>12,}  ({ratio:.2f}%)")
     print(f"{'='*60}\n")
 
 
-# =============================================================================
-# Main Execution Block (Integration Test)
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. STANDALONE INTEGRATION TEST
+# ═══════════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
     """
-    Test Script to verify the Adapter Injection pipeline.
-    
-    Steps:
-    1.  Load a real ViTMAE model from Hugging Face.
-    2.  Inject Adapters.
-    3.  Run a dummy forward pass to check for shape mismatches or runtime errors.
+    Quick integration test to verify the adapter injection pipeline.
+
+    Steps
+    -----
+    1. Load the pre-trained ViTMAE model from Hugging Face.
+    2. Run ``inject_adapters`` to freeze the backbone and add adapters.
+    3. Create a dummy image tensor and run a forward pass.
+    4. Verify that the model produces a valid loss without errors.
+
+    Expected output:
+        - Parameter audit showing ~1% trainable (adapter) parameters.
+        - A finite loss value from the forward pass.
     """
-    print("[Main] Loading pre-trained ViTMAE...")
+    print("[Test] Loading facebook/vit-mae-base...")
     try:
-        # NOTE: Requires `pip install transformers`
+        # Load the pre-trained ViTMAE model
         model = ViTMAEForPreTraining.from_pretrained("facebook/vit-mae-base")
-        
-        # Inject Adapters
+
+        # Inject adapters into all 12 encoder layers
         model = inject_adapters(model, bottleneck_dim=64)
-        
-        # Sanity Check: Forward pass
-        print("[Main] Running dummy forward pass to verify graph integrity...")
-        dummy_input = torch.randn(1, 3, 224, 224)
-        
-        # Move inputs to same device as model
+
+        # Create a dummy input image: 1 image, 3 channels, 224x224 pixels
+        print("[Test] Running forward pass sanity check...")
+        dummy = torch.randn(1, 3, 224, 224)
         device = next(model.parameters()).device
-        dummy_input = dummy_input.to(device)
-        
-        # Forward pass (ensure gradients flow through adapters)
-        output = model(dummy_input)
-        
+        dummy = dummy.to(device)
+
+        # Forward pass — the model should compute MAE loss internally
+        output = model(dummy)
         loss_val = output.loss.item() if hasattr(output, "loss") else "N/A"
-        print(f"[Success] Standard Forward pass complete. Loss: {loss_val}")
+        print(f"[Test] Forward pass OK — loss={loss_val}")
 
     except Exception as e:
-        print(f"[Error] An error occurred during execution: {e}")
+        print(f"[Test] Failed: {e}")
