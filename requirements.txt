@@ -1,10 +1,18 @@
-# Core Dependencies
+# ─── Core Deep Learning ──────────────────────────────────────────────────────
+# PyTorch: tensor operations, autograd, GPU acceleration, distributed training
 torch>=2.0.0
+
+# TorchVision: image transforms, pretrained model utilities
 torchvision>=0.15.0
 
-# Hugging Face (ViT-MAE backbone)
+# ─── Hugging Face (ViT-MAE Backbone) ────────────────────────────────────────
+# Provides ViTMAEForPreTraining — the pre-trained Masked Autoencoder backbone
+# that serves as the frozen feature extractor in our framework
 transformers>=4.30.0
 
-# Numerical & Scientific
+# ─── Numerical & Scientific ─────────────────────────────────────────────────
+# NumPy: array operations and numerical utilities
 numpy>=1.21.0
+
+# scikit-learn: additional ML utilities (metrics, evaluation)
 scikit-learn>=1.0.0
