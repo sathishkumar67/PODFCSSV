@@ -126,6 +126,8 @@ class GlobalPrototypeBank:
                 self.prototypes = p_new.unsqueeze(0)
                 continue
                 
+            # Defensively keep bank on the unit sphere before dot-product similarity
+            self.prototypes = F.normalize(self.prototypes, p=2, dim=1)
             # Compute similarities: Dot product of (M, D) and (D,) -> (M,)
             sims = torch.mv(self.prototypes, p_new)
             max_sim, best_idx = sims.max(dim=0)
