@@ -1,6 +1,6 @@
 # PODFCSSV — Prototype-Oriented Distillation for Federated Continual Self-Supervised Vision
 
-A framework for **Federated Continual Self-Supervised Learning** that combines Masked Autoencoders (MAE) with Gated Prototype Anchored Distillation (GPAD) to enable privacy-preserving, communication-efficient visual representation learning across distributed clients.
+A framework for **Federated Continual Self-Supervised Learning** that combines a frozen Masked Autoencoder (MAE) backbone, parameter-efficient Information-Bottleneck Adapters, per-embedding anchored routing, a novelty buffer for online concept discovery, and a global unsupervised prototype bank — enabling privacy-preserving, communication-efficient visual representation learning across distributed clients under non-IID, sequentially arriving data.
 
 <p align="center">
   <img src="docs/diagrams/proposed architecture.png" alt="Proposed Architecture" width="700"/>
@@ -19,6 +19,7 @@ A framework for **Federated Continual Self-Supervised Learning** that combines M
 - [Configuration](#configuration)
 - [Module Reference](#module-reference)
 - [Algorithm Details](#algorithm-details)
+- [References](#references)
 - [License](#license)
 
 ---
@@ -37,16 +38,19 @@ Training a shared visual model across distributed edge devices faces three simul
 
 1. Training a **frozen ViT-MAE backbone** with lightweight **Information-Bottleneck Adapters** (~1% trainable parameters).
 2. Communicating only compact **prototype vectors** (K-Means centroids of local features) instead of raw data.
-3. Using **GPAD loss** to anchor local representations against a global prototype bank, preventing forgetting.
+3. Using **GPAD loss** with per-embedding routing to anchor local representations against a global prototype bank, preventing forgetting.
+4. Employing a **Novelty Buffer** on each client that accumulates genuinely unseen patterns and discovers new visual concepts via triggered K-Means clustering.
 
 ---
 
 ## Key Features
 
-- **Parameter-Efficient Fine-Tuning** — IBA adapters with zero-initialized up-projections for stable training.
-- **Privacy-Preserving** — Only prototype vectors and adapter weights leave the client; raw data stays local.
-- **Continual Learning** — EMA-based global prototype bank grows dynamically as new visual concepts emerge.
-- **Adaptive Distillation** — Entropy-aware gating in GPAD suppresses noisy anchoring from ambiguous assignments.
+- **Parameter-Efficient Fine-Tuning** — IBA adapters with zero-initialized up-projections for stable, identity-first training.
+- **Privacy-Preserving** — Only prototype vectors and adapter weights leave the client; raw data and novelty buffer contents stay local.
+- **Continual Learning** — EMA-based global prototype bank grows dynamically as new visual concepts emerge across tasks.
+- **Adaptive Distillation** — Entropy-aware gating in GPAD suppresses noisy anchoring from ambiguous prototype assignments.
+- **Per-Embedding Routing** — Each embedding is dynamically classified as anchored (→ GPAD loss), locally known (→ EMA update), or truly novel (→ novelty buffer).
+- **Novelty Buffer with Merge-or-Add** — Accumulated novel samples are clustered when a threshold is reached; resulting centroids are merged into existing local prototypes via EMA if similar, or added as new concepts if distinct.
 - **Multi-GPU Parallelism** — 1:1 client-GPU mapping with `ThreadPoolExecutor` for true concurrent training.
 - **Mock Simulation** — Full pipeline runs without downloading model checkpoints or real datasets.
 
@@ -67,34 +71,71 @@ The system operates in round-based communication cycles between a central **Serv
 └─────────────┼───────────────────────────┼────────────────────┘
               │ Broadcast                 │ Broadcast
               ▼ Global Prototypes        ▼ Global Weights
-┌─────────────────────────────────────────────────────────────┐
-│                     CLIENT i (Edge Device)                   │
-│                                                              │
-│  ┌─────────────────────────────────────────────────────────┐│
-│  │ Frozen ViT-MAE Backbone + IBA Adapters (trainable)     ││
-│  └─────────────────────────────────────────────────────────┘│
-│                          │                                   │
-│              ┌───────────┼───────────┐                       │
-│              ▼           ▼           ▼                       │
-│        MAE Loss    GPAD Loss    EMA Proto                    │
-│      (reconstruct) (distill)   (refine)                      │
-│              └───────────┼───────────┘                       │
-│                          ▼                                   │
-│                K-Means Clustering → Local Prototypes          │
-│                          │                                   │
-│                    Upload to Server                           │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                     CLIENT i (Edge Device)                    │
+│                                                               │
+│  ┌──────────────────────────────────────────────────────────┐│
+│  │ Frozen ViT-MAE Backbone + IBA Adapters (trainable)      ││
+│  └──────────────────────────────────────────────────────────┘│
+│                          │                                    │
+│              ┌───────────┼───────────────┐                    │
+│              ▼           ▼               ▼                    │
+│        MAE Loss    GPAD Loss     Per-Embedding Router         │
+│      (reconstruct) (distill)   ┌─────────┴──────────┐        │
+│              │           │     │ Local EMA  │ Novelty │        │
+│              │           │     │  Update    │ Buffer  │        │
+│              │           │     └────────────┴─────────┘        │
+│              └───────────┼───────────┘                         │
+│                          ▼                                     │
+│            Local Prototypes → Upload to Server                 │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ### Training Phases (per round)
 
-| Phase | Step | Description |
-|---|---|---|
-| **A** | Broadcast | Server sends global prototypes to all clients |
-| **B** | Local Training | Clients train with MAE loss (Round 1) or MAE + GPAD (Round > 1) |
-| **C** | Prototype Extraction | Clients cluster local features via Spherical K-Means |
-| **D** | Server Aggregation | EMA prototype merging + FedAvg weight averaging |
-| **E** | Global Update | Updated model and prototype bank ready for next round |
+| Phase | Step | Round 1 | Round ≥ 2 |
+|---|---|---|---|
+| **A** | Broadcast | Server sends initial model (no prototypes) | Server sends global prototypes + averaged weights |
+| **B** | Local Training | MAE loss only (no global knowledge yet) | MAE + λ × GPAD loss with per-embedding routing |
+| **C** | Prototype Extraction | Full K-Means on all local embeddings | Use live local prototypes (maintained via EMA + buffer clustering) |
+| **D** | Server Aggregation | Build initial Global Prototype Bank | EMA merge-or-add prototypes + FedAvg weight averaging |
+| **E** | Global Update | First global model and prototype bank ready | Updated model and bank broadcast to all clients |
+
+### Per-Embedding Routing (Round ≥ 2)
+
+For each embedding in a training batch, the client applies a three-stage decision tree:
+
+```
+                    ┌─────────────────────────────┐
+                    │    Compute Anchor Mask       │
+                    │  (GPAD adaptive threshold)   │
+                    └──────────┬──────────────────┘
+                               │
+                    ┌──────────┴──────────┐
+                    ▼                     ▼
+              Anchored               Not Anchored
+           (sim ≥ τ_adaptive)     (sim < τ_adaptive)
+                    │                     │
+           Apply GPAD Loss        Check Local Prototypes
+           (pull toward global)          │
+                                ┌────────┴────────┐
+                                ▼                 ▼
+                          Local Match        No Match
+                       (sim ≥ τ_local)    (sim < τ_local)
+                                │                 │
+                        EMA Update         Add to Novelty
+                     Local Prototype          Buffer
+                                              │
+                                    ┌─────────┴─────────┐
+                                    │  Buffer ≥ thresh?  │
+                                    └─────────┬─────────┘
+                                              │ Yes
+                                    ┌─────────┴──────────┐
+                                    │  Fresh K-Means     │
+                                    │  Merge-or-Add      │
+                                    │  into local protos │
+                                    └────────────────────┘
+```
 
 ---
 
@@ -104,19 +145,23 @@ The system operates in round-based communication cycles between a central **Serv
 PODFCSSV/
 ├── main.py                      # Federated Learning orchestrator & CONFIG
 ├── src/
-│   ├── __init__.py
+│   ├── __init__.py              # Clean public API imports
 │   ├── mae_with_adapter.py      # IBA Adapter + ViT block wrapper + injection
 │   ├── client.py                # FederatedClient + ClientManager
 │   ├── server.py                # GlobalPrototypeBank + FedAvg + GlobalModel
-│   └── loss.py                  # GPAD distillation loss
+│   └── loss.py                  # GPAD distillation loss + anchor mask
 ├── docs/
 │   ├── diagrams/                # Architecture diagrams (PNG)
 │   ├── svg/                     # Architecture diagrams (SVG)
 │   └── markdowns/               # Complete Pipeline Guide
 ├── train.ipynb                  # Interactive training notebook
+├── pyproject.toml               # Project metadata & build config
 ├── requirements.txt             # Python dependencies
+├── ruff.toml                    # Linter/formatter configuration
+├── CHANGELOG.md                 # Release history
+├── CONTRIBUTING.md              # Contribution guidelines
 ├── LICENSE                      # MIT License
-└── .gitignore
+└── .gitignore                   # Git ignore patterns
 ```
 
 ---
@@ -125,7 +170,7 @@ PODFCSSV/
 
 ### Prerequisites
 
-- Python ≥ 3.8
+- Python ≥ 3.9
 - CUDA ≥ 11.7 (optional, for GPU acceleration)
 
 ### Setup
@@ -142,6 +187,9 @@ source .venv/bin/activate   # Linux/macOS
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Or install as editable package (includes dev dependencies)
+pip install -e ".[dev]"
 ```
 
 ### Dependencies
@@ -149,8 +197,10 @@ pip install -r requirements.txt
 | Package | Version | Purpose |
 |---|---|---|
 | `torch` | ≥ 2.0.0 | Core deep learning framework |
-| `torchvision` | ≥ 0.15.0 | Vision utilities |
+| `torchvision` | ≥ 0.15.0 | Vision utilities and transforms |
 | `transformers` | ≥ 4.30.0 | ViT-MAE backbone from Hugging Face |
+| `numpy` | ≥ 1.21.0 | Numerical computing |
+| `scikit-learn` | ≥ 1.0.0 | Additional ML utilities |
 
 ---
 
@@ -166,10 +216,13 @@ This runs the complete federated learning loop using a lightweight `MockViTMAE` 
 
 **Expected output:**
 
-- Initialization logs for each client
-- Per-round training losses
-- Global prototype bank growth
-- `Pipeline Finished Successfully.`
+```
+Round 1: MAE only  → loss ≈ 0.45 → 5 protos/client → initial global bank
+Round 2: MAE+GPAD → loss ≈ 1.10 → per-embedding routing active
+Round 3: MAE+GPAD → loss ≈ 1.10 → novelty buffer accumulating
+Round 4: MAE+GPAD → loss ≈ 1.10 → buffer grows, local protos stable
+Round 5: MAE+GPAD → loss ≈ 1.10 → pipeline finished successfully
+```
 
 ### Run with Real ViT-MAE
 
@@ -201,40 +254,48 @@ All hyperparameters are centralized in the `CONFIG` dictionary in `main.py`:
 | Parameter | Default | Description |
 |---|---|---|
 | `num_clients` | 2 | Number of simulated federated clients |
-| `num_rounds` | 5 | Total communication rounds |
-| `gpu_count` | 0 | GPUs available (auto-detected; 0 = CPU) |
-| `dtype` | `float32` | Precision (`float32` or `bfloat16`) |
+| `num_rounds` | 5 | Total server-client communication rounds |
+| `gpu_count` | 0 | GPUs available (auto-detected; 0 = CPU mode) |
+| `dtype` | `float32` | Floating-point precision (`float32` or `bfloat16`) |
 
 ### Adapter
 
 | Parameter | Default | Description |
 |---|---|---|
-| `adapter_bottleneck_dim` | 64 | Bottleneck dim (32–128 typical) |
+| `adapter_bottleneck_dim` | 64 | Information bottleneck dimension (32–128 typical) |
 
-### Server — Prototype Management
+### Server — Global Prototype Bank
 
 | Parameter | Default | Description |
 |---|---|---|
-| `merge_threshold` | 0.85 | Cosine similarity to merge vs. add a prototype |
-| `server_ema_alpha` | 0.1 | EMA factor for global prototype updates |
+| `merge_threshold` | 0.85 | Cosine similarity threshold to merge vs. add a prototype |
+| `server_ema_alpha` | 0.1 | EMA interpolation factor for global prototype updates |
 
 ### GPAD Loss
 
 | Parameter | Default | Description |
 |---|---|---|
-| `gpad_base_tau` | 0.5 | Base threshold for confident anchoring |
-| `gpad_temp_gate` | 0.1 | Sigmoid gate temperature |
-| `gpad_lambda_entropy` | 0.1 | Entropy penalty scaling factor |
+| `gpad_base_tau` | 0.5 | Base similarity threshold for confident anchoring |
+| `gpad_temp_gate` | 0.1 | Sigmoid gate temperature (lower = sharper decision boundary) |
+| `gpad_lambda_entropy` | 0.1 | Entropy penalty scaling factor (raises threshold for uncertain samples) |
+| `lambda_proto` | 1.0 | GPAD loss weight: `total = MAE + λ × GPAD` |
 
-### Client Training
+### Client — Local Training & Prototype Management
 
 | Parameter | Default | Description |
 |---|---|---|
-| `k_init_prototypes` | 5 | Local prototypes per client per round |
-| `client_lr` | 1e-4 | Optimizer learning rate |
-| `client_weight_decay` | 0.05 | AdamW weight decay |
-| `client_local_update_threshold` | 0.7 | EMA update similarity threshold |
-| `client_local_ema_alpha` | 0.1 | Online prototype EMA factor |
+| `k_init_prototypes` | 5 | Number of prototype centroids per client (Round 1 K-Means) |
+| `client_lr` | 1e-4 | AdamW optimizer learning rate |
+| `client_weight_decay` | 0.05 | AdamW L2 regularization weight decay |
+| `client_local_update_threshold` | 0.7 | Cosine similarity threshold for EMA prototype updates and buffer merge decisions |
+| `client_local_ema_alpha` | 0.1 | EMA interpolation factor for online prototype refinement |
+
+### Client — Novelty Buffer
+
+| Parameter | Default | Description |
+|---|---|---|
+| `novelty_buffer_size` | 500 | Number of novel embeddings to accumulate before triggering fresh K-Means |
+| `novelty_k` | 20 | K for buffer K-Means clustering (independent of `k_init_prototypes`) |
 
 ---
 
@@ -246,17 +307,30 @@ Implements parameter-efficient fine-tuning via **Information-Bottleneck Adapters
 
 | Component | Description |
 |---|---|
-| `IBA_Adapter` | Bottleneck MLP: Linear(D→d) → GELU → Linear(d→D) → Dropout, with zero-initialized up-projection |
+| `IBA_Adapter` | Bottleneck MLP: Linear(D→d) → GELU → Linear(d→D) → Dropout, with zero-initialized up-projection for identity-first training |
 | `ViTBlockWithAdapter` | Wraps a frozen encoder layer + adapter, handling HuggingFace return type polymorphism |
 | `inject_adapters()` | Freezes backbone, injects adapters into every encoder layer, prints parameter audit |
 
-### `src/client.py`
+### `src/loss.py`
 
-Defines federated client-side training and prototype generation.
+Implements the **Gated Prototype Anchored Distillation (GPAD)** loss.
 
 | Component | Description |
 |---|---|
-| `FederatedClient` | Single edge device: local training (MAE ± GPAD), feature extraction, K-Means prototype generation, online EMA prototype refinement |
+| `GPADLoss.forward()` | Full GPAD loss pipeline: similarity → adaptive threshold → gating → weighted distance. Returns `0.0` safely when the global bank is empty |
+| `GPADLoss.compute_anchor_mask()` | Returns a boolean mask `[B]` indicating which embeddings are anchored to global prototypes (used by per-embedding routing) |
+
+### `src/client.py`
+
+Defines federated client-side training, per-embedding routing, and prototype management.
+
+| Component | Description |
+|---|---|
+| `FederatedClient.train_epoch()` | Per-embedding routing: anchored → GPAD loss, non-anchored → local check → EMA or buffer |
+| `FederatedClient._route_non_anchored()` | Routes non-anchored embeddings: updates matching local prototypes via EMA, or adds to novelty buffer |
+| `FederatedClient._cluster_novelty_buffer()` | Clusters buffered novel embeddings via K-Means; merges similar centroids into existing local prototypes (EMA) or adds new ones |
+| `FederatedClient.generate_prototypes()` | Full-dataset K-Means prototype extraction (used in Round 1 only) |
+| `FederatedClient.get_local_prototypes()` | Returns current live local prototypes without re-clustering (used in Round ≥ 2) |
 | `ClientManager` | Orchestrates N clients with parallel (multi-GPU via ThreadPoolExecutor) or sequential (CPU) execution |
 
 ### `src/server.py`
@@ -265,16 +339,10 @@ Server-side aggregation logic.
 
 | Component | Description |
 |---|---|
-| `GlobalPrototypeBank` | Merge-or-Add prototype bank with EMA updates. Dynamically grows as new concepts emerge |
-| `FederatedModelServer` | Standard FedAvg: arithmetic mean of client state dictionaries |
-| `run_server_round()` | One-call server round: merges prototypes + averages weights |
+| `GlobalPrototypeBank` | Merge-or-Add prototype bank with EMA updates. Dynamically grows as new concepts emerge. Re-normalizes after merges to maintain unit-sphere geometry |
+| `FederatedModelServer` | Standard FedAvg: element-wise arithmetic mean of client state dictionaries with float32 upcasting for numerical stability |
+| `run_server_round()` | Single-call server round: merges prototypes + averages weights |
 | `GlobalModel` | Wrapper for loading real ViTMAEForPreTraining with adapter injection |
-
-### `src/loss.py`
-
-| Component | Description |
-|---|---|
-| `GPADLoss` | Gated Prototype Anchored Distillation loss with entropy-adaptive thresholding and soft sigmoid gating |
 
 ---
 
@@ -282,43 +350,72 @@ Server-side aggregation logic.
 
 ### 1. Information-Bottleneck Adapter (IBA)
 
+Each frozen transformer block is paired with a lightweight adapter that learns a residual correction:
+
 ```
-H_out = H + Dropout(W_up · σ(W_down · H))
+H_adapted = H + Dropout(W_up · σ(W_down · H))
 ```
 
-- **Down-projection** compresses D → d (information bottleneck)
-- **Up-projection** is zero-initialized at step 0 → adapter outputs Δh = 0 (identity init)
+- **Down-projection** compresses D → d (information bottleneck, retaining only task-relevant features)
+- **Up-projection** is zero-initialized → adapter outputs Δh = 0 at initialization (identity-first training)
 - Only adapter parameters are trainable (~1% of total for ViT-Base)
 
 ### 2. Gated Prototype Anchored Distillation (GPAD)
 
+The GPAD loss enforces alignment between local embeddings and global prototypes:
+
 ```
-L_gpad(z) = Gate(z) × ‖z - v*‖₂
+L_GPAD(z) = Gate(z) × ‖z - v*‖²
 
 where:
-  v*    = argmax_v cos(z, v)           (best-matching global prototype)
-  τ(z)  = τ_base + λ · H_norm(z)      (entropy-adaptive threshold)
-  Gate  = σ((cos(z, v*) - τ(z)) / T)  (soft sigmoid gate)
+  v*          = argmax_v cos(z, v)              (best-matching global prototype)
+  p_j         = softmax(cos(z, v_j) / τ_p)     (soft assignment distribution)
+  H_norm(z)   = -Σ p_j log(p_j) / log(M)       (normalized Shannon entropy)
+  τ(z)        = τ_base + λ_entropy · H_norm(z)  (entropy-adaptive threshold)
+  I_anchor    = 1 if cos(z, v*) ≥ τ(z), else 0  (binary anchor indicator)
+  α_match     = σ((cos(z, v*) - τ(z)) / T)      (soft sigmoid gate)
+  Gate(z)     = I_anchor × α_match               (final gating weight)
 ```
 
-The entropy penalty `H_norm` raises the threshold when prototype assignment is ambiguous, ensuring only confident matches contribute to the distillation loss.
+The entropy penalty `H_norm` raises the threshold for uncertain samples, ensuring only confident matches contribute to the distillation loss.
 
-### 3. Global Prototype Bank (Merge-or-Add with EMA)
+### 3. Per-Embedding Routing
 
-For each incoming local prototype `p`:
+Each embedding in a batch is routed through a three-stage decision tree:
 
-- If `max cos(p, G) ≥ threshold`: **Merge** via EMA — `G_best ← (1-α)·G_best + α·p`, then re-normalize
-- If `max cos(p, G) < threshold`: **Add** — append `p` as a new global prototype
+1. **Global Anchor Check**: If the embedding is sufficiently similar to a global prototype (passes adaptive threshold), apply GPAD loss. Total loss = MAE + λ × GPAD.
+2. **Local Prototype Check**: If not globally anchored, compare against local prototypes. If similar enough, update the closest local prototype via EMA. Only MAE loss applies.
+3. **Novelty Buffer**: If the embedding matches neither global nor local prototypes, it is truly novel. Store it in the buffer. Only MAE loss applies.
+
+### 4. Novelty Buffer Clustering with Merge-or-Add
+
+When the novelty buffer accumulates enough samples (≥ `novelty_buffer_size`):
+
+1. Run a **fresh K-Means** (K = `novelty_k`) on the buffered embeddings to find cluster centroids.
+2. For each new centroid, compute similarity to existing local prototypes:
+   - **If similar** (sim ≥ `local_update_threshold`): Merge into the matched prototype via EMA.
+   - **If distinct** (sim < `local_update_threshold`): Add as a new local prototype.
+3. Clear the buffer.
+
+This prevents duplicate prototypes while allowing genuine new concept discovery.
+
+### 5. Global Prototype Bank (Merge-or-Add with EMA)
+
+For each incoming local prototype `p` uploaded by a client:
+
+- If `max cos(p, G) ≥ merge_threshold`: **Merge** via EMA — `G_best ← (1-α)·G_best + α·p`, then re-normalize to unit sphere.
+- If `max cos(p, G) < merge_threshold`: **Add** — append `p` as a new global prototype.
 
 This allows the prototype bank to automatically discover new visual concepts while refining existing ones.
 
-### 4. Spherical K-Means
+### 6. Spherical K-Means
 
-Client-side prototype extraction uses K-Means on L2-normalized embeddings with cosine similarity as the distance metric. Features include:
+Client-side prototype extraction uses K-Means on L2-normalized embeddings with cosine similarity (dot product) as the distance metric:
 
 - Random data-point initialization
-- Empty-cluster re-seeding
+- Empty-cluster re-seeding with random data points
 - Convergence check (centroid shift < 1e-4)
+- Automatic clamping of K to N when samples < clusters
 
 ---
 
