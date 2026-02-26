@@ -1,6 +1,6 @@
 # Contributing to PODFCSSV
 
-Thank you for considering contributing to **PODFCSSV**! This document provides guidelines to help you get started.
+Thank you for considering contributing to **PODFCSSV**! This document provides guidelines for researchers and engineers looking to extend or improve the framework.
 
 ---
 
@@ -35,13 +35,46 @@ pip install -e ".[dev]"
 python -c "from src import GPADLoss, ClientManager; print('Imports OK')"
 ```
 
+### 4. Run the Pipeline
+
+```bash
+python main.py
+```
+
+This executes the full federated learning loop using `MockViTMAE` and synthetic data — no real datasets or checkpoints needed.
+
+---
+
+## Architecture Overview
+
+Understanding the codebase requires familiarity with its four main modules:
+
+| Module | Responsibility |
+|---|---|
+| `src/loss.py` | GPAD loss computation, adaptive thresholding, and anchor mask generation |
+| `src/client.py` | Local training, per-embedding routing (anchored / local / novel), novelty buffer, K-Means clustering |
+| `src/server.py` | Global prototype bank (merge-or-add with EMA), FedAvg weight aggregation |
+| `src/mae_with_adapter.py` | Information-Bottleneck Adapter injection into frozen ViT-MAE blocks |
+
+### Key Data Flow
+
+```
+Server broadcasts global prototypes + averaged weights
+    → Client trains with MAE + GPAD (per-embedding routing)
+        → Anchored embeddings: GPAD loss pulls toward global prototypes
+        → Non-anchored, locally similar: EMA-update local prototype
+        → Truly novel: Accumulate in novelty buffer → K-Means when full → Merge-or-Add
+    → Client uploads local prototypes + adapter weights
+→ Server merges prototypes (EMA merge-or-add) + averages weights (FedAvg)
+```
+
 ---
 
 ## Development Workflow
 
 ### Code Style
 
-This project uses [Ruff](https://docs.astral.sh/ruff/) for linting and formatting.
+This project uses [Ruff](https://docs.astral.sh/ruff/) for linting and formatting. Configuration is in `ruff.toml`.
 
 ```bash
 # Check for lint issues
@@ -54,11 +87,40 @@ ruff check --fix .
 ruff format .
 ```
 
-### Running the Pipeline
+### Naming Conventions
 
-```bash
-python main.py
-```
+Mathematical variable names (e.g., `K`, `N`, `D`, `X`, `Z`) follow standard research notation and are exempted from PEP 8 lowercase rules via `ruff.toml`. This is intentional — do not rename them.
+
+### Docstrings
+
+Every public class and method should have a docstring following NumPy/SciPy style with:
+- **Summary line**: One-line description.
+- **Parameters section**: All arguments with types and descriptions.
+- **Returns section**: Return type and description.
+- **Notes section** (optional): Mathematical background and implementation details.
+
+---
+
+## Adding New Features
+
+### Adding a New Loss Component
+
+1. Implement the loss class in `src/loss.py`.
+2. Add any new hyperparameters to `CONFIG` in `main.py` with descriptive comments.
+3. Wire the loss into `FederatedClient.train_epoch()` in `src/client.py`.
+4. Update `src/__init__.py` for public import access.
+
+### Adding a New Routing Strategy
+
+1. The per-embedding routing logic lives in `FederatedClient.train_epoch()` and `_route_non_anchored()`.
+2. To add a new routing branch, modify the decision tree after the anchor mask check.
+3. Document the routing decision clearly in docstrings.
+
+### Adding a New Aggregation Strategy
+
+1. Server-side aggregation happens in `src/server.py`.
+2. `GlobalPrototypeBank` handles prototype merging; `FederatedModelServer` handles weight averaging.
+3. To change aggregation (e.g., weighted FedAvg), modify `aggregate_weights()`.
 
 ---
 
@@ -67,8 +129,10 @@ python main.py
 1. **Fork** the repository and create a feature branch from `main`.
 2. Make your changes with clear, descriptive commit messages.
 3. Ensure code passes `ruff check .` with no errors.
-4. Open a **Pull Request** with a description of:
+4. Run the full pipeline `python main.py` and confirm `Pipeline Finished Successfully.`
+5. Open a **Pull Request** with a description of:
    - What changed and why.
+   - Any new hyperparameters added to `CONFIG`.
    - Any new dependencies added.
    - How you tested the changes.
 
@@ -80,7 +144,8 @@ Please use [GitHub Issues](https://github.com/sathishkumar67/PODFCSSV/issues) wi
 
 - A clear title and description.
 - Steps to reproduce the problem.
-- Your environment (OS, Python version, PyTorch version).
+- Your environment (OS, Python version, PyTorch version, CUDA version).
+- Relevant log output.
 
 ---
 
