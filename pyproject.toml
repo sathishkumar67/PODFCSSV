@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "podfcssv"
-version = "0.1.0"
+version = "0.2.0"
 description = "Prototype-Oriented Distillation for Federated Continual Self-Supervised Vision"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 authors = [
     {name = "Sathish Kumar R"},
 ]
@@ -19,16 +19,19 @@ keywords = [
     "vision-transformers",
     "masked-autoencoders",
     "prototype-learning",
+    "knowledge-distillation",
+    "novelty-detection",
+    "parameter-efficient-fine-tuning",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
@@ -43,12 +46,15 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "ruff>=0.4.0",
+    "jupyter>=1.0.0",
+    "ipykernel>=6.0.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/sathishkumar67/PODFCSSV"
 Repository = "https://github.com/sathishkumar67/PODFCSSV"
 Issues = "https://github.com/sathishkumar67/PODFCSSV/issues"
+Changelog = "https://github.com/sathishkumar67/PODFCSSV/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["src*"]
