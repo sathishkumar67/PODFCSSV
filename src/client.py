@@ -352,7 +352,8 @@ class FederatedClient:
                 old_proto = self.local_prototypes[proto_idx]
                 updated = ((1 - self.local_ema_alpha) * old_proto
                            + self.local_ema_alpha * z_norm[i])
-                self.local_prototypes[proto_idx] = updated
+                # Re-normalize: EMA blend of two unit vectors is NOT a unit vector
+                self.local_prototypes[proto_idx] = F.normalize(updated, p=2, dim=0)
             else:
                 # Truly novel — add to buffer
                 self.novelty_buffer.append(z_norm[i].clone())
@@ -438,7 +439,8 @@ class FederatedClient:
                     old_proto = updated_protos[idx]
                     # EMA update
                     updated = (1 - self.local_ema_alpha) * old_proto + self.local_ema_alpha * new_centroids[i]
-                    updated_protos[idx] = updated
+                    # Re-normalize: EMA blend of two unit vectors is NOT a unit vector
+                    updated_protos[idx] = F.normalize(updated, p=2, dim=0)
                     merged_count += 1
                 else:
                     # Add: Append as new prototype
