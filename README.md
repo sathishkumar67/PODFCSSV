@@ -251,51 +251,61 @@ All hyperparameters are centralized in the `CONFIG` dictionary in `main.py`:
 
 ### System
 
-| Parameter | Default | Description |
-|---|---|---|
-| `num_clients` | 2 | Number of simulated federated clients |
-| `num_rounds` | 5 | Total server-client communication rounds |
-| `gpu_count` | 0 | GPUs available (auto-detected; 0 = CPU mode) |
-| `dtype` | `float32` | Floating-point precision (`float32` or `bfloat16`) |
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `seed` | 42 | — | Random seed for reproducibility (set to `None` to disable) |
+| `num_clients` | 2 | — | Number of simulated federated clients |
+| `num_rounds` | 5 | — | Total server-client communication rounds |
+| `local_epochs` | 1 | 1–10 | Number of local training epochs per round |
+| `gpu_count` | 0 | — | GPUs available (auto-detected; 0 = CPU mode) |
+| `dtype` | `float32` | — | Floating-point precision (`float32` or `bfloat16`) |
+| `dataloader_shuffle` | True | — | Whether to shuffle the DataLoader between epochs |
 
 ### Adapter
 
-| Parameter | Default | Description |
-|---|---|---|
-| `adapter_bottleneck_dim` | 64 | Information bottleneck dimension (32–128 typical) |
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `pretrained_model_name` | `facebook/vit-mae-base` | — | HuggingFace model identifier for the ViT-MAE backbone |
+| `adapter_bottleneck_dim` | 64 | 32–128 | Information bottleneck dimension |
+| `adapter_dropout` | 0.0 | 0.0–0.5 | Dropout rate for IBA adapters (regularization) |
 
 ### Server — Global Prototype Bank
 
-| Parameter | Default | Description |
-|---|---|---|
-| `merge_threshold` | 0.85 | Cosine similarity threshold to merge vs. add a prototype |
-| `server_ema_alpha` | 0.1 | EMA interpolation factor for global prototype updates |
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `merge_threshold` | 0.7 | 0.5–0.85 | Cosine similarity threshold to merge vs. add a prototype |
+| `server_ema_alpha` | 0.05 | 0.01–0.2 | EMA interpolation factor for global prototype updates |
+| `max_global_prototypes` | 50 | 20–200 | Maximum capacity of the global prototype bank |
 
 ### GPAD Loss
 
-| Parameter | Default | Description |
-|---|---|---|
-| `gpad_base_tau` | 0.5 | Base similarity threshold for confident anchoring |
-| `gpad_temp_gate` | 0.1 | Sigmoid gate temperature (lower = sharper decision boundary) |
-| `gpad_lambda_entropy` | 0.1 | Entropy penalty scaling factor (raises threshold for uncertain samples) |
-| `lambda_proto` | 1.0 | GPAD loss weight: `total = MAE + λ × GPAD` |
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `gpad_base_tau` | 0.5 | 0.3–0.7 | Base similarity threshold for confident anchoring |
+| `gpad_temp_gate` | 0.1 | 0.05–0.5 | Sigmoid gate temperature (lower = sharper decision boundary) |
+| `gpad_lambda_entropy` | 0.3 | 0.1–0.5 | Entropy penalty scaling factor (raises threshold for uncertain samples) |
+| `gpad_soft_assign_temp` | 0.1 | 0.05–0.5 | Temperature for the soft assignment distribution in entropy calculation |
+| `gpad_epsilon` | 1e-8 | — | Numerical epsilon for GPAD loss computation (prevents div-by-zero) |
+| `lambda_proto` | 0.01 | 0.001–0.1 | GPAD loss weight: `total = MAE + λ × GPAD` |
 
 ### Client — Local Training & Prototype Management
 
-| Parameter | Default | Description |
-|---|---|---|
-| `k_init_prototypes` | 5 | Number of prototype centroids per client (Round 1 K-Means) |
-| `client_lr` | 1e-4 | AdamW optimizer learning rate |
-| `client_weight_decay` | 0.05 | AdamW L2 regularization weight decay |
-| `client_local_update_threshold` | 0.7 | Cosine similarity threshold for EMA prototype updates and buffer merge decisions |
-| `client_local_ema_alpha` | 0.1 | EMA interpolation factor for online prototype refinement |
+| Parameter | Default | Range | Description |
+|---|---|---|---|
+| `k_init_prototypes` | 10 | 5–50 | Number of prototype centroids per client (Round 1 K-Means) |
+| `client_lr` | 1e-4 | — | AdamW optimizer learning rate |
+| `client_weight_decay` | 0.05 | — | AdamW L2 regularization weight decay |
+| `client_local_update_threshold` | 0.6 | 0.4–0.8 | Cosine similarity threshold for EMA prototype updates and buffer merge decisions |
+| `client_local_ema_alpha` | 0.1 | 0.05–0.3 | EMA interpolation factor for online prototype refinement |
+| `kmeans_max_iters` | 100 | — | Maximum K-Means iterations before forced termination |
+| `kmeans_tol` | 1e-4 | — | K-Means convergence tolerance (centroid shift below this = converged) |
 
 ### Client — Novelty Buffer
 
-| Parameter | Default | Description |
-|---|---|---|
-| `novelty_buffer_size` | 500 | Number of novel embeddings to accumulate before triggering fresh K-Means |
-| `novelty_k` | 20 | K for buffer K-Means clustering (independent of `k_init_prototypes`) |
+| Parameter | Default | Range / Options | Description |
+|---|---|---|---|
+| `novelty_buffer_size` | 256 | 128, 256, 512 | Number of novel embeddings to accumulate before triggering fresh K-Means |
+| `novelty_k` | 5 | 3–10 | K for buffer K-Means clustering (independent of `k_init_prototypes`) |
 
 ---
 
@@ -414,7 +424,7 @@ Client-side prototype extraction uses K-Means on L2-normalized embeddings with c
 
 - Random data-point initialization
 - Empty-cluster re-seeding with random data points
-- Convergence check (centroid shift < 1e-4)
+- Convergence check (centroid shift < `kmeans_tol`)
 - Automatic clamping of K to N when samples < clusters
 
 ---
