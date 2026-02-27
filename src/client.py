@@ -277,23 +277,22 @@ class FederatedClient:
         global average pooling across the sequence (patch token) dimension to
         produce a single D-dimensional feature vector per input sample.
 
-        For the mock model, ``model.vit`` is a ``_MockViTEncoder`` that
-        returns a ``last_hidden_state`` of shape [B, 1, D], so mean-pooling
-        over the sequence dimension is a no-op (but keeps the code generic).
+        The encoder processes images through patch embedding and self-attention,
+        returning a sequence of patch token representations. Mean-pooling
+        collapses this variable-length sequence into a fixed-size vector
+        suitable for prototype comparison and GPAD computation.
 
         Parameters
         ----------
         inputs : torch.Tensor
-            Input tensor already cast to the correct dtype and moved to the
-            correct device. Shape depends on the model:
-            - Real ViT-MAE: [B, 3, 224, 224] pixel values.
-            - Mock model:   [B, D] raw embeddings.
+            Input image tensor of shape [B, 3, 224, 224], already cast to
+            the correct dtype and moved to the correct device.
 
         Returns
         -------
         torch.Tensor
             Pooled feature embeddings of shape [B, D], where D is the
-            encoder's hidden dimension (e.g., 768 for ViT-Base).
+            encoder's hidden dimension (768 for ViT-Base).
         """
         # Forward through the encoder backbone (not the full MAE model).
         # model.vit returns an object with .last_hidden_state: [B, L, D]
