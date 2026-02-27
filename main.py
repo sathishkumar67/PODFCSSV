@@ -87,12 +87,19 @@ logger = logging.getLogger("DistillFed")
 
 CONFIG = {
     # ── System ────────────────────────────────────────────────────────────────
+    # Random seed for reproducibility (set to None to disable)
+    "seed": 42,
+
     # How many federated clients to simulate in this run
     "num_clients": 2,
 
     # Total number of server-client communication rounds to simulate.
     # Each round consists of: broadcast -> train -> extract -> aggregate -> update.
     "num_rounds": 5,
+
+    # Number of local training epochs each client runs per round
+    # Range: 1–10
+    "local_epochs": 1,
 
     # Number of GPUs available (0 = CPU-only sequential mode)
     # This value is auto-detected at runtime if CUDA is available
@@ -110,6 +117,9 @@ CONFIG = {
     "dtype": torch.float32,
 
     # ── Model & Data ─────────────────────────────────────────────────────────
+    # Pretrained model name/path for HuggingFace ViT-MAE backbone
+    "pretrained_model_name": "facebook/vit-mae-base",
+
     # Dimensionality of the feature embedding space
     # (small value for mock simulation; real ViT-Base uses 768)
     "embedding_dim": 32,
@@ -120,6 +130,9 @@ CONFIG = {
     # Mini-batch size for local training and prototype extraction
     "batch_size": 4,
 
+    # Whether to shuffle the DataLoader between epochs
+    "dataloader_shuffle": True,
+
     # ── Adapter (mae_with_adapter.py) ────────────────────────────────────────
     # Bottleneck dimension of the IBA adapters injected into the ViT encoder.
     # Smaller = fewer params / faster, larger = more capacity.
@@ -127,33 +140,54 @@ CONFIG = {
     # trainable parameters.
     "adapter_bottleneck_dim": 64,
 
-    # ── Global Prototype Management (server.py) ──────────────────────────────
-    # Cosine similarity threshold: if a new local prototype is this similar
-    # to an existing global prototype, they are merged via EMA instead of
-    # being added as a new entry
-    "merge_threshold": 0.85,
+    # Dropout rate for IBA adapters (regularization)
+    # Range: 0.0–0.5
+    "adapter_dropout": 0.0,
 
-    # Exponential Moving Average factor for updating global prototypes
+    # ── Global Prototype Management (server.py) ──────────────────────────────
+    # Server-side global merge threshold: cosine similarity required to merge
+    # a local prototype into an existing global one via EMA
+    # Range: 0.5–0.85
+    "merge_threshold": 0.7,
+
+    # Server-side EMA alpha for global prototype updates
     # Lower values = slower, more stable updates
-    "server_ema_alpha": 0.1,
+    # Range: 0.01–0.2
+    "server_ema_alpha": 0.05,
+
+    # Maximum capacity of the global prototype bank.
+    # New prototypes are not added once this limit is reached.
+    # Range: 20–200
+    "max_global_prototypes": 50,
 
     # ── GPAD Distillation Loss (loss.py) ─────────────────────────────────────
-    # Base adaptive threshold for confident anchoring in GPAD
+    # Base similarity threshold for global anchoring in GPAD
     # Higher = stricter gating, fewer anchors activated
+    # Range: 0.3–0.7
     "gpad_base_tau": 0.5,
 
-    # Temperature for the soft sigmoid gate in GPAD
+    # Sigmoid gate temperature for steepness control in GPAD
     # Lower = sharper (near step-function), higher = smoother
+    # Range: 0.05–0.5
     "gpad_temp_gate": 0.1,
 
-    # Scaling factor for the entropy-based penalty that raises the gate
-    # threshold when prototype assignment is ambiguous
-    "gpad_lambda_entropy": 0.1,
+    # Uncertainty scaling factor for the entropy-based adaptive threshold
+    # Higher lambda = threshold rises more steeply as assignment entropy increases
+    # Range: 0.1–0.5
+    "gpad_lambda_entropy": 0.3,
+
+    # Temperature for the soft assignment distribution in GPAD
+    # Controls sharpness of the softmax used in entropy calculation
+    # Range: 0.05–0.5
+    "gpad_soft_assign_temp": 0.1,
+
+    # Numerical epsilon for GPAD loss computation (prevents div-by-zero)
+    "gpad_epsilon": 1e-8,
 
     # ── Client Local Training (client.py) ────────────────────────────────────
-    # Number of prototype centroids each client generates per round
-    # via K-Means clustering
-    "k_init_prototypes": 5,
+    # Number of prototype centroids each client generates via K-Means (Round 1)
+    # Range: 5–50
+    "k_init_prototypes": 10,
 
     # Optimizer learning rate for local client training
     "client_lr": 1e-4,
@@ -161,30 +195,43 @@ CONFIG = {
     # AdamW weight decay for L2 regularization
     "client_weight_decay": 0.05,
 
-    # Cosine-similarity threshold for online EMA prototype updates.
+    # Local merge threshold: cosine-similarity for online EMA prototype updates.
     # Only samples more similar than this to their nearest local prototype
     # trigger an update — prevents noisy refinements.
-    "client_local_update_threshold": 0.7,
+    # Range: 0.4–0.8
+    "client_local_update_threshold": 0.6,
 
-    # EMA interpolation factor for online prototype refinement.
+    # EMA interpolation factor for local non-anchored updates and
+    # local buffer centroid merges.
     # 0 = no update, 1 = full replacement.
+    # Range: 0.05–0.3
     "client_local_ema_alpha": 0.1,
 
     # ── GPAD Loss Weighting ──────────────────────────────────────────────────
-    # Scaling factor for the GPAD distillation loss.
+    # Weight of GPAD distillation loss relative to the main reconstruction loss.
     # total_loss = mae_loss + lambda_proto * gpad_loss.
-    # Higher values enforce stronger alignment to global prototypes.
-    "lambda_proto": 1.0, # should be a power of 10
+    # Range: 0.001–0.1
+    "lambda_proto": 0.01,
 
     # ── Novelty Buffer (client.py) ───────────────────────────────────────────
+    # Novelty buffer capacity before triggering clustering.
     # Number of truly novel embeddings (failing both global and local
     # threshold checks) to accumulate before triggering a fresh K-Means
     # clustering to discover new visual concepts.
-    "novelty_buffer_size": 500,
+    # Options: 128, 256, 512
+    "novelty_buffer_size": 256,
 
     # K for the buffer K-Means clustering.
     # This is independent of k_init_prototypes (Round 1 full clustering).
-    "novelty_k": 20,
+    # Range: 3–10
+    "novelty_k": 5,
+
+    # ── K-Means (client.py) ──────────────────────────────────────────────────
+    # Maximum number of K-Means iterations before stopping
+    "kmeans_max_iters": 100,
+
+    # Convergence tolerance for K-Means (centroid shift below this = converged)
+    "kmeans_tol": 1e-4,
 }
 
 
@@ -345,6 +392,13 @@ def main():
 
     logger.info(f"Dtype: {CONFIG['dtype']}")
 
+    # Seed for reproducibility
+    if CONFIG["seed"] is not None:
+        torch.manual_seed(CONFIG["seed"])
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(CONFIG["seed"])
+        logger.info(f"Random seed set to {CONFIG['seed']}")
+
     # ── Step 2: Component Initialization ─────────────────────────────────────
 
     # 2A. Server-Side Global Prototype Bank
@@ -355,7 +409,8 @@ def main():
         embedding_dim=CONFIG["embedding_dim"],
         merge_threshold=CONFIG["merge_threshold"],
         ema_alpha=CONFIG["server_ema_alpha"],
-        device=CONFIG["device"]
+        device=CONFIG["device"],
+        max_prototypes=CONFIG["max_global_prototypes"],
     )
 
     # 2B. Server-Side Model Aggregator
@@ -385,6 +440,8 @@ def main():
         lambda_proto=CONFIG["lambda_proto"],
         novelty_buffer_size=CONFIG["novelty_buffer_size"],
         novelty_k=CONFIG["novelty_k"],
+        kmeans_max_iters=CONFIG["kmeans_max_iters"],
+        kmeans_tol=CONFIG["kmeans_tol"],
     )
 
     # 2E. GPAD Distillation Loss
@@ -394,13 +451,15 @@ def main():
         base_tau=CONFIG["gpad_base_tau"],
         temp_gate=CONFIG["gpad_temp_gate"],
         lambda_entropy=CONFIG["gpad_lambda_entropy"],
+        soft_assign_temp=CONFIG["gpad_soft_assign_temp"],
+        epsilon=CONFIG["gpad_epsilon"],
     )
 
     # ── Step 3: Data Setup (Mock) ────────────────────────────────────────────
     # Create a synthetic dataset using dimensions from CONFIG.
     # In production, each client would have its own real image dataset.
     dataset = TensorDataset(torch.randn(CONFIG["num_samples"], CONFIG["embedding_dim"]))
-    dataloader = DataLoader(dataset, batch_size=CONFIG["batch_size"])
+    dataloader = DataLoader(dataset, batch_size=CONFIG["batch_size"], shuffle=CONFIG["dataloader_shuffle"])
 
     # For simulation, all clients share the same dataloader.
     # In a real system, each client would have its own private data.
