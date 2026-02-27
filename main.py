@@ -1,11 +1,12 @@
 """
 Federated Continual Self-Supervised Learning — Main Orchestrator.
 
-This script is the top-level entry point that simulates the complete
+This script is the top-level entry point that executes the complete
 lifecycle of a Federated Learning (FL) system designed for Continual
-Self-Supervised Learning. It combines Masked Autoencoders (MAE) as the
-self-supervised pretext task with Gated Prototype Anchored Distillation
-(GPAD) as a forgetting-prevention mechanism.
+Self-Supervised Learning on the Tiny ImageNet dataset. It combines a
+pretrained ViT-MAE backbone with IBA adapters as the model architecture,
+MAE as the self-supervised pretext task, and Gated Prototype Anchored
+Distillation (GPAD) as a forgetting-prevention mechanism.
 
 System Architecture
 -------------------
@@ -21,7 +22,7 @@ The system consists of three logical actors:
 
 2. **Clients** (edge devices):
    - Each client holds a private local dataset and an independent deep copy
-     of the global model.
+     of the global model (ViTMAEForPreTraining with IBA adapters).
    - Privacy-preserving: clients NEVER share raw data — only compact
      prototype vectors and model weights are communicated over the network.
    - Training uses per-embedding routing to classify each feature vector as
@@ -33,42 +34,22 @@ The system consists of three logical actors:
    - Handles broadcasting, collection, and state updates.
    - Centrally defines ALL hyperparameters in the CONFIG dictionary.
 
-Training Phases (per communication round)
-------------------------------------------
-Round 1 — Initialization:
-    Clients train with MAE reconstruction loss only. No global knowledge
-    exists yet: GPAD is skipped. After training, each client clusters its
-    feature space via Spherical K-Means to produce the initial local
-    prototypes.
+Model Pipeline
+--------------
+The model is a real ``ViTMAEForPreTraining`` loaded from HuggingFace with
+IBA adapters injected into every encoder layer via ``inject_adapters()``.
+The backbone is frozen — only adapter parameters (~1% of total) are
+trained. The model expects image tensors of shape ``[B, 3, 224, 224]``.
 
-Round > 1 — Continual Learning:
-    Clients train with MAE + GPAD. The GPAD loss regularizes each client's
-    evolving feature space against the current global prototype bank,
-    preventing catastrophic forgetting while allowing plasticity for new
-    visual concepts.
-
-Within each round, the following five steps execute sequentially:
-
-    Step A — Broadcast:   Server sends current global prototypes to all clients.
-    Step B — Training:    Clients train locally (MAE-only or MAE+GPAD).
-    Step C — Extraction:  Round 1: K-Means prototype generation.
-                          Round >1: Retrieve online-maintained prototypes.
-    Step D — Aggregation: Server merges local prototypes (Merge-or-Add + EMA)
-                          and averages model weights (FedAvg).
-    Step E — Update:      Load the FedAvg weights into the base model for the
-                          next round.
-
-Simulation Details
-------------------
-- **Data**: Uses a synthetic ``TensorDataset`` with random noise to simulate
-  image embeddings. No real images or pretrained checkpoints are needed for
-  pipeline testing.
-- **Model**: Uses ``MockViTMAE`` — a lightweight stand-in for
-  ``ViTMAEForPreTraining`` that replicates the essential interfaces without
-  requiring HuggingFace Transformers or checkpoint downloads.
-- **Execution**: Supports both sequential (CPU) and parallel (multi-GPU)
-  modes. GPU mode uses ``ThreadPoolExecutor`` with strict 1:1 Client-GPU
-  mapping.
+Continual Learning Design
+--------------------------
+Tiny ImageNet has 200 classes. We split them into 5 sequential tasks of
+40 classes each. Each round introduces a new task. Within each task, the
+40 classes are divided between the 2 clients (20 each, non-IID), simulating
+realistic federated continual learning where:
+- Different clients see different data distributions (non-IID).
+- New visual concepts arrive over time (continual).
+- Raw data never leaves the client (federated).
 
 Hyperparameter Centralization
 -----------------------------
@@ -80,9 +61,13 @@ sweeps. Each entry includes a descriptive comment and valid range for tuning.
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Subset
 import logging
-from typing import List, Dict, Any
+import os
+import json
+import time
+from typing import List, Dict, Any, Optional
+from tqdm import tqdm
 
 # ==========================================================================
 # Project Imports
@@ -93,6 +78,16 @@ from typing import List, Dict, Any
 from src.server import GlobalPrototypeBank, FederatedModelServer, run_server_round, GlobalModel
 from src.client import ClientManager
 from src.loss import GPADLoss
+
+# Import the pretrained ViT-MAE backbone and adapter injection utility.
+# ViTMAEForPreTraining provides the full Masked Autoencoder with encoder +
+# decoder. inject_adapters() freezes the backbone and adds ~1% trainable
+# IBA adapter parameters.
+from transformers import ViTMAEForPreTraining
+from src.mae_with_adapter import inject_adapters
+
+# Torchvision for dataset loading and image transforms.
+from torchvision import transforms, datasets
 
 
 # ==========================================================================
@@ -127,10 +122,13 @@ CONFIG = {
     "num_clients": 2,
 
     # Total number of server-client communication rounds to simulate.
-    # Each round consists of: broadcast -> train -> extract -> aggregate -> update.
+    # Each round corresponds to one continual learning task.
+    # 5 rounds × 40 classes per task = 200 classes (all of Tiny ImageNet).
     "num_rounds": 5,
 
-    # Number of local training epochs each client runs per round
+    # Number of local training epochs each client runs per round.
+    # In real federated settings, each client trains for 1 epoch to minimize
+    # communication overhead and client drift.
     # Range: 1–10
     "local_epochs": 1,
 
@@ -144,27 +142,50 @@ CONFIG = {
     "device": "cpu",
 
     # Floating-point precision used for model parameters and input tensors.
-    # torch.float32 (single precision) is the safe default.
-    # torch.bfloat16 offers ~2x speedup on Ampere+ GPUs with minimal
-    # accuracy loss for most vision models.
+    # torch.float32 (single precision) is the safe default for T4 GPUs.
     "dtype": torch.float32,
 
     # ── Model & Data ─────────────────────────────────────────────────────────
     # Pretrained model name/path for HuggingFace ViT-MAE backbone
     "pretrained_model_name": "facebook/vit-mae-base",
 
-    # Dimensionality of the feature embedding space
-    # (small value for mock simulation; real ViT-Base uses 768)
-    "embedding_dim": 32,
+    # Dimensionality of the feature embedding space.
+    # ViT-Base hidden size is 768. This must match the pretrained model.
+    "embedding_dim": 768,
 
-    # Number of synthetic samples in the mock dataset (ignored in production)
-    "num_samples": 20,
+    # Input image size expected by the ViT-MAE model.
+    # ViT-MAE-Base uses 224×224 images (16×16 patches → 196 patch tokens).
+    "image_size": 224,
 
-    # Mini-batch size for local training and prototype extraction
-    "batch_size": 4,
+    # Mini-batch size for local training and prototype extraction.
+    # 16 is a good balance for T4 GPUs (16GB VRAM) with float32.
+    "batch_size": 16,
 
     # Whether to shuffle the DataLoader between epochs
     "dataloader_shuffle": True,
+
+    # Number of DataLoader worker processes for parallel data loading.
+    "num_workers": 4,
+
+    # Enable pinned memory for faster CPU→GPU data transfer.
+    "pin_memory": True,
+
+    # ── Continual Learning Task Schedule ──────────────────────────────────────
+    # Number of classes introduced per round (task).
+    # 40 classes × 5 rounds = 200 (all of Tiny ImageNet).
+    "classes_per_task": 40,
+
+    # Number of classes assigned to each client per task (non-IID split).
+    # 20 classes × 2 clients = 40 classes per task.
+    "classes_per_client": 20,
+
+    # Root directory for the Tiny ImageNet dataset.
+    # The dataset will be downloaded here on first run.
+    "data_root": "./data",
+
+    # ── Checkpointing ────────────────────────────────────────────────────────
+    # Directory to save model checkpoints and training history.
+    "save_dir": "checkpoints",
 
     # ── Adapter (mae_with_adapter.py) ────────────────────────────────────────
     # Bottleneck dimension of the IBA adapters injected into the ViT encoder.
@@ -269,183 +290,361 @@ CONFIG = {
 
 
 # ==========================================================================
-# MOCK MODEL — Lightweight stand-in for ViTMAEForPreTraining
-#
-# These classes replicate the essential interfaces of HuggingFace's
-# ViTMAEForPreTraining model, enabling full pipeline testing without
-# downloading a 300MB+ checkpoint or installing the `transformers` library.
+# DATA PIPELINE — Tiny ImageNet with Continual Learning Task Scheduling
 # ==========================================================================
 
 
-class _MockViTEncoder(nn.Module):
+def load_tinyimagenet(data_root: str, image_size: int = 224):
     """
-    Mock ViT encoder that simulates ``model.vit`` in ViTMAEForPreTraining.
+    Load the Tiny ImageNet training dataset with transforms.
 
-    In the real HuggingFace model, ``model.vit`` is a ``ViTMAEModel`` whose
-    ``forward()`` returns a ``BaseModelOutput`` with a ``.last_hidden_state``
-    attribute of shape ``[B, L, D]``, where L is the number of visible
-    (non-masked) patch tokens.
+    Tiny ImageNet contains 200 classes, each with 500 training images of
+    64×64 pixels. Images are resized to ``image_size`` (224) to match
+    the ViT-MAE's expected input resolution.
 
-    This mock replicates that interface using a shared linear layer, so that
-    ``FederatedClient._extract_features()`` works identically whether the
-    underlying model is real or mock. The sequence dimension is set to 1
-    (a single "token") for simplicity.
+    Transforms applied:
+    - Resize to (image_size, image_size): Upscale 64×64 → 224×224
+    - ToTensor: Convert PIL Image → torch.Tensor [C, H, W] with [0, 1] range
 
-    Attributes
+    No augmentation or normalization is applied — the raw resized pixel
+    values are fed directly to the ViT-MAE model.
+
+    Parameters
     ----------
-    linear : nn.Linear
-        A shared linear layer (same instance as ``MockViTMAE.encoder``) to
-        ensure consistent weight sharing between ``model.forward()`` and
-        ``model.vit.forward()`` calls.
+    data_root : str
+        Root directory where the dataset is (or will be) stored.
+    image_size : int
+        Target spatial resolution. Default: 224.
+
+    Returns
+    -------
+    datasets.ImageFolder
+        The full Tiny ImageNet training dataset with transforms applied.
+        Each sample is a (image_tensor, class_label) pair where
+        image_tensor has shape [3, image_size, image_size].
     """
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+    ])
 
-    def __init__(self, linear: nn.Linear):
-        """
-        Initialize the mock ViT encoder.
+    train_dir = os.path.join(data_root, "tiny-imagenet-200", "train")
 
-        Parameters
-        ----------
-        linear : nn.Linear
-            A pre-existing linear layer to share with the parent MockViTMAE.
-        """
-        super().__init__()
-        self.linear = linear
+    if not os.path.isdir(train_dir):
+        logger.info(
+            f"Tiny ImageNet not found at {train_dir}. "
+            f"Downloading to {data_root}..."
+        )
+        _download_tinyimagenet(data_root)
 
-    def forward(self, x: torch.Tensor, **kwargs) -> object:
-        """
-        Simulate a ViTMAEModel forward pass.
-
-        Applies the shared linear transformation and wraps the output in an
-        object with a ``.last_hidden_state`` attribute to match the real
-        ViT encoder's output format.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor of shape ``[B, D]`` (batch of feature vectors).
-
-        Returns
-        -------
-        object
-            An object with ``.last_hidden_state`` of shape ``[B, 1, D]``.
-            The sequence length is 1 (a single mock patch token).
-        """
-        # Apply the shared linear transformation: [B, D] → [B, D]
-        feat = self.linear(x)
-
-        # Wrap in an output object mimicking HuggingFace's BaseModelOutput.
-        class EncoderOutput:
-            pass
-
-        out = EncoderOutput()
-        # Add a fake sequence dimension: [B, D] → [B, 1, D]
-        # This allows mean-pooling in _extract_features() to be a no-op,
-        # keeping the feature extraction code generic.
-        out.last_hidden_state = feat.unsqueeze(1)
-        return out
+    dataset = datasets.ImageFolder(train_dir, transform=transform)
+    logger.info(
+        f"Loaded Tiny ImageNet: {len(dataset)} images, "
+        f"{len(dataset.classes)} classes"
+    )
+    return dataset
 
 
-class MockViTMAE(nn.Module):
+def _download_tinyimagenet(data_root: str) -> None:
     """
-    Lightweight stand-in for ``ViTMAEForPreTraining``.
+    Download and extract Tiny ImageNet 200 to the given root directory.
 
-    Used to test the full Federated Continual Learning pipeline without
-    requiring a real pretrained checkpoint (300MB+) or the HuggingFace
-    ``transformers`` library. This mock replicates the three essential
-    interfaces that the pipeline code depends on:
+    Downloads the official Tiny ImageNet zip file from Stanford's CS231N
+    server and extracts it to ``data_root/tiny-imagenet-200/``.
 
-    1. ``model.forward(x)`` → returns object with ``.loss`` and ``.hidden_states``
-    2. ``model.vit``        → exposes an encoder whose output has ``.last_hidden_state``
-    3. ``model.config``     → provides ``.hidden_size`` attribute
-
-    The mock "loss" is computed as the mean absolute value of the encoder
-    output, providing a simple differentiable scalar that enables gradient
-    flow for testing the backward pass.
-
-    Attributes
+    Parameters
     ----------
-    encoder : nn.Linear
-        The core linear layer acting as the "encoder". Shape: [D, D].
-    head : nn.Identity
-        Placeholder for a downstream projection head (identity = no-op).
-    config : object
-        Mock configuration object with ``.hidden_size = dim``, matching
-        HuggingFace's model config interface.
-    vit : _MockViTEncoder
-        Mock ViT encoder exposing ``.last_hidden_state`` in its output,
-        matching the real ``model.vit`` interface used by
-        ``FederatedClient._extract_features()``.
+    data_root : str
+        Root directory to store the dataset.
     """
+    import urllib.request
+    import zipfile
 
-    def __init__(self, dim: int = 32):
-        """
-        Initialize the mock ViT-MAE model.
+    os.makedirs(data_root, exist_ok=True)
+    url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+    zip_path = os.path.join(data_root, "tiny-imagenet-200.zip")
 
-        Parameters
-        ----------
-        dim : int
-            Mock embedding dimension. Default: 32 (small for fast testing;
-            real ViT-Base uses 768).
-        """
-        super().__init__()
+    logger.info(f"Downloading Tiny ImageNet from {url}...")
+    urllib.request.urlretrieve(url, zip_path)
 
-        # Core linear layer acting as the "encoder".
-        self.encoder = nn.Linear(dim, dim)
+    logger.info(f"Extracting to {data_root}...")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(data_root)
 
-        # Identity head — placeholder for downstream projection.
-        self.head = nn.Identity()
+    # Clean up the zip file to save disk space.
+    os.remove(zip_path)
+    logger.info("Tiny ImageNet download and extraction complete.")
 
-        # Mock config matching HuggingFace's model.config interface.
-        self.config = type("Config", (), {"hidden_size": dim})()
 
-        # Expose .vit to match ViTMAEForPreTraining's structure.
-        # FederatedClient._extract_features() accesses model.vit directly
-        # to get encoder-only representations (without the decoder).
-        self.vit = _MockViTEncoder(self.encoder)
+def create_task_schedule(
+    dataset: datasets.ImageFolder,
+    num_rounds: int,
+    classes_per_task: int,
+    num_clients: int,
+    classes_per_client: int,
+    seed: int = 42,
+) -> List[List[List[int]]]:
+    """
+    Create the continual learning task schedule for all rounds and clients.
 
-    def forward(
-        self, x: torch.Tensor, output_hidden_states: bool = False, **kwargs
-    ) -> object:
-        """
-        Simulate a ViTMAEForPreTraining forward pass.
+    Splits the 200 Tiny ImageNet classes into sequential tasks, then
+    partitions each task's classes across clients in a non-IID fashion.
+    Returns a nested list structure where ``schedule[round][client]``
+    contains the list of class indices assigned to that client in that round.
 
-        Runs the input through the linear encoder and produces a mock
-        reconstruction loss (mean absolute value) and hidden states.
-        The loss is differentiable, enabling full backward-pass testing.
+    Continual Learning Design
+    -------------------------
+    - 200 classes are shuffled (deterministically via seed) to randomize
+      which concepts appear together.
+    - Split into ``num_rounds`` tasks of ``classes_per_task`` classes each.
+    - Within each task, classes are divided equally among ``num_clients``
+      clients, giving each client ``classes_per_client`` unique classes.
+    - This creates non-IID data distributions: no two clients see the same
+      classes in the same round.
 
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor of shape ``[B, D]`` (batch of feature vectors).
-        output_hidden_states : bool
-            Accepted for API compatibility with HuggingFace models.
-            Does not change behavior in the mock.
+    Parameters
+    ----------
+    dataset : ImageFolder
+        The full Tiny ImageNet dataset.
+    num_rounds : int
+        Number of communication rounds (= number of tasks).
+    classes_per_task : int
+        Total classes introduced per round.
+    num_clients : int
+        Number of federated clients.
+    classes_per_client : int
+        Classes assigned to each client per round.
+    seed : int
+        Random seed for class shuffling.
 
-        Returns
-        -------
-        object
-            An object with two attributes:
-            - ``.loss``: Scalar tensor — mean absolute value of encoder output.
-              Serves as a simple differentiable proxy for MAE reconstruction loss.
-            - ``.hidden_states``: List containing the encoder features as a
-              ``[B, 1, D]`` tensor, mimicking the real ViT's multi-layer output.
-        """
-        # Forward through the mock encoder: [B, D] → [B, D]
-        feat = self.encoder(x)
+    Returns
+    -------
+    List[List[List[int]]]
+        ``schedule[round_idx][client_idx]`` = list of class indices.
+    """
+    # Get all unique class indices and shuffle them deterministically.
+    all_classes = list(range(len(dataset.classes)))
+    rng = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(len(all_classes), generator=rng).tolist()
+    shuffled_classes = [all_classes[i] for i in perm]
 
-        class Output:
-            pass
+    schedule = []
+    for round_idx in range(num_rounds):
+        # Extract this round's classes from the shuffled order.
+        start = round_idx * classes_per_task
+        end = start + classes_per_task
+        task_classes = shuffled_classes[start:end]
 
-        out = Output()
+        # Divide task classes across clients (non-IID).
+        round_schedule = []
+        for client_idx in range(num_clients):
+            c_start = client_idx * classes_per_client
+            c_end = c_start + classes_per_client
+            client_classes = task_classes[c_start:c_end]
+            round_schedule.append(client_classes)
 
-        # Mock reconstruction loss: mean(|encoder_output|). This provides
-        # a simple, non-trivial differentiable scalar for gradient testing.
-        out.loss = feat.abs().mean()
+        schedule.append(round_schedule)
 
-        # Mock hidden states: list of (B, 1, D) tensors. In the real ViT,
-        # this would contain one entry per encoder layer.
-        out.hidden_states = [feat.unsqueeze(1)]
-        return out
+    return schedule
+
+
+def create_client_dataloaders(
+    dataset: datasets.ImageFolder,
+    client_classes: List[List[int]],
+    batch_size: int,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    shuffle: bool = True,
+) -> List[DataLoader]:
+    """
+    Create one DataLoader per client for the current round's task.
+
+    Filters the full dataset to include only samples from each client's
+    assigned classes, then wraps them in a DataLoader.
+
+    Parameters
+    ----------
+    dataset : ImageFolder
+        The full Tiny ImageNet training dataset.
+    client_classes : List[List[int]]
+        ``client_classes[i]`` = list of class indices assigned to client i.
+    batch_size : int
+        Mini-batch size per client.
+    num_workers : int
+        DataLoader workers. Default: 4.
+    pin_memory : bool
+        Pin CUDA memory for faster transfer. Default: True.
+    shuffle : bool
+        Shuffle the data each epoch. Default: True.
+
+    Returns
+    -------
+    List[DataLoader]
+        One DataLoader per client, each containing only samples from
+        that client's assigned classes.
+    """
+    dataloaders = []
+
+    # Build a mapping: class_idx → list of sample indices for fast lookup.
+    # dataset.targets is a list of integer class labels for each sample.
+    targets = torch.tensor(dataset.targets)
+
+    for classes in client_classes:
+        # Create a boolean mask for all samples belonging to this client's classes.
+        mask = torch.zeros(len(dataset), dtype=torch.bool)
+        for cls_idx in classes:
+            mask |= (targets == cls_idx)
+
+        # Get the indices of matching samples.
+        indices = torch.where(mask)[0].tolist()
+
+        # Create a Subset and wrap in a DataLoader.
+        subset = Subset(dataset, indices)
+        loader = DataLoader(
+            subset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=False,
+        )
+        dataloaders.append(loader)
+
+    return dataloaders
+
+
+# ==========================================================================
+# CHECKPOINTING — Save model, prototypes, and training history
+# ==========================================================================
+
+
+def save_checkpoint(
+    save_dir: str,
+    round_idx: int,
+    base_model: nn.Module,
+    proto_bank: GlobalPrototypeBank,
+    training_history: Dict[str, Any],
+    is_final: bool = False,
+) -> str:
+    """
+    Save a training checkpoint to disk.
+
+    Each checkpoint contains:
+    - Model state dict (trainable adapter weights only for efficiency).
+    - Global prototype bank tensor.
+    - Full training history (losses, timings, bank sizes).
+
+    Parameters
+    ----------
+    save_dir : str
+        Directory to save checkpoints.
+    round_idx : int
+        Current round number (used in filename).
+    base_model : nn.Module
+        The global model to save.
+    proto_bank : GlobalPrototypeBank
+        The global prototype bank.
+    training_history : Dict[str, Any]
+        Training metrics accumulated over all rounds.
+    is_final : bool
+        If True, saves as 'final_model.pt' instead of 'round_N.pt'.
+
+    Returns
+    -------
+    str
+        Path to the saved checkpoint file.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Extract only trainable (adapter) weights to save disk space.
+    # Frozen backbone weights are identical to the pretrained checkpoint
+    # and don't need to be saved.
+    trainable_state = {
+        k: v.cpu() for k, v in base_model.state_dict().items()
+        if v.requires_grad or "adapter" in k.lower()
+    }
+
+    # Fallback: if the above filtering is too aggressive, save all weights.
+    # This handles cases where requires_grad state may not be preserved
+    # in the state_dict values.
+    if len(trainable_state) == 0:
+        trainable_state = {
+            k: v.cpu() for k, v in base_model.state_dict().items()
+        }
+
+    checkpoint = {
+        "round": round_idx,
+        "model_state_dict": trainable_state,
+        "global_prototypes": (
+            proto_bank.prototypes.cpu() if proto_bank.prototypes is not None
+            else None
+        ),
+        "training_history": training_history,
+        "config": {k: str(v) for k, v in CONFIG.items()},
+    }
+
+    filename = "final_model.pt" if is_final else f"round_{round_idx}.pt"
+    filepath = os.path.join(save_dir, filename)
+    torch.save(checkpoint, filepath)
+    logger.info(f"Checkpoint saved: {filepath}")
+
+    # Also save training history as JSON for easy visualization.
+    history_path = os.path.join(save_dir, "training_history.json")
+    with open(history_path, "w") as f:
+        json.dump(training_history, f, indent=2)
+
+    return filepath
+
+
+# ==========================================================================
+# TRAINING PROGRESS DISPLAY
+# ==========================================================================
+
+
+def print_round_summary(
+    round_idx: int,
+    num_rounds: int,
+    losses: List[float],
+    proto_bank: GlobalPrototypeBank,
+    round_time: float,
+    training_history: Dict[str, Any],
+) -> None:
+    """
+    Print a formatted summary of the completed round.
+
+    Displays loss per client, global prototype bank size, round timing,
+    and cumulative statistics.
+
+    Parameters
+    ----------
+    round_idx : int
+        Current round number.
+    num_rounds : int
+        Total number of rounds.
+    losses : List[float]
+        Loss per client for this round.
+    proto_bank : GlobalPrototypeBank
+        The global prototype bank (to show capacity).
+    round_time : float
+        Wall-clock time for this round in seconds.
+    training_history : Dict[str, Any]
+        Full training history for cumulative stats.
+    """
+    bank_size = (
+        proto_bank.prototypes.shape[0] if proto_bank.prototypes is not None
+        else 0
+    )
+    max_bank = CONFIG["max_global_prototypes"]
+
+    print(f"\n{'━' * 60}")
+    print(f"  Round {round_idx}/{num_rounds} Complete")
+    print(f"{'━' * 60}")
+    for i, loss in enumerate(losses):
+        print(f"  Client {i} Loss: {loss:.6f}")
+    print(f"  Avg Loss:       {sum(losses) / len(losses):.6f}")
+    print(f"  Proto Bank:     {bank_size}/{max_bank}")
+    print(f"  Round Time:     {round_time:.1f}s")
+    print(f"{'━' * 60}\n")
 
 
 # ==========================================================================
@@ -455,42 +654,40 @@ class MockViTMAE(nn.Module):
 
 def main():
     """
-    Run the complete Federated Continual Self-Supervised Learning simulation.
+    Run the complete Federated Continual Self-Supervised Learning pipeline
+    on Tiny ImageNet with 2 T4 GPUs.
 
-    This function is the top-level orchestrator that executes the full FL
-    pipeline end-to-end. It performs four major phases:
+    This function orchestrates the full FL pipeline end-to-end using a real
+    ViTMAEForPreTraining backbone with IBA adapters. It performs five phases:
 
     Phase 1 — Environment Setup:
-        Detect available GPUs, configure the execution mode (sequential CPU
-        or parallel multi-GPU), and set the random seed for reproducibility.
+        Detect GPUs, configure execution mode, set random seed.
 
     Phase 2 — Component Initialization:
-        Instantiate all FL components from the centralized CONFIG:
-        (a) GlobalPrototypeBank — server-side prototype aggregation.
-        (b) FederatedModelServer — FedAvg weight aggregation.
-        (c) MockViTMAE — base model template (or real ViT-MAE in production).
-        (d) ClientManager — spawns N independent federated clients.
-        (e) GPADLoss — distillation loss module for Rounds > 1.
+        Instantiate GlobalPrototypeBank, FederatedModelServer, the real
+        ViT-MAE model with adapters, ClientManager, and GPADLoss.
 
     Phase 3 — Data Setup:
-        Create a synthetic TensorDataset and DataLoaders. In production, each
-        client would have its own private image dataset; here all clients
-        share the same mock data for pipeline validation.
+        Load Tiny ImageNet (200 classes, 100k images), create the continual
+        learning task schedule (5 tasks × 40 classes, non-IID split).
 
     Phase 4 — Federated Training Loop:
-        For each round r = 1, ..., num_rounds:
-            (A) Broadcast global prototypes to all clients (skip Round 1).
-            (B) Clients train locally — MAE only (Round 1) or MAE+GPAD (Round > 1).
-            (C) Extract local prototypes — K-Means (Round 1) or online protos (Round > 1).
-            (D) Server aggregates prototypes (Merge-or-Add + EMA) and weights (FedAvg).
-            (E) Load aggregated weights into the base model for the next round.
+        For each round r = 1, ..., 5:
+            (A) Broadcast global prototypes to clients.
+            (B) Create task-specific dataloaders (non-IID class split).
+            (C) Clients train locally (MAE + GPAD from Round 2).
+            (D) Extract/collect local prototypes.
+            (E) Server aggregates prototypes and weights.
+            (F) Load FedAvg weights, save checkpoint.
+
+    Phase 5 — Final Save:
+        Save the final model, prototypes, and training history.
     """
     logger.info("Initializing Federated Continual Learning Pipeline...")
 
     # ── Phase 1: Environment Setup ────────────────────────────────────────────
     # Automatically detect available CUDA GPUs and configure the execution
-    # mode. Multi-GPU mode enables parallel client training with strict 1:1
-    # Client-GPU mapping. CPU mode falls back to sequential execution.
+    # mode. With 2 T4 GPUs, each client gets its own GPU for parallel training.
     if torch.cuda.is_available():
         CONFIG["gpu_count"] = torch.cuda.device_count()
         CONFIG["device"] = "cuda"
@@ -499,6 +696,11 @@ def main():
             f"Device set to '{CONFIG['device']}'. "
             f"Parallel mode enabled if Clients <= GPUs."
         )
+        # Print GPU info for verification.
+        for i in range(CONFIG["gpu_count"]):
+            name = torch.cuda.get_device_name(i)
+            mem = torch.cuda.get_device_properties(i).total_mem / (1024**3)
+            logger.info(f"  GPU {i}: {name} ({mem:.1f} GB)")
     else:
         CONFIG["device"] = "cpu"
         logger.info(
@@ -508,7 +710,7 @@ def main():
     logger.info(f"Dtype: {CONFIG['dtype']}")
 
     # Set random seed for reproducibility. This ensures deterministic weight
-    # initialization and data generation across runs with the same seed.
+    # initialization, data shuffling, and class scheduling across runs.
     if CONFIG["seed"] is not None:
         torch.manual_seed(CONFIG["seed"])
         if torch.cuda.is_available():
@@ -534,23 +736,32 @@ def main():
 
     # 2B. Server-Side Model Aggregator (FedAvg)
     # Computes the element-wise arithmetic mean of all client model state
-    # dicts to produce a global consensus model. Stateless — no
-    # hyperparameters needed.
+    # dicts to produce a global consensus model.
     fed_server = FederatedModelServer()
 
-    # 2C. Global Model Template
-    # In production, this would be a real ViTMAEForPreTraining model loaded
-    # from CONFIG["pretrained_model_name"]. Here we use MockViTMAE — a
-    # lightweight stand-in that replicates the essential model interfaces
-    # without requiring checkpoint downloads or the transformers library.
-    base_model = MockViTMAE(dim=CONFIG["embedding_dim"])
+    # 2C. Global Model — Real ViTMAEForPreTraining with IBA Adapters
+    # Load the pretrained ViT-MAE backbone from HuggingFace Hub and inject
+    # IBA adapters into every encoder layer. The backbone is frozen — only
+    # adapter parameters (~1% of total) are trainable.
+    logger.info(
+        f"Loading pretrained model: {CONFIG['pretrained_model_name']}..."
+    )
+    base_model = ViTMAEForPreTraining.from_pretrained(
+        CONFIG["pretrained_model_name"]
+    )
+
+    # Inject IBA adapters: freezes all backbone parameters and adds
+    # lightweight bottleneck adapters after each encoder layer.
+    base_model = inject_adapters(
+        base_model,
+        bottleneck_dim=CONFIG["adapter_bottleneck_dim"],
+    )
+    logger.info("Model loaded and adapters injected successfully.")
 
     # 2D. Client Manager
     # Factory that spawns N independent FederatedClient instances, each with
     # a deep copy of the base model. Handles device assignment (1:1 GPU
-    # mapping when available) and dispatches training commands either
-    # sequentially (CPU) or in parallel (multi-GPU via ThreadPoolExecutor).
-    # All client-side hyperparameters are forwarded from CONFIG.
+    # mapping) and dispatches training commands in parallel (multi-GPU).
     client_manager = ClientManager(
         base_model=base_model,
         num_clients=CONFIG["num_clients"],
@@ -572,8 +783,7 @@ def main():
     # 2E. GPAD Distillation Loss
     # The Gated Prototype Anchored Distillation loss module. Used from
     # Round 2 onwards to regularize client features against the global
-    # prototype bank, preventing catastrophic forgetting while allowing
-    # local plasticity for novel concepts.
+    # prototype bank, preventing catastrophic forgetting.
     gpad_loss = GPADLoss(
         base_tau=CONFIG["gpad_base_tau"],
         temp_gate=CONFIG["gpad_temp_gate"],
@@ -582,30 +792,60 @@ def main():
         epsilon=CONFIG["gpad_epsilon"],
     )
 
-    # ── Phase 3: Data Setup (Mock) ────────────────────────────────────────────
-    # Create a synthetic dataset with random noise to simulate feature
-    # embeddings. In production, each client would have its own private
-    # image dataset (e.g., a shard of ImageNet or a domain-specific corpus).
-    dataset = TensorDataset(
-        torch.randn(CONFIG["num_samples"], CONFIG["embedding_dim"])
-    )
-    dataloader = DataLoader(
-        dataset,
-        batch_size=CONFIG["batch_size"],
-        shuffle=CONFIG["dataloader_shuffle"],
+    # ── Phase 3: Data Setup — Tiny ImageNet ───────────────────────────────────
+    # Load the full training dataset and create the continual learning
+    # task schedule. 200 classes → 5 tasks × 40 classes.
+    logger.info("Loading Tiny ImageNet dataset...")
+    dataset = load_tinyimagenet(
+        data_root=CONFIG["data_root"],
+        image_size=CONFIG["image_size"],
     )
 
-    # For simulation simplicity, all clients share the same dataloader.
-    # In a real federated system, each client's DataLoader would wrap a
-    # distinct, private dataset that never leaves the edge device.
-    dataloaders = [dataloader] * CONFIG["num_clients"]
+    # Create the task schedule: which classes each client sees in each round.
+    task_schedule = create_task_schedule(
+        dataset=dataset,
+        num_rounds=CONFIG["num_rounds"],
+        classes_per_task=CONFIG["classes_per_task"],
+        num_clients=CONFIG["num_clients"],
+        classes_per_client=CONFIG["classes_per_client"],
+        seed=CONFIG["seed"],
+    )
+
+    # Log the task schedule for transparency.
+    for r, round_sched in enumerate(task_schedule):
+        for c, classes in enumerate(round_sched):
+            logger.info(
+                f"  Round {r+1} | Client {c}: "
+                f"{len(classes)} classes → {classes}"
+            )
 
     # ── Phase 4: Federated Training Loop ──────────────────────────────────────
-    # Round 1 starts with no global prototypes → pure MAE training.
-    # Subsequent rounds use MAE + GPAD for continual learning.
+    # Training history for tracking and visualization.
+    training_history = {
+        "round_losses": [],       # List of [client_0_loss, client_1_loss, ...]
+        "avg_losses": [],         # Average loss per round
+        "proto_bank_sizes": [],   # Global bank size after each round
+        "round_times": [],        # Wall-clock time per round
+        "task_classes": [],       # Classes introduced per round
+    }
+
     global_protos = None
 
-    for round_idx in range(1, CONFIG["num_rounds"] + 1):
+    # Main training loop with tqdm progress over rounds.
+    round_pbar = tqdm(
+        range(1, CONFIG["num_rounds"] + 1),
+        desc="Federated Rounds",
+        unit="round",
+        position=0,
+    )
+
+    for round_idx in round_pbar:
+        round_start = time.time()
+
+        round_pbar.set_description(
+            f"Round {round_idx}/{CONFIG['num_rounds']}"
+        )
+
         logger.info(f"\n{'='*40}")
         logger.info(f"STARTING ROUND {round_idx}/{CONFIG['num_rounds']}")
         logger.info(f"{'='*40}")
@@ -618,7 +858,26 @@ def main():
                 f"Broadcasting {len(global_protos)} Global Prototypes to Clients."
             )
 
-        # ── Step B: Client Local Training ────────────────────────────────
+        # ── Step B: Create Task-Specific DataLoaders ─────────────────────
+        # Each round introduces a new task with new classes. Each client
+        # gets a disjoint subset of the task's classes (non-IID).
+        client_classes = task_schedule[round_idx - 1]
+        dataloaders = create_client_dataloaders(
+            dataset=dataset,
+            client_classes=client_classes,
+            batch_size=CONFIG["batch_size"],
+            num_workers=CONFIG["num_workers"],
+            pin_memory=CONFIG["pin_memory"],
+            shuffle=CONFIG["dataloader_shuffle"],
+        )
+
+        for i, (dl, classes) in enumerate(zip(dataloaders, client_classes)):
+            logger.info(
+                f"  Client {i}: {len(dl.dataset)} samples "
+                f"from {len(classes)} classes"
+            )
+
+        # ── Step C: Client Local Training ────────────────────────────────
         # Each client trains on its private data for one epoch:
         #   Round 1:  Loss = MAE reconstruction loss only.
         #   Round >1: Loss = MAE + lambda_proto × GPAD (anchored embeddings).
@@ -630,12 +889,11 @@ def main():
         )
         logger.info(f"Client Losses: {losses}")
 
-        # ── Step C: Local Prototype Extraction ───────────────────────────
+        # ── Step D: Local Prototype Extraction ───────────────────────────
         # Round 1:  Run full K-Means from scratch to produce initial
         #           client prototypes (k_init_prototypes clusters).
         # Round >1: Prototypes are maintained online via per-embedding
         #           routing (EMA updates + novelty buffer clustering).
-        #           Retrieve them with get_local_prototypes().
         client_payloads = []
 
         if round_idx == 1:
@@ -643,10 +901,9 @@ def main():
             logger.info(">> Generating Initial Local Prototypes (K-Means)...")
             for i, client in enumerate(client_manager.clients):
                 local_protos = client.generate_prototypes(
-                    dataloader, K_init=CONFIG["k_init_prototypes"]
+                    dataloaders[i], K_init=CONFIG["k_init_prototypes"]
                 )
-                # Move weights to CPU for server-side aggregation (avoids
-                # GPU memory retention across communication boundaries).
+                # Move weights to CPU for server-side aggregation.
                 weights = {
                     k: v.cpu() for k, v in client.model.state_dict().items()
                 }
@@ -679,12 +936,10 @@ def main():
                     logger.info(f"  Client {i}: No local prototypes yet")
                 client_payloads.append(payload)
 
-        # ── Step D: Server Aggregation ───────────────────────────────────
+        # ── Step E: Server Aggregation ───────────────────────────────────
         # The server receives all client payloads and executes two tasks:
-        #   (1) Merge local prototypes into the Global Prototype Bank using
-        #       the Merge-or-Add strategy with EMA updates.
-        #   (2) Average client model weights using FedAvg (element-wise mean
-        #       of all client state dicts).
+        #   (1) Merge local prototypes into the Global Prototype Bank.
+        #   (2) Average client model weights using FedAvg.
         logger.info(">> Server Aggregation...")
         server_result = run_server_round(
             proto_manager=proto_bank,
@@ -696,14 +951,54 @@ def main():
         global_protos = server_result["global_prototypes"]
         global_weights = server_result["global_weights"]
 
-        # ── Step E: Global Model Update ──────────────────────────────────
-        # Load the FedAvg-aggregated weights into the base model. In the
-        # next round, each client will receive a deep copy of this updated
-        # model (via ClientManager), ensuring all clients start from the
-        # latest global consensus.
-        base_model.load_state_dict(global_weights)
+        # ── Step F: Global Model Update + Checkpoint ─────────────────────
+        # Load the FedAvg-aggregated weights into the base model. We use
+        # strict=False because clients send all weights but frozen backbone
+        # weights should not cause issues.
+        base_model.load_state_dict(global_weights, strict=False)
 
-        # Log round completion with the current global bank size.
+        # Record round timing.
+        round_time = time.time() - round_start
+
+        # Update training history.
+        bank_size = (
+            global_protos.shape[0] if global_protos is not None else 0
+        )
+        training_history["round_losses"].append(losses)
+        training_history["avg_losses"].append(sum(losses) / len(losses))
+        training_history["proto_bank_sizes"].append(bank_size)
+        training_history["round_times"].append(round_time)
+        training_history["task_classes"].append(
+            [cls_list for cls_list in client_classes]
+        )
+
+        # Print formatted round summary.
+        print_round_summary(
+            round_idx=round_idx,
+            num_rounds=CONFIG["num_rounds"],
+            losses=losses,
+            proto_bank=proto_bank,
+            round_time=round_time,
+            training_history=training_history,
+        )
+
+        # Update tqdm postfix with key metrics.
+        round_pbar.set_postfix({
+            "avg_loss": f"{training_history['avg_losses'][-1]:.4f}",
+            "bank": bank_size,
+            "time": f"{round_time:.0f}s",
+        })
+
+        # Save checkpoint after every round.
+        save_checkpoint(
+            save_dir=CONFIG["save_dir"],
+            round_idx=round_idx,
+            base_model=base_model,
+            proto_bank=proto_bank,
+            training_history=training_history,
+        )
+
+        # Log round completion.
         if global_protos is not None:
             logger.info(
                 f"Round {round_idx} Complete. "
@@ -711,6 +1006,29 @@ def main():
             )
         else:
             logger.error("Round Complete but Global Protos is None!")
+
+    # ── Phase 5: Final Save ───────────────────────────────────────────────────
+    # Save the final model checkpoint with all training history.
+    save_checkpoint(
+        save_dir=CONFIG["save_dir"],
+        round_idx=CONFIG["num_rounds"],
+        base_model=base_model,
+        proto_bank=proto_bank,
+        training_history=training_history,
+        is_final=True,
+    )
+
+    # Print final training summary.
+    total_time = sum(training_history["round_times"])
+    print(f"\n{'═' * 60}")
+    print(f"  TRAINING COMPLETE")
+    print(f"{'═' * 60}")
+    print(f"  Total Rounds:    {CONFIG['num_rounds']}")
+    print(f"  Total Time:      {total_time:.1f}s ({total_time/60:.1f}min)")
+    print(f"  Final Avg Loss:  {training_history['avg_losses'][-1]:.6f}")
+    print(f"  Final Bank Size: {training_history['proto_bank_sizes'][-1]}")
+    print(f"  Checkpoints:     {CONFIG['save_dir']}/")
+    print(f"{'═' * 60}\n")
 
     logger.info("\nPipeline Finished Successfully.")
 
