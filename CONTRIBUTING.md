@@ -93,11 +93,32 @@ Mathematical variable names (e.g., `K`, `N`, `D`, `X`, `Z`) follow standard rese
 
 ### Docstrings
 
-Every public class and method should have a docstring following NumPy/SciPy style with:
-- **Summary line**: One-line description.
-- **Parameters section**: All arguments with types and descriptions.
-- **Returns section**: Return type and description.
-- **Notes section** (optional): Mathematical background and implementation details.
+Every public class and method should have a researcher-grade docstring following NumPy/SciPy style with:
+- **Summary line**: One-line description of what the component does.
+- **Extended description** (optional): Mathematical formulations, algorithmic pipeline steps, and design rationale explaining *why* a particular approach was chosen.
+- **Parameters section**: All arguments with types, defaults, valid ranges (as `Range: X–Y`), and behavioral descriptions. For example:
+  ```
+  merge_threshold : float
+      Cosine similarity threshold for merging. Range: 0.5–0.85.
+      Default: 0.7.
+  ```
+- **Returns section**: Return type, shape (for tensors), and description.
+- **Notes section** (optional): Mathematical background, edge-case handling, and implementation details. Include tensor shape annotations (e.g., `[B, D]`) wherever applicable.
+
+### Inline Comments
+
+Inline comments should explain the **"why"**, not the **"what"**:
+- Include tensor shape annotations: `# [B, K] similarity matrix`.
+- Reference algorithmic context: `# EMA blend is not a unit vector → re-normalize`.
+- Explain edge cases: `# Buffer may trigger with fewer samples than novelty_k`.
+- Every hyperparameter used in code should reference its CONFIG key in a nearby comment.
+
+### Hyperparameter Range Comments
+
+All tunable hyperparameters in `CONFIG` (in `main.py`) include range comments for future tuning. When adding new hyperparameters:
+1. Add the parameter to `CONFIG` with a descriptive comment and `Range: X–Y` or `Options: A, B, C`.
+2. Wire it through the relevant component constructors.
+3. Document it in the README.md CONFIG reference tables.
 
 ---
 
