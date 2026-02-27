@@ -39,36 +39,33 @@ class GPADLoss(nn.Module):
     learning from noisy or uncertain matches.
     """
     
-    # Small constant to prevent division by zero or log(0) errors
-    EPSILON: float = 1e-8
-    
-    # Temperature for the softmax used in entropy calculation (controls sharpness of distribution)
-    SOFT_ASSIGNMENT_TEMP: float = 0.1
-
     def __init__(self, 
                 base_tau: float = 0.5, 
                 temp_gate: float = 0.1, 
-                lambda_entropy: float = 0.1):
+                lambda_entropy: float = 0.1,
+                soft_assign_temp: float = 0.1,
+                epsilon: float = 1e-8):
         """
         Initialize the GPAD Loss module.
 
         Args:
-            base_tau (float): The minimum similarity required to consider a match "valid" 
-                            in the most confident case (zero entropy). 
-                            Range: [0, 1]. Default: 0.5.
-            temp_gate (float): Temperature scaling for the sigmoid gate. 
-                            Lower values (e.g., 0.01) make the gate a sharp Step Function.
-                            Higher values (e.g., 1.0) make it a smooth transition.
-                            Default: 0.1.
-            lambda_entropy (float): Scaling factor for the uncertainty penalty. 
-                                    A higher lambda means the threshold rises more steeply 
-                                    as the assignment entropy increases.
-                                    Default: 0.1.
+            base_tau (float): Base similarity threshold for global anchoring.
+                            Range: 0.3–0.7. Default: 0.5.
+            temp_gate (float): Sigmoid gate temperature for steepness control.
+                            Range: 0.05–0.5. Default: 0.1.
+            lambda_entropy (float): Uncertainty scaling factor for adaptive threshold.
+                                    Range: 0.1–0.5. Default: 0.1.
+            soft_assign_temp (float): Temperature for the soft assignment distribution.
+                                    Range: 0.05–0.5. Default: 0.1.
+            epsilon (float): Small constant to prevent division by zero or log(0).
+                            Default: 1e-8.
         """
         super().__init__()
         self.base_tau = base_tau
         self.temp_gate = temp_gate
         self.lambda_entropy = lambda_entropy
+        self.soft_assign_temp = soft_assign_temp
+        self.epsilon = epsilon
 
     def forward(self, 
                 embeddings: torch.Tensor, 
@@ -141,15 +138,15 @@ class GPADLoss(nn.Module):
         """
         B, M = sims.shape
         # Soft assignment distribution
-        softmax_all = F.softmax(sims / self.SOFT_ASSIGNMENT_TEMP, dim=1)
+        softmax_all = F.softmax(sims / self.soft_assign_temp, dim=1)
         
         # Entropy calculation: -sum(p * log(p))
-        entropy = -torch.sum(softmax_all * torch.log(softmax_all + self.EPSILON), dim=1)
+        entropy = -torch.sum(softmax_all * torch.log(softmax_all + self.epsilon), dim=1)
         
         # Normalize entropy relative to max possible entropy: log(M)
         # This ensures the entropy penalty scale is consistent regardless of bank size.
         max_ent = torch.log(torch.tensor(float(M), device=sims.device))
-        ent_norm = entropy / (max_ent + self.EPSILON)
+        ent_norm = entropy / (max_ent + self.epsilon)
         
         # Compute threshold
         return self.base_tau + self.lambda_entropy * ent_norm
@@ -201,7 +198,7 @@ class GPADLoss(nn.Module):
         dist_sq = 2 * (1 - max_sim)
         
         # Linear Euclidean Distance (with epsilon for sqrt stability at 0)
-        dist = torch.sqrt(dist_sq + self.EPSILON)
+        dist = torch.sqrt(dist_sq + self.epsilon)
         
         # Apply Gating:
         # High confidence match -> High Gate -> Full Distance Penalty
