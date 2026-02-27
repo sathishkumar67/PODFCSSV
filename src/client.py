@@ -94,6 +94,8 @@ class FederatedClient:
         lambda_proto: float = 1.0,
         novelty_buffer_size: int = 500,
         novelty_k: int = 20,
+        kmeans_max_iters: int = 100,
+        kmeans_tol: float = 1e-4,
     ) -> None:
         """
         Initialize the Federated Client.
@@ -141,6 +143,8 @@ class FederatedClient:
         self.lambda_proto = lambda_proto
         self.novelty_buffer_size = novelty_buffer_size
         self.novelty_k = novelty_k
+        self.kmeans_max_iters = kmeans_max_iters
+        self.kmeans_tol = kmeans_tol
 
         # Local prototype bank — populated after the first call to generate_prototypes()
         self.local_prototypes: Optional[torch.Tensor] = None
@@ -548,7 +552,7 @@ class FederatedClient:
     # ------------------------------------------------------------------
     # K-Means Clustering (PyTorch Implementation)
     # ------------------------------------------------------------------
-    def _kmeans(self, X: torch.Tensor, K: int, max_iters: int = 100) -> torch.Tensor:
+    def _kmeans(self, X: torch.Tensor, K: int) -> torch.Tensor:
         """
         Spherical K-Means clustering on L2-normalized embeddings.
 
@@ -591,7 +595,7 @@ class FederatedClient:
         indices = torch.randperm(N, device=X.device)[:K]
         centroids = X[indices].clone()
 
-        for iteration in range(max_iters):
+        for iteration in range(self.kmeans_max_iters):
             # Ensure centroids stay on the unit sphere
             centroids = F.normalize(centroids, p=2, dim=1)
 
@@ -618,7 +622,7 @@ class FederatedClient:
             center_shift = torch.norm(new_centroids - centroids)
             centroids = new_centroids
 
-            if center_shift < 1e-4:
+            if center_shift < self.kmeans_tol:
                 logger.info(f"[Client {self.client_id}] K-Means converged at iteration {iteration + 1}")
                 break
 
@@ -665,6 +669,8 @@ class ClientManager:
         lambda_proto: float = 1.0,
         novelty_buffer_size: int = 500,
         novelty_k: int = 20,
+        kmeans_max_iters: int = 100,
+        kmeans_tol: float = 1e-4,
     ) -> None:
         """
         Initialize the Client Manager and spawn all clients.
@@ -706,6 +712,8 @@ class ClientManager:
         self.lambda_proto = lambda_proto
         self.novelty_buffer_size = novelty_buffer_size
         self.novelty_k = novelty_k
+        self.kmeans_max_iters = kmeans_max_iters
+        self.kmeans_tol = kmeans_tol
 
         self._initialize_clients(base_model)
 
@@ -749,6 +757,8 @@ class ClientManager:
                 lambda_proto=self.lambda_proto,
                 novelty_buffer_size=self.novelty_buffer_size,
                 novelty_k=self.novelty_k,
+                kmeans_max_iters=self.kmeans_max_iters,
+                kmeans_tol=self.kmeans_tol,
             )
             self.clients.append(client)
 
