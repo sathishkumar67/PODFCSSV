@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] — 2026-02-27
+
+### Added
+
+- **New Hyperparameters in CONFIG** (`main.py`): 10 previously hardcoded or missing values are now centralized in the `CONFIG` dictionary with descriptive comments and tuning ranges:
+  - `seed` (42) — Random seed for reproducibility.
+  - `local_epochs` (1) — Number of local training epochs per round. Range: 1–10.
+  - `dataloader_shuffle` (True) — Whether to shuffle the DataLoader between epochs.
+  - `pretrained_model_name` ("facebook/vit-mae-base") — HuggingFace model identifier for the ViT-MAE backbone.
+  - `adapter_dropout` (0.0) — Dropout rate for IBA adapters. Range: 0.0–0.5.
+  - `max_global_prototypes` (50) — Maximum capacity of the global prototype bank. Range: 20–200.
+  - `gpad_soft_assign_temp` (0.1) — Temperature for the soft assignment distribution in GPAD. Range: 0.05–0.5.
+  - `gpad_epsilon` (1e-8) — Numerical epsilon for GPAD loss computation.
+  - `kmeans_max_iters` (100) — Maximum K-Means iterations before forced termination.
+  - `kmeans_tol` (1e-4) — Convergence tolerance for K-Means centroid shift.
+
+- **Global Prototype Bank Capacity** (`src/server.py`): `GlobalPrototypeBank` now accepts a `max_prototypes` parameter. Once the bank reaches this limit, novel prototypes are rejected (merges still occur). This prevents unbounded bank growth in long-running federations.
+
+- **Configurable GPAD Internals** (`src/loss.py`): `GPADLoss` now accepts `soft_assign_temp` and `epsilon` as constructor parameters (previously class-level constants), enabling external control via `CONFIG`.
+
+- **Configurable K-Means** (`src/client.py`): `FederatedClient._kmeans()` now uses `self.kmeans_max_iters` and `self.kmeans_tol` from CONFIG instead of hardcoded values. These parameters are threaded through `ClientManager` → `FederatedClient`.
+
+### Changed
+
+- **8 Hyperparameter Defaults Updated** (`main.py`): Based on initial experimentation and tuning guidance, the following defaults were recalibrated:
+  - `k_init_prototypes`: 5 → **10** (Range: 5–50)
+  - `novelty_k`: 20 → **5** (Range: 3–10)
+  - `merge_threshold`: 0.85 → **0.7** (Range: 0.5–0.85)
+  - `gpad_lambda_entropy`: 0.1 → **0.3** (Range: 0.1–0.5)
+  - `client_local_update_threshold`: 0.7 → **0.6** (Range: 0.4–0.8)
+  - `lambda_proto`: 1.0 → **0.01** (Range: 0.001–0.1)
+  - `novelty_buffer_size`: 500 → **256** (Options: 128, 256, 512)
+  - `server_ema_alpha`: 0.1 → **0.05** (Range: 0.01–0.2)
+
+- **Seed Setup** (`main.py`): Added explicit `torch.manual_seed()` and `torch.cuda.manual_seed_all()` calls based on `CONFIG["seed"]` for reproducibility.
+
+### Documentation
+
+- **Researcher-Grade Docstring Rewrite**: All module-level, class-level, and method-level docstrings across `src/loss.py`, `src/server.py`, `src/client.py`, and `main.py` were completely rewritten to provide:
+  - Detailed mathematical formulations (GPAD loss equation, EMA blending, adaptive threshold derivation).
+  - Per-stage pipeline explanations with data flow and tensor shapes.
+  - Design rationale for every architectural choice (e.g., why sequential processing in prototype merging, why re-normalization after EMA blending).
+  - Parameter documentation following NumPy/SciPy style with types, defaults, valid ranges, and behavioral descriptions.
+  - References to relevant literature (FedAvg, Prototypical Networks, Masked Autoencoders).
+
+- **Researcher-Grade Inline Comments**: All inline comments across 4 source files were rewritten to explain the "why" behind each operation, not just the "what". Each comment includes tensor shape notation, algorithmic context, and edge-case explanations.
+
+- **Updated `README.md`**: CONFIG reference tables updated to reflect all new defaults and newly added hyperparameters.
+
+- **Updated `CONTRIBUTING.md`**: Documentation style guidelines updated to reflect researcher-grade standards with range comments and design rationale requirements.
+
+- **Version Bump**: `pyproject.toml` version bumped from `0.2.0` to `0.3.0`.
+
+---
+
 ## [0.2.0] — 2026-02-26
 
 ### Added
