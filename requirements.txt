@@ -16,3 +16,10 @@ numpy>=1.21.0
 
 # scikit-learn: additional ML utilities (metrics, evaluation)
 scikit-learn>=1.0.0
+
+# ─── Training Progress & Visualization ──────────────────────────────────────
+# tqdm: progress bars for training loop visualization
+tqdm>=4.60.0
+
+# matplotlib: plotting training curves and results
+matplotlib>=3.5.0
