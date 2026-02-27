@@ -52,27 +52,28 @@ class GlobalPrototypeBank:
         embedding_dim: int = 768, 
         merge_threshold: float = 0.8, 
         ema_alpha: float = 0.1,
-        device: str = "cpu"
+        device: str = "cpu",
+        max_prototypes: int = 50
     ) -> None:
         """
         Initialize the Global Prototype Bank.
 
         Args:
             embedding_dim (int): The dimensionality of the feature vectors.
-            merge_threshold (float): The cosine similarity score [0, 1] required to 
-                                    merge a local prototype into an existing global one.
-                                    High value (e.g., 0.9) = stricter merging (more new prototypes).
-                                    Low value (e.g., 0.6) = looser merging (fewer prototypes).
-            ema_alpha (float): The interpolation factor for EMA updates.
-                            Range: (0, 1].
-                            - Small alpha (0.1): Global proto changes slowly (more stable).
-                            - Large alpha (0.9): Global proto changes quickly (more responsive).
+            merge_threshold (float): Server-side global merge threshold.
+                                    Range: 0.5–0.85. Default: 0.8.
+            ema_alpha (float): Server-side EMA alpha for global prototype updates.
+                            Range: 0.01–0.2. Default: 0.1.
             device (str): Computation device ('cpu' or 'cuda').
+            max_prototypes (int): Maximum capacity of the global prototype bank.
+                                New prototypes are not added once this limit is reached.
+                                Range: 20–200. Default: 50.
         """
         self.embedding_dim = embedding_dim
         self.merge_threshold = merge_threshold
         self.ema_alpha = ema_alpha
         self.device = torch.device(device)
+        self.max_prototypes = max_prototypes
         
         # Tensor storing all global prototypes.
         # Shape: [M, D] where M is the current number of prototypes.
@@ -143,11 +144,17 @@ class GlobalPrototypeBank:
                 self.prototypes[best_idx] = F.normalize(new_vec, p=2, dim=0)
             else:
                 # NO MATCH: This represents a novel feature/concept
-                # Append to the bank
-                self.prototypes = torch.cat(
-                    [self.prototypes, p_new.unsqueeze(0)], 
-                    dim=0
-                )
+                # Append to the bank only if below capacity
+                if self.max_prototypes is None or self.prototypes.size(0) < self.max_prototypes:
+                    self.prototypes = torch.cat(
+                        [self.prototypes, p_new.unsqueeze(0)], 
+                        dim=0
+                    )
+                else:
+                    logger.info(
+                        f"Global bank at capacity ({self.max_prototypes}). "
+                        f"Skipping novel prototype."
+                    )
                 
         return self.prototypes
 
