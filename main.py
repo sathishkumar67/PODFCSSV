@@ -159,7 +159,7 @@ CONFIG = {
 
     # Mini-batch size for local training and prototype extraction.
     # 16 is a good balance for T4 GPUs (16GB VRAM) with float32.
-    "batch_size": 16,
+    "batch_size": 64,
 
     # Whether to shuffle the DataLoader between epochs
     "dataloader_shuffle": True,
@@ -192,17 +192,17 @@ CONFIG = {
     # Smaller = fewer params / faster, larger = more capacity.
     # Typical values: 32–128. At dim=64 with ViT-Base the adapters add ~1 %
     # trainable parameters.
-    "adapter_bottleneck_dim": 64,
+    "adapter_bottleneck_dim": 256,
 
     # Dropout rate for IBA adapters (regularization)
     # Range: 0.0–0.5
-    "adapter_dropout": 0.0,
+    "adapter_dropout": 0.1,
 
     # ── Global Prototype Management (server.py) ──────────────────────────────
     # Server-side global merge threshold: cosine similarity required to merge
     # a local prototype into an existing global one via EMA
     # Range: 0.5–0.85
-    "merge_threshold": 0.7,
+    "merge_threshold": 0.6,
 
     # Server-side EMA alpha for global prototype updates
     # Lower values = slower, more stable updates
@@ -212,13 +212,13 @@ CONFIG = {
     # Maximum capacity of the global prototype bank.
     # New prototypes are not added once this limit is reached.
     # Range: 20–200
-    "max_global_prototypes": 50,
+    "max_global_prototypes": 500,
 
     # ── GPAD Distillation Loss (loss.py) ─────────────────────────────────────
     # Base similarity threshold for global anchoring in GPAD
     # Higher = stricter gating, fewer anchors activated
     # Range: 0.3–0.7
-    "gpad_base_tau": 0.5,
+    "gpad_base_tau": 0.4,
 
     # Sigmoid gate temperature for steepness control in GPAD
     # Lower = sharper (near step-function), higher = smoother
@@ -241,7 +241,7 @@ CONFIG = {
     # ── Client Local Training (client.py) ────────────────────────────────────
     # Number of prototype centroids each client generates via K-Means (Round 1)
     # Range: 5–50
-    "k_init_prototypes": 10,
+    "k_init_prototypes": 50,
 
     # Optimizer learning rate for local client training
     "client_lr": 1e-4,
@@ -278,7 +278,7 @@ CONFIG = {
     # K for the buffer K-Means clustering.
     # This is independent of k_init_prototypes (Round 1 full clustering).
     # Range: 3–10
-    "novelty_k": 5,
+    "novelty_k": 10,
 
     # ── K-Means (client.py) ──────────────────────────────────────────────────
     # Maximum number of K-Means iterations before stopping
