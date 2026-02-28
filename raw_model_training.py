@@ -399,10 +399,6 @@ def main():
         logger.info(
             f"Detected {gpu_count} GPU(s). Using '{CONFIG['device']}'."
         )
-        for i in range(gpu_count):
-            name = torch.cuda.get_device_name(i)
-            mem = torch.cuda.get_device_properties(i).total_mem / (1024**3)
-            logger.info(f"  GPU {i}: {name} ({mem:.1f} GB)")
     else:
         CONFIG["device"] = "cpu"
         logger.info("No CUDA GPUs found. Using CPU.")
