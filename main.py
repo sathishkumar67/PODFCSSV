@@ -124,7 +124,7 @@ CONFIG = {
     # Total number of server-client communication rounds to simulate.
     # Each round corresponds to one continual learning task.
     # 5 rounds × 40 classes per task = 200 classes (all of Tiny ImageNet).
-    "num_rounds": 5,
+    "num_rounds": 2,
 
     # Number of local training epochs each client runs per round.
     # In real federated settings, each client trains for 1 epoch to minimize
