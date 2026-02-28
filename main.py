@@ -159,7 +159,7 @@ CONFIG = {
 
     # Mini-batch size for local training and prototype extraction.
     # 16 is a good balance for T4 GPUs (16GB VRAM) with float32.
-    "batch_size": 64,
+    "batch_size": 96,
 
     # Whether to shuffle the DataLoader between epochs
     "dataloader_shuffle": True,
