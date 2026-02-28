@@ -200,14 +200,19 @@ CONFIG = {
 
     # ── Global Prototype Management (server.py) ──────────────────────────────
     # Server-side global merge threshold: cosine similarity required to merge
-    # a local prototype into an existing global one via EMA
-    # Range: 0.5–0.85
-    "merge_threshold": 0.6,
+    # a local prototype into an existing global one via EMA.
+    #
+    # IMPORTANT — ViT-MAE pretrained features on the unit sphere are very dense:
+    # cosine similarity between different-class centroids routinely exceeds 0.5.
+    # A high threshold (e.g. 0.6) causes ALL prototypes to merge into 1.
+    # Use 0.15 so only near-identical prototypes merge; everything else is added.
+    # Range: 0.05–0.4 for pretrained ViT-MAE features.
+    "merge_threshold": 0.15,
 
     # Server-side EMA alpha for global prototype updates
     # Lower values = slower, more stable updates
     # Range: 0.01–0.2
-    "server_ema_alpha": 0.05,
+    "server_ema_alpha": 0.1,
 
     # Maximum capacity of the global prototype bank.
     # New prototypes are not added once this limit is reached.
@@ -252,8 +257,10 @@ CONFIG = {
     # Local merge threshold: cosine-similarity for online EMA prototype updates.
     # Only samples more similar than this to their nearest local prototype
     # trigger an update — prevents noisy refinements.
-    # Range: 0.4–0.8
-    "client_local_update_threshold": 0.6,
+    # Must match the same reasoning as merge_threshold: ViT-MAE pretrained
+    # embeddings are dense on the unit sphere, so this must also be low.
+    # Range: 0.05–0.3 for pretrained ViT-MAE features.
+    "client_local_update_threshold": 0.2,
 
     # EMA interpolation factor for local non-anchored updates and
     # local buffer centroid merges.
