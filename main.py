@@ -79,12 +79,10 @@ from src.server import GlobalPrototypeBank, FederatedModelServer, run_server_rou
 from src.client import ClientManager
 from src.loss import GPADLoss
 
-# Import the pretrained ViT-MAE backbone and adapter injection utility.
-# ViTMAEForPreTraining provides the full Masked Autoencoder with encoder +
-# decoder. inject_adapters() freezes the backbone and adds ~1% trainable
-# IBA adapter parameters.
-from transformers import ViTMAEForPreTraining
-from src.mae_with_adapter import inject_adapters
+# ViTMAEForPreTraining: full Masked Autoencoder (encoder + decoder).
+# ViTMAEConfig: architecture configuration for from-scratch initialization.
+# Trained entirely from random initialization — no pretrained weights.
+from transformers import ViTMAEForPreTraining, ViTMAEConfig
 
 # Torchvision for dataset loading and image transforms.
 from torchvision import transforms, datasets
@@ -158,8 +156,7 @@ CONFIG = {
     "image_size": 224,
 
     # Mini-batch size for local training and prototype extraction.
-    # 16 is a good balance for T4 GPUs (16GB VRAM) with float32.
-    "batch_size": 96,
+    "batch_size": 64,
 
     # Whether to shuffle the DataLoader between epochs
     "dataloader_shuffle": True,
@@ -169,6 +166,34 @@ CONFIG = {
 
     # Enable pinned memory for faster CPU→GPU data transfer.
     "pin_memory": True,
+
+    # ── Model Architecture (from scratch) ───────────────────────────────────────
+    # ViT-MAE is initialized with RANDOM weights — no pretrained checkpoint.
+    # ALL parameters (encoder + decoder) are trainable end-to-end.
+    # This ensures diverse, task-driven feature representations that will
+    # naturally separate into distinct clusters in the prototype bank.
+
+    # ViT hidden dimension (encoder patch embedding size).
+    # ViT-Base: 768, ViT-Small: 384, ViT-Tiny: 192.
+    "hidden_size": 768,
+
+    # Number of transformer encoder layers.
+    # ViT-Base: 12, ViT-Small: 8, ViT-Tiny: 4.
+    "num_hidden_layers": 12,
+
+    # Number of attention heads per encoder layer.
+    # ViT-Base: 12, ViT-Small: 6, ViT-Tiny: 3.
+    "num_attention_heads": 12,
+
+    # Intermediate (MLP) dimension in each transformer block.
+    # ViT-Base: 3072 (= 4 × hidden_size).
+    "intermediate_size": 3072,
+
+    # Fraction of input patches randomly masked during MAE pre-training.
+    # 75% is the standard from He et al. (2022) — the key hyperparameter
+    # that makes MAE work: too low = trivial task; too high = insufficient signal.
+    # Range: 0.5–0.9
+    "mask_ratio": 0.75,
 
     # ── Continual Learning Task Schedule ──────────────────────────────────────
     # Number of classes introduced per round (task).
@@ -183,20 +208,9 @@ CONFIG = {
     # The dataset will be downloaded here on first run.
     "data_root": "./data",
 
-    # ── Checkpointing ────────────────────────────────────────────────────────
+    # ── Checkpointing ──────────────────────────────────────────────────
     # Directory to save model checkpoints and training history.
     "save_dir": "checkpoints",
-
-    # ── Adapter (mae_with_adapter.py) ────────────────────────────────────────
-    # Bottleneck dimension of the IBA adapters injected into the ViT encoder.
-    # Smaller = fewer params / faster, larger = more capacity.
-    # Typical values: 32–128. At dim=64 with ViT-Base the adapters add ~1 %
-    # trainable parameters.
-    "adapter_bottleneck_dim": 256,
-
-    # Dropout rate for IBA adapters (regularization)
-    # Range: 0.0–0.5
-    "adapter_dropout": 0.1,
 
     # ── Global Prototype Management (server.py) ──────────────────────────────
     # Server-side global merge threshold: cosine similarity required to merge
@@ -741,24 +755,34 @@ def main():
     # dicts to produce a global consensus model.
     fed_server = FederatedModelServer()
 
-    # 2C. Global Model — Real ViTMAEForPreTraining with IBA Adapters
-    # Load the pretrained ViT-MAE backbone from HuggingFace Hub and inject
-    # IBA adapters into every encoder layer. The backbone is frozen — only
-    # adapter parameters (~1% of total) are trainable.
-    logger.info(
-        f"Loading pretrained model: {CONFIG['pretrained_model_name']}..."
+    # 2C. Global Model — ViTMAEForPreTraining trained from scratch
+    # Build a ViT-MAE model from a random weight initialization using the
+    # ViTMAEConfig API. No pretrained checkpoint is loaded — ALL parameters
+    # (encoder + decoder) are trainable end-to-end.
+    #
+    # This avoids the prototype collapse problem caused by pretrained features
+    # being too densely clustered on the unit hypersphere. Training from scratch
+    # means the encoder learns task-driven representations that naturally
+    # separate into distinct clusters as training progresses.
+    logger.info("Initializing ViT-MAE from scratch (random weights)...")
+    vitmae_config = ViTMAEConfig(
+        image_size=CONFIG["image_size"],
+        hidden_size=CONFIG["hidden_size"],
+        num_hidden_layers=CONFIG["num_hidden_layers"],
+        num_attention_heads=CONFIG["num_attention_heads"],
+        intermediate_size=CONFIG["intermediate_size"],
+        mask_ratio=CONFIG["mask_ratio"],
     )
-    base_model = ViTMAEForPreTraining.from_pretrained(
-        CONFIG["pretrained_model_name"]
-    )
+    base_model = ViTMAEForPreTraining(vitmae_config)
 
-    # Inject IBA adapters: freezes all backbone parameters and adds
-    # lightweight bottleneck adapters after each encoder layer.
-    base_model = inject_adapters(
-        base_model,
-        bottleneck_dim=CONFIG["adapter_bottleneck_dim"],
+    # Log architecture summary
+    total_params = sum(p.numel() for p in base_model.parameters())
+    trainable_params = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+    logger.info(
+        f"ViT-MAE initialized from scratch | "
+        f"Total params: {total_params:,} | "
+        f"Trainable: {trainable_params:,} (100% — full end-to-end training)"
     )
-    logger.info("Model loaded and adapters injected successfully.")
 
     # 2D. Client Manager
     # Factory that spawns N independent FederatedClient instances, each with
