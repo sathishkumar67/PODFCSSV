@@ -527,10 +527,14 @@ class FederatedClient:
                 # LOCAL MATCH: The embedding is close enough to an existing
                 # local prototype → refine that prototype via EMA blending.
                 proto_idx = best_idx[i]
-                old_proto = self.local_prototypes[proto_idx]
+                # BUG FIX: Read old_proto from p_norm (the normalized copy used
+                # for similarity computation) NOT from self.local_prototypes[proto_idx]
+                # which may have accumulated numerical drift away from the unit sphere
+                # across many rounds of in-place writes.
+                old_proto = p_norm[proto_idx]               # guaranteed unit-norm
                 blended = (
                     (1 - self.local_ema_alpha) * old_proto
-                    + self.local_ema_alpha * z_norm[i]
+                    + self.local_ema_alpha * z_norm[i]      # z_norm is also unit-norm
                 )
                 # Re-normalize: the EMA blend of two unit vectors is NOT a
                 # unit vector (its norm < 1), so project back to the sphere.
