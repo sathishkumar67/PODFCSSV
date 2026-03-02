@@ -122,7 +122,7 @@ CONFIG = {
     # Total number of server-client communication rounds to simulate.
     # Each round corresponds to one continual learning task.
     # 5 rounds × 40 classes per task = 200 classes (all of Tiny ImageNet).
-    "num_rounds": 2,
+    "num_rounds": 5,
 
     # Number of local training epochs each client runs per round.
     # In real federated settings, each client trains for 1 epoch to minimize
@@ -132,7 +132,7 @@ CONFIG = {
 
     # Number of GPUs available (0 = CPU-only sequential mode)
     # This value is auto-detected at runtime if CUDA is available
-    "gpu_count": 0,
+    "gpu_count": 2,
 
     # Primary computation device for training and inference.
     # Set to "cuda" to use the first available GPU, or "cuda:N" for a
@@ -159,7 +159,7 @@ CONFIG = {
     # Bottleneck dimension of the IBA adapters injected into the ViT encoder.
     # Typical values: 32–128. At dim=64 with ViT-Base the adapters add ~1 %
     # trainable parameters.
-    "adapter_bottleneck_dim": 64,
+    "adapter_bottleneck_dim": 256,
 
     # Mini-batch size for local training and prototype extraction.
     "batch_size": 64,
@@ -172,34 +172,6 @@ CONFIG = {
 
     # Enable pinned memory for faster CPU→GPU data transfer.
     "pin_memory": True,
-
-    # ── Model Architecture (from scratch) ───────────────────────────────────────
-    # ViT-MAE is initialized with RANDOM weights — no pretrained checkpoint.
-    # ALL parameters (encoder + decoder) are trainable end-to-end.
-    # This ensures diverse, task-driven feature representations that will
-    # naturally separate into distinct clusters in the prototype bank.
-
-    # ViT hidden dimension (encoder patch embedding size).
-    # ViT-Base: 768, ViT-Small: 384, ViT-Tiny: 192.
-    "hidden_size": 768,
-
-    # Number of transformer encoder layers.
-    # ViT-Base: 12, ViT-Small: 8, ViT-Tiny: 4.
-    "num_hidden_layers": 12,
-
-    # Number of attention heads per encoder layer.
-    # ViT-Base: 12, ViT-Small: 6, ViT-Tiny: 3.
-    "num_attention_heads": 12,
-
-    # Intermediate (MLP) dimension in each transformer block.
-    # ViT-Base: 3072 (= 4 × hidden_size).
-    "intermediate_size": 3072,
-
-    # Fraction of input patches randomly masked during MAE pre-training.
-    # 75% is the standard from He et al. (2022) — the key hyperparameter
-    # that makes MAE work: too low = trivial task; too high = insufficient signal.
-    # Range: 0.5–0.9
-    "mask_ratio": 0.75,
 
     # ── Continual Learning Task Schedule ──────────────────────────────────────
     # Number of classes introduced per round (task).
