@@ -205,15 +205,23 @@ class GlobalPrototypeBank:
         # similarity. This is essential for valid threshold comparisons.
         incoming = F.normalize(incoming, p=2, dim=1)
 
-        # Process each incoming prototype sequentially against the bank.
+        # --- Round 1 Initialization ---
+        # If the bank is empty, concatenate all local prototypes to form
+        # the initial global bank without applying merge/add logic.
+        if self.prototypes.size(0) == 0:
+            if self.max_prototypes is not None and incoming.size(0) > self.max_prototypes:
+                logger.warning(
+                    f"Round 1 incoming prototypes ({incoming.size(0)}) exceed max capacity "
+                    f"({self.max_prototypes}). Truncating."
+                )
+                self.prototypes = incoming[:self.max_prototypes]
+            else:
+                self.prototypes = incoming
+            return self.prototypes
+
+        # Process each incoming prototype sequentially against the bank (Round > 1).
         for i in range(incoming.size(0)):
             p_new = incoming[i]  # Single prototype vector, shape [D]
-
-            # --- Special case: bank is empty (first round initialization) ---
-            # Simply add the first prototype to bootstrap the bank.
-            if self.prototypes.size(0) == 0:
-                self.prototypes = p_new.unsqueeze(0)  # [1, D]
-                continue
 
             # Defensive re-normalization of the bank before similarity
             # computation. EMA updates can cause slight norm drift due to
