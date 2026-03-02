@@ -155,6 +155,12 @@ CONFIG = {
     # ViT-MAE-Base uses 224×224 images (16×16 patches → 196 patch tokens).
     "image_size": 224,
 
+    # ── Adapter (mae_with_adapter.py) ────────────────────────────────────────
+    # Bottleneck dimension of the IBA adapters injected into the ViT encoder.
+    # Typical values: 32–128. At dim=64 with ViT-Base the adapters add ~1 %
+    # trainable parameters.
+    "adapter_bottleneck_dim": 64,
+
     # Mini-batch size for local training and prototype extraction.
     "batch_size": 64,
 
@@ -755,33 +761,26 @@ def main():
     # dicts to produce a global consensus model.
     fed_server = FederatedModelServer()
 
-    # 2C. Global Model — ViTMAEForPreTraining trained from scratch
-    # Build a ViT-MAE model from a random weight initialization using the
-    # ViTMAEConfig API. No pretrained checkpoint is loaded — ALL parameters
-    # (encoder + decoder) are trainable end-to-end.
-    #
-    # This avoids the prototype collapse problem caused by pretrained features
-    # being too densely clustered on the unit hypersphere. Training from scratch
-    # means the encoder learns task-driven representations that naturally
-    # separate into distinct clusters as training progresses.
-    logger.info("Initializing ViT-MAE from scratch (random weights)...")
-    vitmae_config = ViTMAEConfig(
-        image_size=CONFIG["image_size"],
-        hidden_size=CONFIG["hidden_size"],
-        num_hidden_layers=CONFIG["num_hidden_layers"],
-        num_attention_heads=CONFIG["num_attention_heads"],
-        intermediate_size=CONFIG["intermediate_size"],
-        mask_ratio=CONFIG["mask_ratio"],
-    )
-    base_model = ViTMAEForPreTraining(vitmae_config)
+    # 2C. Global Model — Pre-trained ViT-MAE with Adapters
+    # We load the official pre-trained weights so we start with a strong
+    # feature extractor, then inject trainable bottleneck adapters and
+    # freeze the 300MB backbone.
+    logger.info("Loading pre-trained ViT-MAE and injecting adapters...")
+    
+    # Load the base model
+    base_model = ViTMAEForPreTraining.from_pretrained("facebook/vit-mae-base")
+    
+    # Inject adapters (freezes backbone, adds trainable adapter modules)
+    from src.mae_with_adapter import inject_adapters
+    base_model = inject_adapters(base_model, bottleneck_dim=CONFIG["adapter_bottleneck_dim"])
 
     # Log architecture summary
     total_params = sum(p.numel() for p in base_model.parameters())
     trainable_params = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
     logger.info(
-        f"ViT-MAE initialized from scratch | "
+        f"ViT-MAE with Adapters initialized | "
         f"Total params: {total_params:,} | "
-        f"Trainable: {trainable_params:,} (100% — full end-to-end training)"
+        f"Trainable: {trainable_params:,} ({(trainable_params/total_params)*100:.2f}% — frozen backbone)"
     )
 
     # 2D. Client Manager
@@ -929,9 +928,10 @@ def main():
                 local_protos = client.generate_prototypes(
                     dataloaders[i], K_init=CONFIG["k_init_prototypes"]
                 )
-                # Move weights to CPU for server-side aggregation.
+                # Extract only trainable weights (adapters) for server-side aggregation.
                 weights = {
                     k: v.cpu() for k, v in client.model.state_dict().items()
+                    if client.model.get_parameter(k).requires_grad
                 }
                 payload = {
                     "client_id": f"client_{i}",
@@ -944,8 +944,10 @@ def main():
             logger.info(">> Collecting Local Prototypes (from routing/buffer)...")
             for i, client in enumerate(client_manager.clients):
                 local_protos = client.get_local_prototypes()
+                # Extract only trainable weights (adapters) for server-side aggregation.
                 weights = {
                     k: v.cpu() for k, v in client.model.state_dict().items()
+                    if client.model.get_parameter(k).requires_grad
                 }
                 payload = {
                     "client_id": f"client_{i}",
