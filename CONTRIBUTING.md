@@ -41,7 +41,7 @@ python -c "from src import GPADLoss, ClientManager; print('Imports OK')"
 python main.py
 ```
 
-This executes the full federated learning loop using `MockViTMAE` and synthetic data — no real datasets or checkpoints needed.
+This loads the pre-trained `facebook/vit-mae-base` checkpoint, injects IBA adapters, freezes the backbone, and runs the federated learning loop on Tiny ImageNet.
 
 ---
 
@@ -54,7 +54,7 @@ Understanding the codebase requires familiarity with its four main modules:
 | `src/loss.py` | GPAD loss computation, adaptive thresholding, and anchor mask generation |
 | `src/client.py` | Local training, per-embedding routing (anchored / local / novel), novelty buffer, K-Means clustering |
 | `src/server.py` | Global prototype bank (merge-or-add with EMA), FedAvg weight aggregation |
-| `src/mae_with_adapter.py` | Information-Bottleneck Adapter injection into frozen ViT-MAE blocks |
+| `src/mae_with_adapter.py` | Information-Bottleneck Adapter injection into frozen ViT-MAE blocks; backbone freezing |
 
 ### Key Data Flow
 
@@ -93,17 +93,14 @@ Mathematical variable names (e.g., `K`, `N`, `D`, `X`, `Z`) follow standard rese
 
 ### Docstrings
 
-Every public class and method should have a researcher-grade docstring following NumPy/SciPy style with:
-- **Summary line**: One-line description of what the component does.
-- **Extended description** (optional): Mathematical formulations, algorithmic pipeline steps, and design rationale explaining *why* a particular approach was chosen.
-- **Parameters section**: All arguments with types, defaults, valid ranges (as `Range: X–Y`), and behavioral descriptions. For example:
-  ```
-  merge_threshold : float
-      Cosine similarity threshold for merging. Range: 0.5–0.85.
-      Default: 0.7.
-  ```
-- **Returns section**: Return type, shape (for tensors), and description.
-- **Notes section** (optional): Mathematical background, edge-case handling, and implementation details. Include tensor shape annotations (e.g., `[B, D]`) wherever applicable.
+Every public class and method should have a **compact, scannable** docstring following NumPy/SciPy style:
+- **Summary line**: One concise sentence describing what the component does.
+- **Structured body** (optional): Use attribute tables (e.g., `attr : type – description`) and short inline notes rather than full prose paragraphs.
+- **Parameters section**: All arguments with types, defaults, and valid ranges. Keep descriptions to one or two lines.
+- **Returns section**: Return type, shape (for tensors), and a brief description.
+- **Notes section** (optional): Mathematical background or edge-case handling, with tensor shape annotations (e.g., `[B, D]`).
+
+Prefer concise language. Avoid repeating information that is obvious from the function signature.
 
 ### Inline Comments
 
@@ -112,6 +109,15 @@ Inline comments should explain the **"why"**, not the **"what"**:
 - Reference algorithmic context: `# EMA blend is not a unit vector → re-normalize`.
 - Explain edge cases: `# Buffer may trigger with fewer samples than novelty_k`.
 - Every hyperparameter used in code should reference its CONFIG key in a nearby comment.
+
+### Dtype Consistency
+
+All tensor operations must respect the centralized `CONFIG["dtype"]` setting from `main.py`. **Never** use hardcoded `.float()`, `.double()`, or `.half()` casts. Instead:
+- Use `.to(tensor.dtype)` when converting boolean masks to the input tensor's dtype.
+- Use `self.dtype` (threaded from CONFIG) when casting inputs.
+- Use `ref_param.dtype` when matching a backbone parameter's precision.
+
+This ensures that switching between `float32` and `bfloat16` in CONFIG propagates correctly through every file.
 
 ### Hyperparameter Range Comments
 

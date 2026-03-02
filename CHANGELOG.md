@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.0] — 2026-03-02
+
+### Added
+
+- **Adapter Injection in Main Orchestrator** (`main.py`): `main.py` now loads the official `facebook/vit-mae-base` pre-trained checkpoint and calls `inject_adapters()` to freeze the backbone and add trainable IBA adapters. Previously the model was initialised from scratch with all parameters trainable — this was a critical gap between the documented architecture and the actual execution.
+- **`adapter_bottleneck_dim` CONFIG Key** (`main.py`): New hyperparameter (default: 256, range: 32–256) controls the bottleneck dimension of the injected IBA adapters.
+- **Round 1 Prototype Concatenation** (`src/server.py`): When the global prototype bank is empty (Round 1), all incoming local prototypes are now concatenated directly into the bank without applying the Merge-or-Add algorithm. From Round 2 onwards the original sequential Merge-or-Add logic is preserved. This ensures the initial global bank captures all client concepts without premature merging.
+
+### Fixed
+
+- **Mask-Consistent Embedding Extraction** (`src/client.py`): `train_epoch()` now passes `output_hidden_states=True` to the single MAE forward call and extracts embeddings from the last encoder hidden state (excluding the CLS token). Previously, a separate `_extract_features()` call re-ran the encoder with a *different* random mask, making the MAE loss and prototype embeddings inconsistent. `_extract_features()` is now used only during `generate_prototypes()` (Round 1, under `torch.inference_mode`).
+- **Dtype Consistency** (`src/loss.py`, `src/server.py`): Removed all hardcoded `.float()` casts that forced tensors to `float32` regardless of the `CONFIG["dtype"]` setting. `GPADLoss._compute_gating()` now uses `.to(max_sim.dtype)` instead of `.float()`. FedAvg aggregation in `FederatedModelServer` preserves the original parameter dtype during averaging.
+- **K-Means Convergence on the Unit Sphere** (`src/client.py`): `_kmeans()` now L2-normalises new centroids *before* computing the centroid shift, ensuring the convergence check measures true displacement on the unit sphere rather than comparing normalised vs. un-normalised vectors.
+- **EMA Blending from Normalised Copies** (`src/client.py`): `_route_non_anchored()` and `_cluster_novelty_buffer()` now read the old prototype from the normalised copy (`p_norm`) rather than from `self.local_prototypes` directly. This avoids compounding numerical drift from repeated in-place EMA writes.
+- **Entropy Log-Clamping** (`src/loss.py`): `_compute_adaptive_threshold()` now uses `softmax_all.clamp(min=epsilon)` inside `torch.log()` instead of `softmax_all + epsilon`. Clamping avoids biasing the probability distribution away from zero, producing a cleaner entropy estimate.
+
+### Changed
+
+- **Docstring Style Overhaul** (`src/server.py`, `src/client.py`, `src/loss.py`): All module-level, class-level, and method-level docstrings were condensed into a compact, scannable format. Verbose prose was replaced with structured summaries, inline attribute tables, and concise parameter descriptions while retaining all mathematical and algorithmic detail.
+- **CONFIG Defaults Updated** (`main.py`):
+  - `merge_threshold`: 0.7 → **0.15** (ViT-MAE pre-trained features are dense on the unit sphere; a high threshold collapses all prototypes).
+  - `server_ema_alpha`: 0.05 → **0.1**.
+  - `max_global_prototypes`: 50 → **500** (increased capacity for 200-class Tiny ImageNet).
+  - `k_init_prototypes`: 10 → **50**.
+  - `client_local_update_threshold`: 0.6 → **0.2**.
+  - `gpad_base_tau`: 0.5 → **0.4**.
+  - `novelty_k`: 5 → **10** (Range: 3–10).
+- **Model Architecture Section Removed** (`main.py`): The from-scratch `ViTMAEConfig` initialisation block was replaced with pre-trained loading + adapter injection.
+- **Architecture Log** (`main.py`): The post-init log now reports the percentage of trainable parameters (e.g., "1.09% — frozen backbone") instead of "100% — full end-to-end training".
+
+### Documentation
+
+- Updated `README.md`: CONFIG reference tables, module reference, and algorithm details updated to reflect all v0.4.0 changes.
+- Updated `CONTRIBUTING.md`: Added dtype policy section and updated docstring style guidance.
+- Version bump: `pyproject.toml` from `0.3.0` to `0.4.0`.
+
+---
+
 ## [0.3.0] — 2026-02-27
 
 ### Added

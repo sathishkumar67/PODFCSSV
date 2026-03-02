@@ -36,7 +36,7 @@ Training a shared visual model across distributed edge devices faces three simul
 
 **PODFCSSV** addresses all three by:
 
-1. Training a **frozen ViT-MAE backbone** with lightweight **Information-Bottleneck Adapters** (~1% trainable parameters).
+1. Loading a **pre-trained ViT-MAE backbone** and injecting lightweight **Information-Bottleneck Adapters** (~1% trainable parameters, backbone frozen).
 2. Communicating only compact **prototype vectors** (K-Means centroids of local features) instead of raw data.
 3. Using **GPAD loss** with per-embedding routing to anchor local representations against a global prototype bank, preventing forgetting.
 4. Employing a **Novelty Buffer** on each client that accumulates genuinely unseen patterns and discovers new visual concepts via triggered K-Means clustering.
@@ -52,6 +52,7 @@ Training a shared visual model across distributed edge devices faces three simul
 - **Per-Embedding Routing** — Each embedding is dynamically classified as anchored (→ GPAD loss), locally known (→ EMA update), or truly novel (→ novelty buffer).
 - **Novelty Buffer with Merge-or-Add** — Accumulated novel samples are clustered when a threshold is reached; resulting centroids are merged into existing local prototypes via EMA if similar, or added as new concepts if distinct.
 - **Multi-GPU Parallelism** — 1:1 client-GPU mapping with `ThreadPoolExecutor` for true concurrent training.
+- **Dtype Consistency** — All tensors respect the centralized `CONFIG["dtype"]` setting with no implicit float32 casts.
 - **Mock Simulation** — Full pipeline runs without downloading model checkpoints or real datasets.
 
 ---
@@ -98,7 +99,7 @@ The system operates in round-based communication cycles between a central **Serv
 | **A** | Broadcast | Server sends initial model (no prototypes) | Server sends global prototypes + averaged weights |
 | **B** | Local Training | MAE loss only (no global knowledge yet) | MAE + λ × GPAD loss with per-embedding routing |
 | **C** | Prototype Extraction | Full K-Means on all local embeddings | Use live local prototypes (maintained via EMA + buffer clustering) |
-| **D** | Server Aggregation | Build initial Global Prototype Bank | EMA merge-or-add prototypes + FedAvg weight averaging |
+| **D** | Server Aggregation | Concatenate all client prototypes into initial bank (no merge logic) | EMA merge-or-add prototypes + FedAvg weight averaging |
 | **E** | Global Update | First global model and prototype bank ready | Updated model and bank broadcast to all clients |
 
 ### Per-Embedding Routing (Round ≥ 2)
@@ -206,13 +207,13 @@ pip install -e ".[dev]"
 
 ## Quick Start
 
-### Run the Full Pipeline (Mock Simulation)
+### Run the Full Pipeline
 
 ```bash
 python main.py
 ```
 
-This runs the complete federated learning loop using a lightweight `MockViTMAE` model and synthetic data — no checkpoint downloads or real datasets required.
+This loads the pre-trained `facebook/vit-mae-base` checkpoint, injects IBA adapters, and runs the full federated training loop on Tiny ImageNet. The backbone is frozen — only adapter parameters (~1%) are trained.
 
 **Expected output:**
 
@@ -261,27 +262,28 @@ All hyperparameters are centralized in the `CONFIG` dictionary in `main.py`:
 | `dtype` | `float32` | — | Floating-point precision (`float32` or `bfloat16`) |
 | `dataloader_shuffle` | True | — | Whether to shuffle the DataLoader between epochs |
 
-### Adapter
+### Model & Adapter
 
 | Parameter | Default | Range | Description |
 |---|---|---|---|
 | `pretrained_model_name` | `facebook/vit-mae-base` | — | HuggingFace model identifier for the ViT-MAE backbone |
-| `adapter_bottleneck_dim` | 64 | 32–128 | Information bottleneck dimension |
-| `adapter_dropout` | 0.0 | 0.0–0.5 | Dropout rate for IBA adapters (regularization) |
+| `adapter_bottleneck_dim` | 256 | 32–256 | Information bottleneck dimension of IBA adapters |
+| `embedding_dim` | 768 | — | Hidden size of ViT-Base encoder (must match backbone) |
+| `image_size` | 224 | — | Input image resolution (224×224 for ViT-Base) |
 
 ### Server — Global Prototype Bank
 
 | Parameter | Default | Range | Description |
 |---|---|---|---|
-| `merge_threshold` | 0.7 | 0.5–0.85 | Cosine similarity threshold to merge vs. add a prototype |
-| `server_ema_alpha` | 0.05 | 0.01–0.2 | EMA interpolation factor for global prototype updates |
-| `max_global_prototypes` | 50 | 20–200 | Maximum capacity of the global prototype bank |
+| `merge_threshold` | 0.15 | 0.05–0.4 | Cosine similarity threshold to merge vs. add a prototype (low because pre-trained ViT-MAE features are dense on the unit sphere) |
+| `server_ema_alpha` | 0.1 | 0.01–0.2 | EMA interpolation factor for global prototype updates |
+| `max_global_prototypes` | 500 | 20–200 | Maximum capacity of the global prototype bank |
 
 ### GPAD Loss
 
 | Parameter | Default | Range | Description |
 |---|---|---|---|
-| `gpad_base_tau` | 0.5 | 0.3–0.7 | Base similarity threshold for confident anchoring |
+| `gpad_base_tau` | 0.4 | 0.3–0.7 | Base similarity threshold for confident anchoring |
 | `gpad_temp_gate` | 0.1 | 0.05–0.5 | Sigmoid gate temperature (lower = sharper decision boundary) |
 | `gpad_lambda_entropy` | 0.3 | 0.1–0.5 | Entropy penalty scaling factor (raises threshold for uncertain samples) |
 | `gpad_soft_assign_temp` | 0.1 | 0.05–0.5 | Temperature for the soft assignment distribution in entropy calculation |
@@ -292,10 +294,10 @@ All hyperparameters are centralized in the `CONFIG` dictionary in `main.py`:
 
 | Parameter | Default | Range | Description |
 |---|---|---|---|
-| `k_init_prototypes` | 10 | 5–50 | Number of prototype centroids per client (Round 1 K-Means) |
+| `k_init_prototypes` | 50 | 5–50 | Number of prototype centroids per client (Round 1 K-Means) |
 | `client_lr` | 1e-4 | — | AdamW optimizer learning rate |
 | `client_weight_decay` | 0.05 | — | AdamW L2 regularization weight decay |
-| `client_local_update_threshold` | 0.6 | 0.4–0.8 | Cosine similarity threshold for EMA prototype updates and buffer merge decisions |
+| `client_local_update_threshold` | 0.2 | 0.05–0.3 | Cosine similarity threshold for EMA prototype updates and buffer merge decisions (low for pre-trained ViT-MAE) |
 | `client_local_ema_alpha` | 0.1 | 0.05–0.3 | EMA interpolation factor for online prototype refinement |
 | `kmeans_max_iters` | 100 | — | Maximum K-Means iterations before forced termination |
 | `kmeans_tol` | 1e-4 | — | K-Means convergence tolerance (centroid shift below this = converged) |
@@ -305,7 +307,7 @@ All hyperparameters are centralized in the `CONFIG` dictionary in `main.py`:
 | Parameter | Default | Range / Options | Description |
 |---|---|---|---|
 | `novelty_buffer_size` | 256 | 128, 256, 512 | Number of novel embeddings to accumulate before triggering fresh K-Means |
-| `novelty_k` | 5 | 3–10 | K for buffer K-Means clustering (independent of `k_init_prototypes`) |
+| `novelty_k` | 10 | 3–10 | K for buffer K-Means clustering (independent of `k_init_prototypes`) |
 
 ---
 
@@ -350,7 +352,7 @@ Server-side aggregation logic.
 | Component | Description |
 |---|---|
 | `GlobalPrototypeBank` | Merge-or-Add prototype bank with EMA updates. Dynamically grows as new concepts emerge. Re-normalizes after merges to maintain unit-sphere geometry |
-| `FederatedModelServer` | Standard FedAvg: element-wise arithmetic mean of client state dictionaries with float32 upcasting for numerical stability |
+| `FederatedModelServer` | Standard FedAvg: element-wise arithmetic mean of client state dictionaries, preserving the original `CONFIG["dtype"]` without implicit float32 casting |
 | `run_server_round()` | Single-call server round: merges prototypes + averages weights |
 | `GlobalModel` | Wrapper for loading real ViTMAEForPreTraining with adapter injection |
 
@@ -375,7 +377,7 @@ H_adapted = H + Dropout(W_up · σ(W_down · H))
 The GPAD loss enforces alignment between local embeddings and global prototypes:
 
 ```
-L_GPAD(z) = Gate(z) × ‖z - v*‖²
+L_GPAD(z) = Gate(z) × ‖z - v*‖
 
 where:
   v*          = argmax_v cos(z, v)              (best-matching global prototype)
@@ -411,20 +413,23 @@ This prevents duplicate prototypes while allowing genuine new concept discovery.
 
 ### 5. Global Prototype Bank (Merge-or-Add with EMA)
 
-For each incoming local prototype `p` uploaded by a client:
+**Round 1 (bank empty):** All incoming local prototypes from every client are simply concatenated to form the initial global bank. No Merge-or-Add logic is applied.
 
-- If `max cos(p, G) ≥ merge_threshold`: **Merge** via EMA — `G_best ← (1-α)·G_best + α·p`, then re-normalize to unit sphere.
-- If `max cos(p, G) < merge_threshold`: **Add** — append `p` as a new global prototype.
+**Round ≥ 2:** For each incoming local prototype `p` uploaded by a client:
+
+- If `max cos(p, G) ≥ merge_threshold`: **Merge** via EMA — `G_best ← (1-α)·G_best + α·p`, then re-normalise to unit sphere.
+- If `max cos(p, G) < merge_threshold`: **Add** — append `p` as a new global prototype (subject to `max_prototypes` capacity).
 
 This allows the prototype bank to automatically discover new visual concepts while refining existing ones.
 
 ### 6. Spherical K-Means
 
-Client-side prototype extraction uses K-Means on L2-normalized embeddings with cosine similarity (dot product) as the distance metric:
+Client-side prototype extraction uses K-Means on L2-normalised embeddings with cosine similarity (dot product) as the distance metric:
 
-- Random data-point initialization
+- Random data-point initialisation (Forgy)
 - Empty-cluster re-seeding with random data points
-- Convergence check (centroid shift < `kmeans_tol`)
+- Centroids are L2-normalised before computing the convergence shift, ensuring the check measures true displacement on the unit sphere
+- Convergence check: centroid shift < `kmeans_tol`
 - Automatic clamping of K to N when samples < clusters
 
 ---
