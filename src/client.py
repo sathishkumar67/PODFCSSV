@@ -251,11 +251,12 @@ class FederatedClient:
         self.model = copy.deepcopy(model).to(self.device)
         logger.info(f"[Client {self.client_id}] Model copied to {self.device}")
 
-        # Initialize the optimizer over ALL model parameters. In production
-        # with IBA adapters, only adapter params have requires_grad=True,
-        # so AdamW effectively only updates the adapters.
+        # Initialize the optimizer over TRAINABLE model parameters only.
+        #    This is critical for PEFT: the backbone is frozen (requires_grad=False),
+        #    so we only want the optimizer to track and update the injected adapters.
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         opt_kwargs = optimizer_kwargs or {"lr": 1e-3}
-        self.optimizer = optimizer_cls(self.model.parameters(), **opt_kwargs)
+        self.optimizer = optimizer_cls(trainable_params, **opt_kwargs)
 
         logger.info(
             f"[Client {self.client_id}] Initialized | device={self.device} | "
@@ -385,23 +386,38 @@ class FederatedClient:
             inputs = batch[0] if isinstance(batch, (list, tuple)) else batch
             inputs = inputs.to(self.dtype).to(self.device)
 
-            # --- Step 1: MAE Forward Pass ---
-            # The full ViTMAE model returns an object with .loss (reconstruction
-            # loss) and .hidden_states. For the mock model, .loss is a dummy
-            # scalar derived from the encoder output.
-            outputs = self.model(inputs)
+            # --- Step 1: MAE Forward Pass (single pass, mask-consistent features) ---
+            # Request hidden_states=True so we can reuse the encoder output for
+            # prototype routing WITHOUT a second forward pass.
+            #
+            # BUG FIX (Critical): Previously, the code called self.model(inputs)
+            # AND self._extract_features(inputs) separately. ViT-MAE re-samples a
+            # NEW random mask on every call, so the two passes operated on different
+            # masked views — the MAE loss was on Mask-A, embeddings on Mask-B.
+            # Now both the loss and embeddings come from the SAME single call.
+            outputs = self.model(inputs, output_hidden_states=True)
             mae_loss = getattr(outputs, "loss", None)
             if mae_loss is None:
-                # Fallback: if the model doesn't produce a loss attribute,
-                # use a differentiable zero to avoid breaking the computation graph.
                 mae_loss = torch.tensor(
                     0.0, dtype=self.dtype, device=self.device, requires_grad=True
                 )
             final_loss = mae_loss
 
-            # --- Step 2: Feature Extraction ---
-            # Extract pooled embeddings from the encoder for prototype routing.
-            embeddings = self._extract_features(inputs)
+            # --- Step 2: Extract Features from the Same Forward Pass ---
+            # outputs.hidden_states is a tuple of 13 tensors (1 embed + 12 layers),
+            # all from the ENCODER only. Shape of each: [B, N_visible+1, D] where
+            # N_visible = unmasked patches (≈49 for 75% mask) and index 0 is CLS.
+            #
+            # BUG FIX (Minor): We slice [:, 1:, :] to exclude the CLS token (index 0)
+            # so the pooled vector is a pure average of VISUAL PATCH features only.
+            # This makes the prototype representation a faithful summary of the
+            # unmasked image regions, not diluted by the CLS aggregation token.
+            #
+            # We detach() because these embeddings are used ONLY for routing logic
+            # (no gradient flows from routing decisions back into the model).
+            # The gradient path for the model update runs through mae_loss only.
+            last_hidden = outputs.hidden_states[-1]           # [B, N_vis+1, D]
+            embeddings = last_hidden[:, 1:, :].mean(dim=1).detach()  # [B, D], patch avg
 
             # --- Step 3: Per-Embedding Routing (active only in Round > 1) ---
             if has_gpad and embeddings is not None:
@@ -605,8 +621,11 @@ class FederatedClient:
             sims = torch.mm(c_norm, p_norm.t())
             max_sim, best_idx = sims.max(dim=1)  # both [K_new]
 
-            # Clone existing prototypes for safe in-place EMA updates.
-            updated_protos = self.local_prototypes.clone()
+            # BUG FIX (Critical): Clone from p_norm (the NORMALIZED version), NOT
+            # from self.local_prototypes (which may have drifted from unit norm).
+            # The EMA blend: (1-α)*old + α*new must use unit-norm old to keep the
+            # math on the hypersphere before the final F.normalize re-projection.
+            updated_protos = p_norm.clone()
             protos_to_add = []
             merged_count = 0
             added_count = 0
@@ -616,12 +635,12 @@ class FederatedClient:
                     # MERGE: This centroid is similar to an existing local
                     # prototype → update the existing one via EMA.
                     idx = best_idx[i]
-                    old_proto = updated_protos[idx]
+                    old_proto = updated_protos[idx]          # guaranteed unit-norm
                     blended = (
                         (1 - self.local_ema_alpha) * old_proto
-                        + self.local_ema_alpha * new_centroids[i]
+                        + self.local_ema_alpha * c_norm[i]   # c_norm also unit-norm
                     )
-                    # Re-normalize: EMA blend is not a unit vector.
+                    # Re-normalize: EMA blend of two unit vectors has norm < 1.
                     updated_protos[idx] = F.normalize(blended, p=2, dim=0)
                     merged_count += 1
                 else:
@@ -825,14 +844,24 @@ class FederatedClient:
                     new_idx = torch.randint(0, N, (1,), device=X.device).item()
                     new_centroids[k] = X[new_idx]
 
-            # Step 4: Convergence check — total centroid displacement.
-            center_shift = torch.norm(new_centroids - centroids)
+            # Step 4: Convergence check — centroid displacement ON THE UNIT SPHERE.
+            #
+            # BUG FIX (Moderate): The old code computed ||new_centroids - centroids||
+            # where new_centroids were raw arithmetic means (norm < 1) and centroids
+            # were unit-norm from the top of the loop. These live on different scales,
+            # making kmeans_tol completely meaningless.
+            #
+            # Fix: normalize new_centroids BEFORE computing the shift, so both
+            # tensors are on the unit sphere and the distance is a true geodesic
+            # displacement. Then store the normalized version as the new centroids.
+            new_centroids = F.normalize(new_centroids, p=2, dim=1)
+            center_shift = torch.norm(new_centroids - centroids)  # both unit-norm now
             centroids = new_centroids
 
             if center_shift < self.kmeans_tol:
                 logger.info(
                     f"[Client {self.client_id}] K-Means converged at "
-                    f"iteration {iteration + 1}"
+                    f"iteration {iteration + 1} | shift={center_shift:.6f}"
                 )
                 break
 
