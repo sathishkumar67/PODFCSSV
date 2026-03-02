@@ -132,7 +132,7 @@ CONFIG = {
 
     # Number of GPUs available (0 = CPU-only sequential mode)
     # This value is auto-detected at runtime if CUDA is available
-    "gpu_count": 2,
+    "gpu_count": 0,
 
     # Primary computation device for training and inference.
     # Set to "cuda" to use the first available GPU, or "cuda:N" for a
@@ -194,12 +194,12 @@ CONFIG = {
     # Server-side global merge threshold: cosine similarity required to merge
     # a local prototype into an existing global one via EMA.
     #
-    # IMPORTANT — ViT-MAE pretrained features on the unit sphere are very dense:
-    # cosine similarity between different-class centroids routinely exceeds 0.5.
-    # A high threshold (e.g. 0.6) causes ALL prototypes to merge into 1.
-    # Use 0.15 so only near-identical prototypes merge; everything else is added.
-    # Range: 0.05–0.4 for pretrained ViT-MAE features.
-    "merge_threshold": 0.15,
+    # IMPORTANT — ViT-MAE pretrained features on the unit sphere naturally form
+    # distinct semantic clusters. A low threshold (e.g. 0.15) merges EVERYTHING.
+    # Use 0.85 so only near-identical prototypes merge; everything else is added
+    # as a new concept.
+    # Range: 0.80–0.95
+    "merge_threshold": 0.85,
 
     # Server-side EMA alpha for global prototype updates
     # Lower values = slower, more stable updates
@@ -213,9 +213,10 @@ CONFIG = {
 
     # ── GPAD Distillation Loss (loss.py) ─────────────────────────────────────
     # Base similarity threshold for global anchoring in GPAD
-    # Higher = stricter gating, fewer anchors activated
-    # Range: 0.3–0.7
-    "gpad_base_tau": 0.4,
+    # Higher = stricter gating, fewer anchors activated, allowing more 
+    # novel embeddings to drop into the novelty buffer.
+    # Range: 0.6–0.9
+    "gpad_base_tau": 0.8,
 
     # Sigmoid gate temperature for steepness control in GPAD
     # Lower = sharper (near step-function), higher = smoother
@@ -249,10 +250,10 @@ CONFIG = {
     # Local merge threshold: cosine-similarity for online EMA prototype updates.
     # Only samples more similar than this to their nearest local prototype
     # trigger an update — prevents noisy refinements.
-    # Must match the same reasoning as merge_threshold: ViT-MAE pretrained
-    # embeddings are dense on the unit sphere, so this must also be low.
-    # Range: 0.05–0.3 for pretrained ViT-MAE features.
-    "client_local_update_threshold": 0.2,
+    # If the similarity is lower, the embedding is sent to the novelty buffer.
+    # Must be high enough to allow distinct concepts to bypass EMA and buffer.
+    # Range: 0.80–0.95
+    "client_local_update_threshold": 0.85,
 
     # EMA interpolation factor for local non-anchored updates and
     # local buffer centroid merges.
@@ -733,28 +734,29 @@ def main():
     # dicts to produce a global consensus model.
     fed_server = FederatedModelServer()
 
-    # 2C. Global Model — ViTMAEForPreTraining trained from scratch
-    # Build a ViT-MAE model from random weight initialization using the
-    # ViTMAEConfig API. No pretrained checkpoint is loaded — ALL parameters
-    # (encoder + decoder) are trainable end-to-end.
-    logger.info("Initializing ViT-MAE from scratch (random weights)...")
-    vitmae_config = ViTMAEConfig(
-        image_size=CONFIG["image_size"],
-        hidden_size=CONFIG["embedding_dim"],
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        intermediate_size=3072,
-        mask_ratio=0.75,
-    )
-    base_model = ViTMAEForPreTraining(vitmae_config)
+    # 2C. Global Model — Pre-trained ViT-MAE with Adapters
+    # We load the official pre-trained weights so we start with a strong
+    # feature extractor, then inject trainable bottleneck adapters and
+    # freeze the 300MB backbone.
+    # 
+    # This ensures features are semantically distinct on the unit hypersphere,
+    # preventing prototype representation collapse early in training.
+    logger.info("Loading pre-trained ViT-MAE and injecting adapters...")
+    
+    # Load the base model
+    base_model = ViTMAEForPreTraining.from_pretrained("facebook/vit-mae-base")
+    
+    # Inject adapters (freezes backbone, adds trainable adapter modules)
+    from src.mae_with_adapter import inject_adapters
+    base_model = inject_adapters(base_model, bottleneck_dim=CONFIG["adapter_bottleneck_dim"])
 
     # Log architecture summary
     total_params = sum(p.numel() for p in base_model.parameters())
     trainable_params = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
     logger.info(
-        f"ViT-MAE initialized from scratch | "
+        f"ViT-MAE with Adapters initialized | "
         f"Total params: {total_params:,} | "
-        f"Trainable: {trainable_params:,} (100% — full end-to-end training)"
+        f"Trainable: {trainable_params:,} ({(trainable_params/total_params)*100:.2f}% — frozen backbone)"
     )
 
     # 2D. Client Manager
@@ -903,6 +905,7 @@ def main():
                     dataloaders[i], K_init=CONFIG["k_init_prototypes"]
                 )
                 # Extract only trainable weights (adapters) for server-side aggregation.
+                # Sending the frozen backbone wastes bandwidth and corrupts the model.
                 weights = {
                     k: v.cpu() for k, v in client.model.state_dict().items()
                     if client.model.get_parameter(k).requires_grad
@@ -919,6 +922,7 @@ def main():
             for i, client in enumerate(client_manager.clients):
                 local_protos = client.get_local_prototypes()
                 # Extract only trainable weights (adapters) for server-side aggregation.
+                # Sending the frozen backbone wastes bandwidth and corrupts the model.
                 weights = {
                     k: v.cpu() for k, v in client.model.state_dict().items()
                     if client.model.get_parameter(k).requires_grad
