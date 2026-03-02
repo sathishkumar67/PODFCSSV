@@ -733,26 +733,28 @@ def main():
     # dicts to produce a global consensus model.
     fed_server = FederatedModelServer()
 
-    # 2C. Global Model — Pre-trained ViT-MAE with Adapters
-    # We load the official pre-trained weights so we start with a strong
-    # feature extractor, then inject trainable bottleneck adapters and
-    # freeze the 300MB backbone.
-    logger.info("Loading pre-trained ViT-MAE and injecting adapters...")
-    
-    # Load the base model
-    base_model = ViTMAEForPreTraining.from_pretrained("facebook/vit-mae-base")
-    
-    # Inject adapters (freezes backbone, adds trainable adapter modules)
-    from src.mae_with_adapter import inject_adapters
-    base_model = inject_adapters(base_model, bottleneck_dim=CONFIG["adapter_bottleneck_dim"])
+    # 2C. Global Model — ViTMAEForPreTraining trained from scratch
+    # Build a ViT-MAE model from random weight initialization using the
+    # ViTMAEConfig API. No pretrained checkpoint is loaded — ALL parameters
+    # (encoder + decoder) are trainable end-to-end.
+    logger.info("Initializing ViT-MAE from scratch (random weights)...")
+    vitmae_config = ViTMAEConfig(
+        image_size=CONFIG["image_size"],
+        hidden_size=CONFIG["embedding_dim"],
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        intermediate_size=3072,
+        mask_ratio=0.75,
+    )
+    base_model = ViTMAEForPreTraining(vitmae_config)
 
     # Log architecture summary
     total_params = sum(p.numel() for p in base_model.parameters())
     trainable_params = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
     logger.info(
-        f"ViT-MAE with Adapters initialized | "
+        f"ViT-MAE initialized from scratch | "
         f"Total params: {total_params:,} | "
-        f"Trainable: {trainable_params:,} ({(trainable_params/total_params)*100:.2f}% — frozen backbone)"
+        f"Trainable: {trainable_params:,} (100% — full end-to-end training)"
     )
 
     # 2D. Client Manager
