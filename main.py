@@ -78,7 +78,6 @@ from tqdm import tqdm
 from src.server import GlobalPrototypeBank, FederatedModelServer, run_server_round, GlobalModel
 from src.client import ClientManager
 from src.loss import GPADLoss
-from src.dataset import MultiDomainDatasetManager
 
 # ViTMAEForPreTraining: full Masked Autoencoder (encoder + decoder).
 # ViTMAEConfig: architecture configuration for from-scratch initialization.
@@ -117,11 +116,14 @@ CONFIG = {
     # Random seed for reproducibility (set to None to disable)
     "seed": 42,
 
-    # List of datasets to assign to clients (length determines num_clients).
-    # Available (20): cifar10, cifar100, svhn, flowers102, food101, pets37,
-    # dtd, gtsrb, mnist, fmnist, kmnist, usps, stl10, aircraft, country211,
-    # sst2, fer2013, sun397, caltech101, eurosat
-    "client_datasets": ["cifar100", "svhn"],
+    # Number of clients participating in the federated learning system
+    "num_clients": 2,
+    
+    # Total classes added per round (must be evenly divisible by num_clients)
+    "classes_per_task": 40,
+    
+    # Number of unique classes each client learns per round (non-IID split)
+    "classes_per_client": 20,
 
     # Total number of server-client communication rounds to simulate.
     # Each round corresponds to one continual learning task.
@@ -178,8 +180,6 @@ CONFIG = {
     "pin_memory": True,
 
     # ── Muli-Domain Continual Learning Strategy ───────────────────────────────
-    # Ratio of local training data reserved for validation
-    "val_split_ratio": 0.1,
 
     # Root directory for the Tiny ImageNet dataset.
     # The dataset will be downloaded here on first run.
@@ -204,6 +204,10 @@ CONFIG = {
     # Lower values = slower, more stable updates
     # Range: 0.01–0.2
     "server_ema_alpha": 0.1,
+
+    # Server-side EMA alpha for federated model weights
+    # If 0.1, new round weights = 0.9 * current_weights + 0.1 * new_aggregated_weights
+    "server_model_ema_alpha": 0.1,
 
     # Maximum capacity of the global prototype bank.
     # New prototypes are not added once this limit is reached.
@@ -431,6 +435,229 @@ def print_round_summary(
 # ==========================================================================
 
 
+# DATA PIPELINE ΓÇö Tiny ImageNet with Continual Learning Task Scheduling
+# ==========================================================================
+
+
+def load_tinyimagenet(data_root: str, image_size: int = 224):
+    """
+    Load the Tiny ImageNet training dataset with transforms.
+
+    Tiny ImageNet contains 200 classes, each with 500 training images of
+    64├ù64 pixels. Images are resized to ``image_size`` (224) to match
+    the ViT-MAE's expected input resolution.
+
+    Transforms applied:
+    - Resize to (image_size, image_size): Upscale 64├ù64 ΓåÆ 224├ù224
+    - ToTensor: Convert PIL Image ΓåÆ torch.Tensor [C, H, W] with [0, 1] range
+
+    No augmentation or normalization is applied ΓÇö the raw resized pixel
+    values are fed directly to the ViT-MAE model.
+
+    Parameters
+    ----------
+    data_root : str
+        Root directory where the dataset is (or will be) stored.
+    image_size : int
+        Target spatial resolution. Default: 224.
+
+    Returns
+    -------
+    datasets.ImageFolder
+        The full Tiny ImageNet training dataset with transforms applied.
+        Each sample is a (image_tensor, class_label) pair where
+        image_tensor has shape [3, image_size, image_size].
+    """
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+    ])
+
+    train_dir = os.path.join(data_root, "tiny-imagenet-200", "train")
+
+    if not os.path.isdir(train_dir):
+        logger.info(
+            f"Tiny ImageNet not found at {train_dir}. "
+            f"Downloading to {data_root}..."
+        )
+        _download_tinyimagenet(data_root)
+
+    dataset = datasets.ImageFolder(train_dir, transform=transform)
+    logger.info(
+        f"Loaded Tiny ImageNet: {len(dataset)} images, "
+        f"{len(dataset.classes)} classes"
+    )
+    return dataset
+
+
+def _download_tinyimagenet(data_root: str) -> None:
+    """
+    Download and extract Tiny ImageNet 200 to the given root directory.
+
+    Downloads the official Tiny ImageNet zip file from Stanford's CS231N
+    server and extracts it to ``data_root/tiny-imagenet-200/``.
+
+    Parameters
+    ----------
+    data_root : str
+        Root directory to store the dataset.
+    """
+    import urllib.request
+    import zipfile
+
+    os.makedirs(data_root, exist_ok=True)
+    url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+    zip_path = os.path.join(data_root, "tiny-imagenet-200.zip")
+
+    logger.info(f"Downloading Tiny ImageNet from {url}...")
+    urllib.request.urlretrieve(url, zip_path)
+
+    logger.info(f"Extracting to {data_root}...")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(data_root)
+
+    # Clean up the zip file to save disk space.
+    os.remove(zip_path)
+    logger.info("Tiny ImageNet download and extraction complete.")
+
+
+def create_task_schedule(
+    dataset: datasets.ImageFolder,
+    num_rounds: int,
+    classes_per_task: int,
+    num_clients: int,
+    classes_per_client: int,
+    seed: int = 42,
+) -> List[List[List[int]]]:
+    """
+    Create the continual learning task schedule for all rounds and clients.
+
+    Splits the 200 Tiny ImageNet classes into sequential tasks, then
+    partitions each task's classes across clients in a non-IID fashion.
+    Returns a nested list structure where ``schedule[round][client]``
+    contains the list of class indices assigned to that client in that round.
+
+    Continual Learning Design
+    -------------------------
+    - 200 classes are shuffled (deterministically via seed) to randomize
+      which concepts appear together.
+    - Split into ``num_rounds`` tasks of ``classes_per_task`` classes each.
+    - Within each task, classes are divided equally among ``num_clients``
+      clients, giving each client ``classes_per_client`` unique classes.
+    - This creates non-IID data distributions: no two clients see the same
+      classes in the same round.
+
+    Parameters
+    ----------
+    dataset : ImageFolder
+        The full Tiny ImageNet dataset.
+    num_rounds : int
+        Number of communication rounds (= number of tasks).
+    classes_per_task : int
+        Total classes introduced per round.
+    num_clients : int
+        Number of federated clients.
+    classes_per_client : int
+        Classes assigned to each client per round.
+    seed : int
+        Random seed for class shuffling.
+
+    Returns
+    -------
+    List[List[List[int]]]
+        ``schedule[round_idx][client_idx]`` = list of class indices.
+    """
+    # Get all unique class indices and shuffle them deterministically.
+    all_classes = list(range(len(dataset.classes)))
+    rng = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(len(all_classes), generator=rng).tolist()
+    shuffled_classes = [all_classes[i] for i in perm]
+
+    schedule = []
+    for round_idx in range(num_rounds):
+        # Extract this round's classes from the shuffled order.
+        start = round_idx * classes_per_task
+        end = start + classes_per_task
+        task_classes = shuffled_classes[start:end]
+
+        # Divide task classes across clients (non-IID).
+        round_schedule = []
+        for client_idx in range(num_clients):
+            c_start = client_idx * classes_per_client
+            c_end = c_start + classes_per_client
+            client_classes = task_classes[c_start:c_end]
+            round_schedule.append(client_classes)
+
+        schedule.append(round_schedule)
+
+    return schedule
+
+
+def create_client_dataloaders(
+    dataset: datasets.ImageFolder,
+    client_classes: List[List[int]],
+    batch_size: int,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    shuffle: bool = True,
+) -> List[DataLoader]:
+    """
+    Create one DataLoader per client for the current round's task.
+
+    Filters the full dataset to include only samples from each client's
+    assigned classes, then wraps them in a DataLoader.
+
+    Parameters
+    ----------
+    dataset : ImageFolder
+        The full Tiny ImageNet training dataset.
+    client_classes : List[List[int]]
+        ``client_classes[i]`` = list of class indices assigned to client i.
+    batch_size : int
+        Mini-batch size per client.
+    num_workers : int
+        DataLoader workers. Default: 4.
+    pin_memory : bool
+        Pin CUDA memory for faster transfer. Default: True.
+    shuffle : bool
+        Shuffle the data each epoch. Default: True.
+
+    Returns
+    -------
+    List[DataLoader]
+        One DataLoader per client, each containing only samples from
+        that client's assigned classes.
+    """
+    dataloaders = []
+
+    # Build a mapping: class_idx ΓåÆ list of sample indices for fast lookup.
+    # dataset.targets is a list of integer class labels for each sample.
+    targets = torch.tensor(dataset.targets)
+
+    for classes in client_classes:
+        # Create a boolean mask for all samples belonging to this client's classes.
+        mask = torch.zeros(len(dataset), dtype=torch.bool)
+        for cls_idx in classes:
+            mask |= (targets == cls_idx)
+
+        # Get the indices of matching samples.
+        indices = torch.where(mask)[0].tolist()
+
+        # Create a Subset and wrap in a DataLoader.
+        subset = Subset(dataset, indices)
+        loader = DataLoader(
+            subset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=False,
+        )
+        dataloaders.append(loader)
+
+    return dataloaders
+
+
 def main():
     """
     Run the complete Federated Continual Self-Supervised Learning pipeline
@@ -544,7 +771,7 @@ def main():
     # mapping) and dispatches training commands in parallel (multi-GPU).
     client_manager = ClientManager(
         base_model=base_model,
-        num_clients=len(CONFIG["client_datasets"]),
+        num_clients=CONFIG["num_clients"],
         gpu_count=CONFIG["gpu_count"],
         dtype=CONFIG["dtype"],
         optimizer_kwargs={
@@ -572,18 +799,32 @@ def main():
         epsilon=CONFIG["gpad_epsilon"],
     )
 
-    # ── Phase 3: Data Setup — Multi-Domain Continual Learning ─────────────────
-    # Initialize the MultiDomainDatasetManager which downloads the datasets
-    # and handles the task-incremental splitting per client.
-    logger.info("Loading Multi-Domain Datasets...")
-    dataset_manager = MultiDomainDatasetManager(
-        client_datasets=CONFIG["client_datasets"],
+    # ── Phase 3: Data Setup — Tiny ImageNet ───────────────────────────────────
+    # Load the full training dataset and create the continual learning
+    # task schedule. 200 classes → 5 tasks × 40 classes.
+    logger.info("Loading Tiny ImageNet dataset...")
+    dataset = load_tinyimagenet(
         data_root=CONFIG["data_root"],
         image_size=CONFIG["image_size"],
-        num_rounds=CONFIG["num_rounds"],
-        val_split_ratio=CONFIG["val_split_ratio"],
-        seed=CONFIG["seed"] if CONFIG["seed"] is not None else 42
     )
+
+    # Create the task schedule: which classes each client sees in each round.
+    task_schedule = create_task_schedule(
+        dataset=dataset,
+        num_rounds=CONFIG["num_rounds"],
+        classes_per_task=CONFIG["classes_per_task"],
+        num_clients=CONFIG["num_clients"],
+        classes_per_client=CONFIG["classes_per_client"],
+        seed=CONFIG["seed"],
+    )
+    
+    # Log the task schedule for transparency.
+    for r, round_sched in enumerate(task_schedule):
+        for c, classes in enumerate(round_sched):
+            logger.info(
+                f"  Round {r+1} | Client {c}: "
+                f"{len(classes)} classes → {classes}"
+            )
 
     # ── Phase 4: Federated Training Loop ──────────────────────────────────────
     # Training history for tracking and visualization.
@@ -625,23 +866,22 @@ def main():
             )
 
         # ── Step B: Fetch Task-Specific DataLoaders ──────────────────────
-        # Each client gets novel classes from its dedicated dataset
-        dataloaders = []
-        for i in range(len(CONFIG["client_datasets"])):
-            train_loader, val_loader, test_loader = dataset_manager.get_client_loaders(
-                client_id=i,
-                round_idx=round_idx - 1,
-                batch_size=CONFIG["batch_size"],
-                num_workers=CONFIG["num_workers"],
-                pin_memory=CONFIG["pin_memory"],
-            )
-            dataloaders.append(train_loader)
-            c_data = dataset_manager.client_data[i]
-            task_classes = c_data["tasks"][round_idx - 1]["classes"]
+        # Each round introduces a new task with new classes. Each client
+        # gets a disjoint subset of the task's classes (non-IID).
+        client_classes = task_schedule[round_idx - 1]
+        dataloaders = create_client_dataloaders(
+            dataset=dataset,
+            client_classes=client_classes,
+            batch_size=CONFIG["batch_size"],
+            num_workers=CONFIG["num_workers"],
+            pin_memory=CONFIG["pin_memory"],
+            shuffle=CONFIG["dataloader_shuffle"],
+        )
+
+        for i, (dl, classes) in enumerate(zip(dataloaders, client_classes)):
             logger.info(
-                f"  Client {i} ({c_data['name']}): "
-                f"{len(train_loader.dataset)} train samples, {len(val_loader.dataset)} val samples "
-                f"from {len(task_classes)} distinct classes."
+                f"  Client {i}: {len(dl.dataset)} samples "
+                f"from {len(classes)} classes"
             )
 
         # ── Step C: Client Local Training ────────────────────────────────
@@ -717,6 +957,9 @@ def main():
             proto_manager=proto_bank,
             model_server=fed_server,
             client_payloads=client_payloads,
+            round_idx=round_idx,
+            current_global_weights=base_model.state_dict(),
+            server_model_ema_alpha=CONFIG["server_model_ema_alpha"]
         )
 
         # Extract the updated global state from the server's result.
