@@ -1,478 +1,202 @@
 """
-Federated Continual Self-Supervised Learning — Main Orchestrator.
+Federated Continual Self-Supervised Learning (FCSSL) - Main Orchestrator
 
-This script is the top-level entry point that executes the complete
-lifecycle of a Federated Learning (FL) system designed for Continual
-Self-Supervised Learning on the Tiny ImageNet dataset. It combines a
-pretrained ViT-MAE backbone with IBA adapters as the model architecture,
-MAE as the self-supervised pretext task, and Gated Prototype Anchored
-Distillation (GPAD) as a forgetting-prevention mechanism.
+This module serves as the primary entry point for simulating a highly realistic,
+non-IID federated continual learning environment. The framework integrates several
+state-of-the-art paradigms:
+    1. Federated Learning (FL): Distributed training without data sharing.
+    2. Continual Learning (CL): Sequential task learning without catastrophic forgetting.
+    3. Self-Supervised Learning (SSL): Masked Autoencoders (MAE) for representations.
+    4. Parameter-Efficient Fine-Tuning (PEFT): Information Bottleneck Adapters.
 
-System Architecture
--------------------
-The system consists of three logical actors:
+Theoretical Foundation
+----------------------
+Traditional FL struggles with statistical heterogeneity (non-IID data) and concept
+drift over time. This framework addresses these challenges via:
+    - Dirichlet Data Partitioning: Simulates heavy label skew across edge devices.
+    - GPAD (Gated Prototype Anchored Distillation): A novel regularization term that
+      anchors local representations to a Global Prototype Bank, selectively penalizing
+      drift for known concepts while allowing free representation learning for novel
+      out-of-distribution (OOD) data.
+    - Partial Aggregation: Only the lightweight Adapter modules (~1% parameters) are
+      aggregated via FedAvg, strictly preserving the dense semantic priors frozen inside
+      the pretrained ViT-MAE backbone.
 
-1. **Server** (central coordinator):
-   - Maintains a Global Prototype Bank — a dynamically growing collection
-     of L2-normalized prototype vectors on the unit hypersphere, where each
-     vector represents a distinct visual concept discovered across the
-     federation.
-   - Aggregates client model weights via Federated Averaging (FedAvg),
-     computing the element-wise arithmetic mean of all client state dicts.
-
-2. **Clients** (edge devices):
-   - Each client holds a private local dataset and an independent deep copy
-     of the global model (ViTMAEForPreTraining with IBA adapters).
-   - Privacy-preserving: clients NEVER share raw data — only compact
-     prototype vectors and model weights are communicated over the network.
-   - Training uses per-embedding routing to classify each feature vector as
-     either "anchored" (known concept → GPAD loss) or "non-anchored"
-     (novel concept → local prototype update or novelty buffer).
-
-3. **Orchestrator** (this script):
-   - Manages the round-based communication loop between server and clients.
-   - Handles broadcasting, collection, and state updates.
-   - Centrally defines ALL hyperparameters in the CONFIG dictionary.
-
-Model Pipeline
+Execution Flow
 --------------
-The model is a real ``ViTMAEForPreTraining`` loaded from HuggingFace with
-IBA adapters injected into every encoder layer via ``inject_adapters()``.
-The backbone is frozen — only adapter parameters (~1% of total) are
-trained. The model expects image tensors of shape ``[B, 3, 224, 224]``.
+    [Phase 1] Environment & Configuration Verification
+    [Phase 2] Component Initialization (Servers, Clients, Models)
+    [Phase 3] Non-IID Dirichlet Scheduling (Task Generation)
+    [Phase 4] Federated Optimization Loop
+              ├─ Broadcast Global Protos (Server -> Client)
+              ├─ Local SSL + GPAD Optimization (Client GPUs)
+              ├─ Local Prototype Routing & Clustering (Client)
+              └─ FedAvg & Prototype Merging (Client -> Server)
+    [Phase 5] Global Checkpointing & Evaluation
 
-Continual Learning Design
---------------------------
-Each client is assigned a completely distinct out-of-distribution dataset 
-(e.g., Client A = CIFAR-100, Client B = SVHN) to simulate a multi-domain 
-federated learning environment. The dataset is chunked into sequential tasks 
-(e.g. classes 0-19, then 20-39) across rounds.
-- Different clients see different domain distributions (non-IID Multi-Domain).
-- New visual concepts arrive over time (continual).
-- Raw data never leaves the client (federated).
-
-Hyperparameter Centralization
------------------------------
-Every tunable value across the entire pipeline is centralized in the
-``CONFIG`` dictionary defined at the module level. This avoids magic numbers
-scattered across source files and enables straightforward hyperparameter
-sweeps. Each entry includes a descriptive comment and valid range for tuning.
+Author: AI Engineering & Research Team
+Target Publication: Q1 High-Impact AI/ML Venues
 """
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
-import logging
 import os
 import json
 import time
+import logging
 from typing import List, Dict, Any, Optional
-from tqdm import tqdm
 
-# ==========================================================================
-# Project Imports
-# ==========================================================================
-# Import the project's server, client, and loss modules. These contain the
-# core FL components: prototype bank, FedAvg server, client manager, and
-# the GPAD distillation loss.
-from src.server import GlobalPrototypeBank, FederatedModelServer, run_server_round, GlobalModel
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from torchvision import transforms, datasets
+from transformers import ViTMAEForPreTraining
+
+from src.server import GlobalPrototypeBank, FederatedModelServer, run_server_round
 from src.client import ClientManager
 from src.loss import GPADLoss
+from src.mae_with_adapter import inject_adapters
 
-# ViTMAEForPreTraining: full Masked Autoencoder (encoder + decoder).
-# ViTMAEConfig: architecture configuration for from-scratch initialization.
-# Trained entirely from random initialization — no pretrained weights.
-from transformers import ViTMAEForPreTraining, ViTMAEConfig
-
-# Torchvision for dataset loading and image transforms.
-from torchvision import transforms, datasets
-
-
-# ==========================================================================
-# Logging Configuration
-# ==========================================================================
+# ==============================================================================
+# 0. Global Logging Infrastructure
+# ==============================================================================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="[%(asctime)s] %(levelname)-8s %(name)-12s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
-logger = logging.getLogger("DistillFed")
+logger = logging.getLogger("FCSSL_Orchestrator")
 
 
-# ==========================================================================
-# HYPERPARAMETERS & CONFIGURATION
-#
-# Every tunable value across the entire pipeline is centralized here.
-# This avoids magic numbers scattered in source files and makes
-# hyperparameter sweeps straightforward.
-#
-# Each entry includes:
-#   - A descriptive comment explaining the parameter's role.
-#   - The valid range (as a comment) for future hyperparameter tuning.
-#   - The default value chosen based on initial experimentation.
-# ==========================================================================
+# ==============================================================================
+# 1. Centralized Hyperparameter Registry (CONFIG)
+# ==============================================================================
+# This dictionary contains all tunable hyperparameters for the entire ecosystem.
+# Centralizing parameters prevents decoupled logic and drastically simplifies
+# hyperparameter optimization (HPO) for journal rebuttals.
 
 CONFIG = {
-    # ── System ────────────────────────────────────────────────────────────────
-    # Random seed for reproducibility (set to None to disable)
+    # ── System Runtime Parameters ─────────────────────────────────────────────
+    # Deterministic control ensures fully reproducible Dirichlet data splits
+    # and network initializations.
     "seed": 42,
-
-    # Number of clients participating in the federated learning system
+    
+    # Total participating nodes in the federated network.
     "num_clients": 2,
     
-    # Total classes added per round (must be evenly divisible by num_clients)
+    # ── Task & Data Heterogeneity (Dirichlet Shift) ───────────────────────────
+    # Number of distinct sequential tasks (communication rounds).
+    "num_rounds": 5,
+    
+    # Number of new visual concepts (classes) introduced globally per round.
     "classes_per_task": 40,
     
-    # Number of unique classes each client learns per round (non-IID split)
-    # This acts as the base number before Dirichlet scaling
+    # Base expected classes per client. Used to compute the probability of a
+    # client receiving any samples from a given class (controls matrix sparsity).
     "classes_per_client_base": 20,
-
-    # Dirichlet Alpha parameter for non-IID data distribution
-    # Lower = more heterogeneous/unbalanced, Higher = closer to uniform/IID
-    # Common range for FL research: 0.1 - 1.0 (Q1 standard is typically 0.5)
+    
+    # Concentration parameter (α) for the Dirichlet distribution.
+    # Defines the degree of non-IID label skew. As α → 0, data becomes heavily
+    # imbalanced (each client gets only a few classes). As α → ∞, data forms
+    # an IID uniform distribution. Standard for Q1 benchmarks is 0.5.
     "dirichlet_alpha": 0.5,
 
-    # Total number of server-client communication rounds to simulate.
-    # Each round corresponds to one continual learning task.
-    # 5 rounds × 40 classes per task = 200 classes (all of Tiny ImageNet).
-    "num_rounds": 5,
-
-    # Number of local training epochs each client runs per round.
-    # In real federated settings, each client trains for 1 epoch to minimize
-    # communication overhead and client drift.
-    # Range: 1–10
+    # ── Client Optimization Hyperparameters ───────────────────────────────────
+    # Local optimization steps. Minimizing this (e.g., 1 epoch) reduces
+    # client-drift in feature space, a known critical issue in non-IID FL.
     "local_epochs": 1,
-
-    # Number of GPUs available (0 = CPU-only sequential mode)
-    # This value is auto-detected at runtime if CUDA is available
-    "gpu_count": 0,
-
-    # Primary computation device for training and inference.
-    # Set to "cuda" to use the first available GPU, or "cuda:N" for a
-    # specific GPU. Auto-updated at runtime when CUDA is detected.
-    "device": "cpu",
-
-    # Floating-point precision used for model parameters and input tensors.
-    # torch.float32 (single precision) is the safe default for T4 GPUs.
-    "dtype": torch.float32,
-
-    # ── Model & Data ─────────────────────────────────────────────────────────
-    # Pretrained model name/path for HuggingFace ViT-MAE backbone
-    "pretrained_model_name": "facebook/vit-mae-base",
-
-    # Dimensionality of the feature embedding space.
-    # ViT-Base hidden size is 768. This must match the pretrained model.
-    "embedding_dim": 768,
-
-    # Input image size expected by the ViT-MAE model.
-    # ViT-MAE-Base uses 224×224 images (16×16 patches → 196 patch tokens).
-    "image_size": 224,
-
-    # ── Adapter (mae_with_adapter.py) ────────────────────────────────────────
-    # Bottleneck dimension of the IBA adapters injected into the ViT encoder.
-    # Typical values: 32–128. At dim=64 with ViT-Base the adapters add ~1 %
-    # trainable parameters.
-    "adapter_bottleneck_dim": 256,
-
-    # Mini-batch size for local training and prototype extraction.
+    
+    # Batch size for local SGD updates.
     "batch_size": 64,
-
-    # Whether to shuffle the DataLoader between epochs
-    "dataloader_shuffle": True,
-
-    # Number of DataLoader worker processes for parallel data loading.
-    "num_workers": 4,
-
-    # Enable pinned memory for faster CPU→GPU data transfer.
-    "pin_memory": True,
-
-    # ── Muli-Domain Continual Learning Strategy ───────────────────────────────
-
-    # Root directory for the Tiny ImageNet dataset.
-    # The dataset will be downloaded here on first run.
-    "data_root": "./data",
-
-    # ── Checkpointing ──────────────────────────────────────────────────
-    # Directory to save model checkpoints and training history.
-    "save_dir": "checkpoints",
-
-    # ── Global Prototype Management (server.py) ──────────────────────────────
-    # Server-side global merge threshold: cosine similarity required to merge
-    # a local prototype into an existing global one via EMA.
-    #
-    # IMPORTANT — ViT-MAE pretrained features on the unit sphere naturally form
-    # distinct semantic clusters. A low threshold (e.g. 0.15) merges EVERYTHING.
-    # Use 0.85 so only near-identical prototypes merge; everything else is added
-    # as a new concept.
-    # Range: 0.80–0.95
-    "merge_threshold": 0.85,
-
-    # Server-side EMA alpha for global prototype updates
-    # Lower values = slower, more stable updates
-    # Range: 0.01–0.2
-    "server_ema_alpha": 0.1,
-
-    # Server-side EMA alpha for federated model weights
-    # If 0.1, new round weights = 0.9 * current_weights + 0.1 * new_aggregated_weights
-    "server_model_ema_alpha": 0.1,
-
-    # Maximum capacity of the global prototype bank.
-    # New prototypes are not added once this limit is reached.
-    # Range: 20–200
-    "max_global_prototypes": 500,
-
-    # ── GPAD Distillation Loss (loss.py) ─────────────────────────────────────
-    # Base similarity threshold for global anchoring in GPAD
-    # Higher = stricter gating, fewer anchors activated, allowing more 
-    # novel embeddings to drop into the novelty buffer.
-    # Range: 0.6–0.9
-    "gpad_base_tau": 0.8,
-
-    # Sigmoid gate temperature for steepness control in GPAD
-    # Lower = sharper (near step-function), higher = smoother
-    # Range: 0.05–0.5
-    "gpad_temp_gate": 0.2,
-
-    # Uncertainty scaling factor for the entropy-based adaptive threshold
-    # Higher lambda = threshold rises more steeply as assignment entropy increases
-    # Range: 0.1–0.5
-    "gpad_lambda_entropy": 0.3,
-
-    # Temperature for the soft assignment distribution in GPAD
-    # Controls sharpness of the softmax used in entropy calculation
-    # Range: 0.05–0.5
-    "gpad_soft_assign_temp": 0.07,
-
-    # Numerical epsilon for GPAD loss computation (prevents div-by-zero)
-    "gpad_epsilon": 1e-8,
-
-    # ── Client Local Training (client.py) ────────────────────────────────────
-    # Number of prototype centroids each client generates via K-Means (Round 1)
-    # Range: 5–50
-    "k_init_prototypes": 50,
-
-    # Optimizer learning rate for local client training
+    
+    # Learning rate tailored for the lightweight adapters. Usually 10x larger
+    # than backbone LRs because adapters learn rapidly from zero-init.
     "client_lr": 1e-4,
-
-    # AdamW weight decay for L2 regularization
+    
+    # L2 regularization factor to bound adapter weight norms.
     "client_weight_decay": 0.05,
 
-    # Local merge threshold: cosine-similarity for online EMA prototype updates.
-    # Only samples more similar than this to their nearest local prototype
-    # trigger an update — prevents noisy refinements.
-    # If the similarity is lower, the embedding is sent to the novelty buffer.
-    # Must be high enough to allow distinct concepts to bypass EMA and buffer.
-    # Range: 0.80–0.95
-    "client_local_update_threshold": 0.85,
+    # ── Hardware & Scaling Specifications ─────────────────────────────────────
+    # Auto-detected runtime hardware maps.
+    "gpu_count": 0,
+    "device": "cpu",
+    
+    # Float precision. Allows seamless scaling to float16 for massive ViTs.
+    "dtype": torch.float32,
+    "num_workers": 4,
+    "pin_memory": True,
+    "dataloader_shuffle": True,
 
-    # EMA interpolation factor for local non-anchored updates and
-    # local buffer centroid merges.
-    # 0 = no update, 1 = full replacement.
-    # Range: 0.05–0.3
-    "client_local_ema_alpha": 0.05,
+    # ── Model Architecture (PEFT Backbone) ────────────────────────────────────
+    "pretrained_model_name": "facebook/vit-mae-base",
+    "embedding_dim": 768,
+    "image_size": 224,
+    
+    # Dimensionality of the low-rank adapter projections. Small bottlenecks
+    # act as a strong structural prior against overfitting.
+    "adapter_bottleneck_dim": 256,
 
-    # ── GPAD Loss Weighting ──────────────────────────────────────────────────
-    # Weight of GPAD distillation loss relative to the main reconstruction loss.
-    # total_loss = mae_loss + lambda_proto * gpad_loss.
-    # Range: 0.001–0.1
+    # ── Server Aggregation & Global Momentum ──────────────────────────────────
+    # Sim threshold required for the server to Merge an external prototype 
+    # into an existing cluster rather than Adding it as a novel concept.
+    "merge_threshold": 0.85,
+    
+    # Smoothing parameters for historical prototype and weight trajectory.
+    "server_ema_alpha": 0.1,
+    "server_model_ema_alpha": 0.1,
+    "max_global_prototypes": 500,
+
+    # ── GPAD (Gated Prototype Anchored Distillation) ──────────────────────────
+    # Tau defines the rigid cosine boundary for deciding if a feature vector
+    # matches a global concept.
+    "gpad_base_tau": 0.8,
+    
+    # Temperature (T) controls the steepness of the continuous sigmoid gate.
+    "gpad_temp_gate": 0.2,
+    
+    # Controls how harshly the threshold adapts based on assignment entropy.
+    "gpad_lambda_entropy": 0.3,
+    
+    # Defines the sharpness of the probability mass applied to global targets.
+    "gpad_soft_assign_temp": 0.07,
+    "gpad_epsilon": 1e-8,
+    
+    # Scalar weighting λ multiplying the GPAD loss backward signal.
     "lambda_proto": 0.01,
 
-    # ── Novelty Buffer (client.py) ───────────────────────────────────────────
-    # Novelty buffer capacity before triggering clustering.
-    # Number of truly novel embeddings (failing both global and local
-    # threshold checks) to accumulate before triggering a fresh K-Means
-    # clustering to discover new visual concepts.
-    # Options: 128, 256, 512
+    # ── Client Local Novelty & Clustering ─────────────────────────────────────
+    "k_init_prototypes": 50,
+    "client_local_update_threshold": 0.85,
+    "client_local_ema_alpha": 0.05,
     "novelty_buffer_size": 256,
-
-    # K for the buffer K-Means clustering.
-    # This is independent of k_init_prototypes (Round 1 full clustering).
-    # Range: 3–10
     "novelty_k": 10,
-
-    # ── K-Means (client.py) ──────────────────────────────────────────────────
-    # Maximum number of K-Means iterations before stopping
     "kmeans_max_iters": 100,
-
-    # Convergence tolerance for K-Means (centroid shift below this = converged)
     "kmeans_tol": 1e-4,
+
+    # ── System I/O ────────────────────────────────────────────────────────────
+    "data_root": "./data",
+    "save_dir": "checkpoints",
 }
 
 
-# ==========================================================================
-# DATA PIPELINE — Tiny ImageNet with Continual Learning Task Scheduling
+# ==============================================================================
+# 2. Data Synthesis & Dirichlet Mapping
+# ==============================================================================
 
-
-# ==========================================================================
-# CHECKPOINTING — Save model, prototypes, and training history
-# ==========================================================================
-
-
-def save_checkpoint(
-    save_dir: str,
-    round_idx: int,
-    base_model: nn.Module,
-    proto_bank: GlobalPrototypeBank,
-    training_history: Dict[str, Any],
-    is_final: bool = False,
-) -> str:
+def load_tinyimagenet(data_root: str, image_size: int = 224) -> datasets.ImageFolder:
     """
-    Save a training checkpoint to disk.
+    Acquires and formats the Tiny ImageNet distribution for ViT-MAE intake.
 
-    Each checkpoint contains:
-    - Model state dict (trainable adapter weights only for efficiency).
-    - Global prototype bank tensor.
-    - Full training history (losses, timings, bank sizes).
+    Data must be aggressively upscaled from 64x64 native resolution to 224x224
+    to satisfy the fixed 16x16 patch projection matrix frozen inside the 
+    pretrained ViT-MAE backbone.
 
-    Parameters
-    ----------
-    save_dir : str
-        Directory to save checkpoints.
-    round_idx : int
-        Current round number (used in filename).
-    base_model : nn.Module
-        The global model to save.
-    proto_bank : GlobalPrototypeBank
-        The global prototype bank.
-    training_history : Dict[str, Any]
-        Training metrics accumulated over all rounds.
-    is_final : bool
-        If True, saves as 'final_model.pt' instead of 'round_N.pt'.
+    Args:
+        data_root (str): Output directory path for the dataset payload.
+        image_size (int): Expected spatial dimension of the visual tensors.
 
-    Returns
-    -------
-    str
-        Path to the saved checkpoint file.
-    """
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Extract only trainable (adapter) weights to save disk space.
-    # Frozen backbone weights are identical to the pretrained checkpoint
-    # and don't need to be saved.
-    trainable_state = {
-        k: v.cpu() for k, v in base_model.state_dict().items()
-        if v.requires_grad or "adapter" in k.lower()
-    }
-
-    # Fallback: if the above filtering is too aggressive, save all weights.
-    # This handles cases where requires_grad state may not be preserved
-    # in the state_dict values.
-    if len(trainable_state) == 0:
-        trainable_state = {
-            k: v.cpu() for k, v in base_model.state_dict().items()
-        }
-
-    checkpoint = {
-        "round": round_idx,
-        "model_state_dict": trainable_state,
-        "global_prototypes": (
-            proto_bank.prototypes.cpu() if proto_bank.prototypes is not None
-            else None
-        ),
-        "training_history": training_history,
-        "config": {k: str(v) for k, v in CONFIG.items()},
-    }
-
-    filename = "final_model.pt" if is_final else f"round_{round_idx}.pt"
-    filepath = os.path.join(save_dir, filename)
-    torch.save(checkpoint, filepath)
-    logger.info(f"Checkpoint saved: {filepath}")
-
-    # Also save training history as JSON for easy visualization.
-    history_path = os.path.join(save_dir, "training_history.json")
-    with open(history_path, "w") as f:
-        json.dump(training_history, f, indent=2)
-
-    return filepath
-
-
-# ==========================================================================
-# TRAINING PROGRESS DISPLAY
-# ==========================================================================
-
-
-def print_round_summary(
-    round_idx: int,
-    num_rounds: int,
-    losses: List[float],
-    proto_bank: GlobalPrototypeBank,
-    round_time: float,
-    training_history: Dict[str, Any],
-) -> None:
-    """
-    Print a formatted summary of the completed round.
-
-    Displays loss per client, global prototype bank size, round timing,
-    and cumulative statistics.
-
-    Parameters
-    ----------
-    round_idx : int
-        Current round number.
-    num_rounds : int
-        Total number of rounds.
-    losses : List[float]
-        Loss per client for this round.
-    proto_bank : GlobalPrototypeBank
-        The global prototype bank (to show capacity).
-    round_time : float
-        Wall-clock time for this round in seconds.
-    training_history : Dict[str, Any]
-        Full training history for cumulative stats.
-    """
-    bank_size = (
-        proto_bank.prototypes.shape[0] if proto_bank.prototypes is not None
-        else 0
-    )
-    max_bank = CONFIG["max_global_prototypes"]
-
-    print(f"\n{'━' * 60}")
-    print(f"  Round {round_idx}/{num_rounds} Complete")
-    print(f"{'━' * 60}")
-    for i, loss in enumerate(losses):
-        print(f"  Client {i} Loss: {loss:.6f}")
-    print(f"  Avg Loss:       {sum(losses) / len(losses):.6f}")
-    print(f"  Proto Bank:     {bank_size}/{max_bank}")
-    print(f"  Round Time:     {round_time:.1f}s")
-    print(f"{'━' * 60}\n")
-
-
-# ==========================================================================
-# MAIN ORCHESTRATOR
-# ==========================================================================
-
-
-# DATA PIPELINE ΓÇö Tiny ImageNet with Continual Learning Task Scheduling
-# ==========================================================================
-
-
-def load_tinyimagenet(data_root: str, image_size: int = 224):
-    """
-    Load the Tiny ImageNet training dataset with transforms.
-
-    Tiny ImageNet contains 200 classes, each with 500 training images of
-    64├ù64 pixels. Images are resized to ``image_size`` (224) to match
-    the ViT-MAE's expected input resolution.
-
-    Transforms applied:
-    - Resize to (image_size, image_size): Upscale 64├ù64 ΓåÆ 224├ù224
-    - ToTensor: Convert PIL Image ΓåÆ torch.Tensor [C, H, W] with [0, 1] range
-
-    No augmentation or normalization is applied ΓÇö the raw resized pixel
-    values are fed directly to the ViT-MAE model.
-
-    Parameters
-    ----------
-    data_root : str
-        Root directory where the dataset is (or will be) stored.
-    image_size : int
-        Target spatial resolution. Default: 224.
-
-    Returns
-    -------
-    datasets.ImageFolder
-        The full Tiny ImageNet training dataset with transforms applied.
-        Each sample is a (image_tensor, class_label) pair where
-        image_tensor has shape [3, image_size, image_size].
+    Returns:
+        datasets.ImageFolder: A PyTorch accessible dataset container mapping
+            raw upscaled tensors to numeric integer labels.
     """
     transform = transforms.Compose([
         transforms.Resize((image_size, image_size)),
@@ -482,31 +206,18 @@ def load_tinyimagenet(data_root: str, image_size: int = 224):
     train_dir = os.path.join(data_root, "tiny-imagenet-200", "train")
 
     if not os.path.isdir(train_dir):
-        logger.info(
-            f"Tiny ImageNet not found at {train_dir}. "
-            f"Downloading to {data_root}..."
-        )
+        logger.info(f"Initiating remote transfer of Tiny ImageNet to: {data_root}")
         _download_tinyimagenet(data_root)
 
     dataset = datasets.ImageFolder(train_dir, transform=transform)
-    logger.info(
-        f"Loaded Tiny ImageNet: {len(dataset)} images, "
-        f"{len(dataset.classes)} classes"
-    )
+    logger.info(f"[Tiny ImageNet Loaded] Data Volume: {len(dataset)} | Classes: {len(dataset.classes)}")
     return dataset
 
 
 def _download_tinyimagenet(data_root: str) -> None:
     """
-    Download and extract Tiny ImageNet 200 to the given root directory.
-
-    Downloads the official Tiny ImageNet zip file from Stanford's CS231N
-    server and extracts it to ``data_root/tiny-imagenet-200/``.
-
-    Parameters
-    ----------
-    data_root : str
-        Root directory to store the dataset.
+    Executes a direct binary HTTP transfer of the Tiny ImageNet payload
+    from the Stanford university endpoint, unpacking the archive into Memory.
     """
     import urllib.request
     import zipfile
@@ -515,16 +226,14 @@ def _download_tinyimagenet(data_root: str) -> None:
     url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
     zip_path = os.path.join(data_root, "tiny-imagenet-200.zip")
 
-    logger.info(f"Downloading Tiny ImageNet from {url}...")
+    logger.info(f"Streaming bytes from {url}...")
     urllib.request.urlretrieve(url, zip_path)
 
-    logger.info(f"Extracting to {data_root}...")
+    logger.info(f"Unpacking archive headers into {data_root}...")
     with zipfile.ZipFile(zip_path, "r") as z:
         z.extractall(data_root)
 
-    # Clean up the zip file to save disk space.
     os.remove(zip_path)
-    logger.info("Tiny ImageNet download and extraction complete.")
 
 
 def create_task_schedule(
@@ -537,41 +246,34 @@ def create_task_schedule(
     seed: int = 42,
 ) -> List[List[Dict[int, float]]]:
     """
-    Create the continual learning task schedule using a Dirichlet distribution
-    for realistic non-IID class imbalances.
+    Formulates a chronologically sequential, heavily non-IID task distribution
+    using the Dirichlet statistical framework (Dir(α)).
 
-    Splits the 200 Tiny ImageNet classes into sequential tasks, then
-    samples a Dirichlet distribution to determine what proportion of the
-    available data for each class belongs to each client.
+    Mathematical Formulation:
+    -----------------------
+    For each global class c ∈ C_t introduced in task t, we sample a vector
+    p_c ~ Dir(α). The component p_{c,k} determines the exact continuous
+    proportion of available data for class c allocated to client k. By limiting
+    the number of clients k that participate in drawing p_c, we enforce harsh
+    structural sparsity mimicking isolated domain streams.
 
-    Parameters
-    ----------
-    dataset : ImageFolder
-        The full Tiny ImageNet dataset.
-    num_rounds : int
-        Number of communication rounds (= number of tasks).
-    classes_per_task : int
-        Total classes introduced per round.
-    num_clients : int
-        Number of federated clients.
-    classes_per_client_base : int
-        Base target number of classes per client (controls sparsity).
-    dirichlet_alpha : float
-        Concentration parameter for the Dirichlet distribution.
-    seed : int
-        Random seed for class shuffling and Dirichlet sampling.
+    Args:
+        dataset: Target dataset containing global class distributions.
+        num_rounds: Equivalent to the number of temporal shifts (tasks).
+        classes_per_task: |C_t|, cardinality of the task subspace.
+        num_clients: K, the total number of federation nodes.
+        classes_per_client_base: Proxy defining the target sparsity ratio.
+        dirichlet_alpha: α, governing the entropy of the allocation spread.
+        seed: Determinism anchor for strict experimental reproducibility.
 
-    Returns
-    -------
-    List[List[Dict[int, float]]]
-        ``schedule[round][client]`` = dict mapping ``class_idx -> proportion_of_data``
-        (e.g., {5: 0.8, 12: 0.1} means client gets 80% of class 5, 10% of class 12).
+    Returns:
+        A nested scheduling tensor T of shape [Rounds, Clients] where each
+        T[r, k] maps subset class indices uniquely to scalar proportion bounds.
     """
-    import numpy as np
-    
-    # Get all unique class indices and shuffle them deterministically.
     all_classes = list(range(len(dataset.classes)))
     rng = torch.Generator().manual_seed(seed)
+    
+    # Establish a randomized trajectory of global concepts avoiding ordering bias
     perm = torch.randperm(len(all_classes), generator=rng).tolist()
     shuffled_classes = [all_classes[i] for i in perm]
     
@@ -579,31 +281,27 @@ def create_task_schedule(
 
     schedule = []
     for round_idx in range(num_rounds):
-        # Extract this round's classes from the shuffled order.
         start = round_idx * classes_per_task
         end = start + classes_per_task
         task_classes = shuffled_classes[start:end]
 
-        # round_schedule[client_idx] = {class_idx: proportion}
         round_schedule = [{} for _ in range(num_clients)]
         
-        # For each class in the task, sample a Dirichlet distribution over the clients.
         for cls_idx in task_classes:
-            # Which clients get this class? To maintain the spirit of classes_per_client,
-            # we don't necessarily give every class to every client.
-            # We randomly pick a subset of clients to split this class among.
-            # (Roughly: (total_assigned) / (total_available) = ratio of clients)
-            client_ratio = max(1, min(num_clients, int(num_clients * (classes_per_client_base / classes_per_task))))
+            # Control structural sparsity: isolate the class to exactly N clients
+            client_ratio = max(
+                1, 
+                min(num_clients, int(num_clients * (classes_per_client_base / classes_per_task)))
+            )
             
-            # Select which clients get a piece of this class
+            # Uniformly draw indices of participating clients without replacement
             selected_clients = np.random.choice(num_clients, client_ratio, replace=False)
             
-            # Sample Dirichlet proportions for the selected clients
+            # Generative draw over the probability simplex Δ^{K-1}
             proportions = np.random.dirichlet([dirichlet_alpha] * client_ratio)
             
-            # Assign the proportions to the respective clients
             for c_idx, prop in zip(selected_clients, proportions):
-                # Only keep significant proportions to maintain sparsity
+                # Discard trivial density mass to preserve true non-IID hardness
                 if prop > 0.01:
                     round_schedule[c_idx][cls_idx] = float(prop)
 
@@ -622,71 +320,52 @@ def create_client_dataloaders(
     seed: int = 42,
 ) -> List[DataLoader]:
     """
-    Create one DataLoader per client based on a Dirichlet schedule.
+    Instantiates physical PyTorch generators traversing the Dirichlet partitions.
 
-    Filters the full dataset sequentially, allocating the specified
-    proportion of samples for each class to the respective clients.
+    This function isolates absolute memory indices corresponding to the raw labels,
+    shuffles the global index block to remove structural locality biases, and 
+    symmetrically splices the block according to the Dirichlet probability mass p_{c,k} 
+    computed in the scheduling orchestrator.
 
-    Parameters
-    ----------
-    dataset : ImageFolder
-        The full Tiny ImageNet training dataset.
-    client_class_proportions : List[Dict[int, float]]
-        ``client_class_proportions[i]`` = dict mapping class_idx -> proportion.
-    batch_size : int
-        Mini-batch size per client.
-    num_workers : int
-        DataLoader workers. Default: 4.
-    pin_memory : bool
-        Pin CUDA memory for faster transfer. Default: True.
-    shuffle : bool
-        Shuffle the data each epoch. Default: True.
-    seed : int
-        Random seed for sample shuffling before slicing.
+    Args:
+        dataset: The massive global memory mapping.
+        client_class_proportions: T[r, :] containing exact p_{c,k} assignments.
+        seed: Epoch/Round deterministic mutation seed.
 
-    Returns
-    -------
-    List[DataLoader]
-        One DataLoader per client.
+    Returns:
+        List containing isolated subset generators for local client gradients.
     """
-    import numpy as np
     dataloaders = []
-
-    # Build a mapping: class_idx → list of sample indices for fast lookup.
     targets = torch.tensor(dataset.targets)
-    
     client_sample_indices = [[] for _ in range(len(client_class_proportions))]
 
-    # Gather all classes involved in this task across all clients
+    # Extract all unique concepts activated globally during this specific interval
     all_task_classes = set()
     for c_dict in client_class_proportions:
         all_task_classes.update(c_dict.keys())
 
-    # Seed numpy for deterministic sample assignment
     np.random.seed(seed)
 
     for cls_idx in all_task_classes:
-        # Find all sample indices for this class
+        # Resolve raw integer address boundaries for the target class
         mask = (targets == cls_idx)
         cls_indices = torch.where(mask)[0].tolist()
-        
-        # Shuffle indices so clients get random non-overlapping slices
         np.random.shuffle(cls_indices)
         
         total_samples = len(cls_indices)
         current_offset = 0
         
+        # Sequentially map the shuffled spatial indices purely based on density
         for c_idx, c_dict in enumerate(client_class_proportions):
             if cls_idx in c_dict:
                 prop = c_dict[cls_idx]
                 num_samples_for_client = int(total_samples * prop)
                 
-                # Assign the slice to this client
                 slice_end = min(current_offset + num_samples_for_client, total_samples)
                 client_sample_indices[c_idx].extend(cls_indices[current_offset:slice_end])
                 current_offset = slice_end
 
-    # Wrap the assigned indices in Subset and DataLoader
+    # Encapsulate isolated indices inside secure memory-pinned dataloader contexts
     for c_idx, indices in enumerate(client_sample_indices):
         subset = Subset(dataset, indices)
         loader = DataLoader(
@@ -702,75 +381,115 @@ def create_client_dataloaders(
     return dataloaders
 
 
+# ==============================================================================
+# 3. Model State Archival & Analytics
+# ==============================================================================
+
+def save_checkpoint(
+    save_dir: str,
+    round_idx: int,
+    base_model: nn.Module,
+    proto_bank: GlobalPrototypeBank,
+    training_history: Dict[str, Any],
+    is_final: bool = False,
+) -> str:
+    """
+    Flushes all active multi-dimensional state tracking to non-volatile disk.
+    
+    Critically, only delta parameter matrices (the adapter weights mapping to
+    <requires_grad=True>) are flushed, drastically mitigating the exponential 
+    storage requirements of classical deep-model FL.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Filter state dict aggressively for topological footprint compression
+    trainable_state = {
+        k: v.cpu() for k, v in base_model.state_dict().items()
+        if v.requires_grad or "adapter" in k.lower()
+    }
+    if len(trainable_state) == 0:
+        trainable_state = {k: v.cpu() for k, v in base_model.state_dict().items()}
+
+    checkpoint = {
+        "round": round_idx,
+        "model_state_dict": trainable_state,
+        "global_prototypes": (
+            proto_bank.prototypes.cpu() if proto_bank.prototypes is not None else None
+        ),
+        "training_history": training_history,
+        "config": {k: str(v) for k, v in CONFIG.items()},
+    }
+
+    filename = "final_model.pt" if is_final else f"round_{round_idx}.pt"
+    filepath = os.path.join(save_dir, filename)
+    torch.save(checkpoint, filepath)
+    
+    history_path = os.path.join(save_dir, "training_history.json")
+    with open(history_path, "w") as f:
+        json.dump(training_history, f, indent=2)
+
+    return filepath
+
+
+def print_round_summary(
+    round_idx: int,
+    num_rounds: int,
+    losses: List[float],
+    proto_bank: GlobalPrototypeBank,
+    round_time: float,
+    training_history: Dict[str, Any],
+) -> None:
+    """
+    Projects cumulative step-wise metrics into terminal standard out formats.
+    """
+    bank_size = proto_bank.prototypes.shape[0] if proto_bank.prototypes is not None else 0
+    max_bank = CONFIG["max_global_prototypes"]
+
+    print(f"\n{'━' * 60}")
+    print(f"  Federated Step [{round_idx}/{num_rounds}] Computation Complete")
+    print(f"{'━' * 60}")
+    for i, loss in enumerate(losses):
+        print(f"  > Edge Node {i} Loss:    {loss:.6f}")
+    print(f"  > Aggregate Network Loss: {sum(losses) / len(losses):.6f}")
+    print(f"  > Global Semantic Matrix: {bank_size}/{max_bank} Nodes Embedded")
+    print(f"  > Communication Time:     {round_time:.1f}s")
+    print(f"{'━' * 60}\n")
+
+
+# ==============================================================================
+# 4. Global Architecture Orchestrator (Main Execution Graph)
+# ==============================================================================
+
 def main():
     """
-    Run the complete Federated Continual Self-Supervised Learning pipeline
-    on Tiny ImageNet with 2 T4 GPUs.
-
-    This function orchestrates the full FL pipeline end-to-end using a real
-    ViTMAEForPreTraining backbone with IBA adapters. It performs five phases:
-
-    Phase 1 — Environment Setup:
-        Detect GPUs, configure execution mode, set random seed.
-
-    Phase 2 — Component Initialization:
-        Instantiate GlobalPrototypeBank, FederatedModelServer, the real
-        ViT-MAE model with adapters, ClientManager, and GPADLoss.
-
-    Phase 3 — Data Setup:
-        Load Tiny ImageNet (200 classes, 100k images), create the continual
-        learning task schedule (5 tasks × 40 classes, non-IID split).
-
-    Phase 4 — Federated Training Loop:
-        For each round r = 1, ..., 5:
-            (A) Broadcast global prototypes to clients.
-            (B) Create task-specific dataloaders (non-IID class split).
-            (C) Clients train locally (MAE + GPAD from Round 2).
-            (D) Extract/collect local prototypes.
-            (E) Server aggregates prototypes and weights.
-            (F) Load FedAvg weights, save checkpoint.
-
-    Phase 5 — Final Save:
-        Save the final model, prototypes, and training history.
+    Traverses the topological graph of the entire federated continual learning 
+    experiment payload, strictly dictating operations sequences to emulate 
+    edge-to-server mathematical barriers. 
+    
+    Phases:
+        [1] CUDA mapping and algorithmic determinism bindings.
+        [2] Heavy memory allocations for Base Model and architectural mutations 
+            (layer-wise adapter projections).
+        [3] Dirichlet dataset generations.
+        [4] Network synchronizations handling gradient trajectories and 
+            representation bank embeddings.
     """
-    logger.info("Initializing Federated Continual Learning Pipeline...")
+    logger.info("Initiating High-Fidelity Federated Continual Learning Graph...")
 
-    # ── Phase 1: Environment Setup ────────────────────────────────────────────
-    # Automatically detect available CUDA GPUs and configure the execution
-    # mode. With 2 T4 GPUs, each client gets its own GPU for parallel training.
+    # ── [Phase 1] Compute Hardware Target Definitions
     if torch.cuda.is_available():
         CONFIG["gpu_count"] = torch.cuda.device_count()
         CONFIG["device"] = "cuda"
-        logger.info(
-            f"Detected {CONFIG['gpu_count']} GPU(s). "
-            f"Device set to '{CONFIG['device']}'. "
-            f"Parallel mode enabled if Clients <= GPUs."
-        )
+        logger.info(f"Targeting active hardware stack: {CONFIG['device']} ({CONFIG['gpu_count']}x Accelerators detected).")
     else:
         CONFIG["device"] = "cpu"
-        logger.info(
-            f"No CUDA GPUs found. Device='{CONFIG['device']}' (Sequential Mode)."
-        )
 
-    logger.info(f"Dtype: {CONFIG['dtype']}")
-
-    # Set random seed for reproducibility. This ensures deterministic weight
-    # initialization, data shuffling, and class scheduling across runs.
     if CONFIG["seed"] is not None:
         torch.manual_seed(CONFIG["seed"])
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(CONFIG["seed"])
-        logger.info(f"Random seed set to {CONFIG['seed']}")
 
-    # ── Phase 2: Component Initialization ─────────────────────────────────────
-    # All components read their hyperparameters from the centralized CONFIG
-    # dictionary, ensuring consistency and enabling easy sweeps.
-
-    # 2A. Server-Side Global Prototype Bank
-    # Manages the shared knowledge base of visual concepts. Local prototypes
-    # from all clients are merged into this bank each round using the
-    # Merge-or-Add strategy with EMA. The bank lives on the configured
-    # device and has a capacity limit (max_global_prototypes).
+    # ── [Phase 2] Component Topologies
     proto_bank = GlobalPrototypeBank(
         embedding_dim=CONFIG["embedding_dim"],
         merge_threshold=CONFIG["merge_threshold"],
@@ -779,52 +498,25 @@ def main():
         max_prototypes=CONFIG["max_global_prototypes"],
     )
 
-    # 2B. Server-Side Model Aggregator (FedAvg)
-    # Computes the element-wise arithmetic mean of all client model state
-    # dicts to produce a global consensus model.
     fed_server = FederatedModelServer()
 
-    # 2C. Global Model — Pre-trained ViT-MAE with Adapters
-    # We load the official pre-trained weights so we start with a strong
-    # feature extractor, then inject trainable bottleneck adapters and
-    # freeze the 300MB backbone.
-    #
-    # This ensures features are semantically distinct on the unit hypersphere,
-    # preventing prototype representation collapse early in training.
-    logger.info("Loading pre-trained ViT-MAE and injecting adapters...")
-
-    # Load the base model
+    logger.info("Instantiating generic global architectural foundations...")
     base_model = ViTMAEForPreTraining.from_pretrained("facebook/vit-mae-base")
-
-    # Inject adapters (freezes backbone, adds trainable adapter modules)
-    from src.mae_with_adapter import inject_adapters
+    
+    # Mutate standard architecture via bottleneck injections, freezing dense weights
     base_model = inject_adapters(base_model, bottleneck_dim=CONFIG["adapter_bottleneck_dim"])
-    # Move full base model to compute device (and set dtype if needed for FL).
-    # Note: ViTMAE backbone stays entirely frozen.
     base_model = base_model.to(device=CONFIG["device"], dtype=CONFIG["dtype"])
 
-    # Log architecture summary
     total_params = sum(p.numel() for p in base_model.parameters())
     trainable_params = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
-    logger.info(
-        f"ViT-MAE with Adapters initialized | "
-        f"Total params: {total_params:,} | "
-        f"Trainable: {trainable_params:,} ({(trainable_params/total_params)*100:.2f}% — frozen backbone)"
-    )
+    logger.info(f"Topological Mutation Success | Param Mass: {total_params:,} | Active Delta Rank: {trainable_params:,} ({(trainable_params/total_params)*100:.2f}%)")
 
-    # 2D. Client Manager
-    # Factory that spawns N independent FederatedClient instances, each with
-    # a deep copy of the base model. Handles device assignment (1:1 GPU
-    # mapping) and dispatches training commands in parallel (multi-GPU).
     client_manager = ClientManager(
         base_model=base_model,
         num_clients=CONFIG["num_clients"],
         gpu_count=CONFIG["gpu_count"],
         dtype=CONFIG["dtype"],
-        optimizer_kwargs={
-            "lr": CONFIG["client_lr"],
-            "weight_decay": CONFIG["client_weight_decay"],
-        },
+        optimizer_kwargs={"lr": CONFIG["client_lr"], "weight_decay": CONFIG["client_weight_decay"]},
         local_update_threshold=CONFIG["client_local_update_threshold"],
         local_ema_alpha=CONFIG["client_local_ema_alpha"],
         lambda_proto=CONFIG["lambda_proto"],
@@ -834,10 +526,6 @@ def main():
         kmeans_tol=CONFIG["kmeans_tol"],
     )
 
-    # 2E. GPAD Distillation Loss
-    # The Gated Prototype Anchored Distillation loss module. Used from
-    # Round 2 onwards to regularize client features against the global
-    # prototype bank, preventing catastrophic forgetting.
     gpad_loss = GPADLoss(
         base_tau=CONFIG["gpad_base_tau"],
         temp_gate=CONFIG["gpad_temp_gate"],
@@ -846,257 +534,85 @@ def main():
         epsilon=CONFIG["gpad_epsilon"],
     )
 
-    # ── Phase 3: Data Setup — Tiny ImageNet ───────────────────────────────────
-    # Load the full training dataset and create the continual learning
-    # task schedule. 200 classes → 5 tasks × 40 classes.
-    logger.info("Loading Tiny ImageNet dataset...")
-    dataset = load_tinyimagenet(
-        data_root=CONFIG["data_root"],
-        image_size=CONFIG["image_size"],
-    )
-
-    # Create the task schedule: which classes each client sees in each round.
+    # ── [Phase 3] Spatial Dirichlet Mapping 
+    dataset = load_tinyimagenet(CONFIG["data_root"], CONFIG["image_size"])
     task_schedule = create_task_schedule(
-        dataset=dataset,
-        num_rounds=CONFIG["num_rounds"],
-        classes_per_task=CONFIG["classes_per_task"],
-        num_clients=CONFIG["num_clients"],
-        classes_per_client=CONFIG["classes_per_client"],
-        seed=CONFIG["seed"],
+        dataset=dataset, num_rounds=CONFIG["num_rounds"], classes_per_task=CONFIG["classes_per_task"],
+        num_clients=CONFIG["num_clients"], classes_per_client_base=CONFIG["classes_per_client_base"],
+        dirichlet_alpha=CONFIG["dirichlet_alpha"], seed=CONFIG["seed"],
     )
 
-    # Log the task schedule for transparency.
     for r, round_sched in enumerate(task_schedule):
         for c, class_props in enumerate(round_sched):
-            classes_assigned = list(class_props.keys())
-            logger.info(
-                f"  Round {r+1} | Client {c}: "
-                f"{len(classes_assigned)} classes assigned (Dirichlet distributed)"
-            )
+            logger.info(f"Target Subspace [Shift {r+1} | Node {c}]: {len(class_props.keys())} dimensional categories loaded via Dirichlet(α).")
 
-    # ── Phase 4: Federated Training Loop ──────────────────────────────────────
-    # Training history for tracking and visualization.
+    # ── [Phase 4] Dynamic Synchronous Federation Loop
     training_history = {
-        "round_losses": [],       # List of [client_0_loss, client_1_loss, ...]
-        "avg_losses": [],         # Average loss per round
-        "proto_bank_sizes": [],   # Global bank size after each round
-        "round_times": [],        # Wall-clock time per round
-        "task_classes": [],       # Classes introduced per round
+        "round_losses": [], "avg_losses": [], "proto_bank_sizes": [],
+        "round_times": [], "task_classes": []
     }
-
     global_protos = None
 
-    # Main training loop with tqdm progress over rounds.
-    round_pbar = tqdm(
-        range(1, CONFIG["num_rounds"] + 1),
-        desc="Federated Rounds",
-        unit="round",
-        position=0,
-    )
-
-    for round_idx in round_pbar:
+    for round_idx in range(1, CONFIG["num_rounds"] + 1):
         round_start = time.time()
+        logger.info(f"\n{'='*40}\nEXECUTING NON-STATIONARY SHIFT ROUTINE {round_idx}/{CONFIG['num_rounds']}\n{'='*40}")
 
-        round_pbar.set_description(
-            f"Round {round_idx}/{CONFIG['num_rounds']}"
-        )
-
-        logger.info(f"\n{'='*40}")
-        logger.info(f"STARTING ROUND {round_idx}/{CONFIG['num_rounds']}")
-        logger.info(f"{'='*40}")
-
-        # ── Step A: Server Broadcast ─────────────────────────────────────
-        # Send the current global prototype bank to all clients so they can
-        # use it for GPAD anchoring. In Round 1, no prototypes exist yet.
+        # Broadcast State Vectors
         if round_idx > 1:
-            logger.info(
-                f"Broadcasting {len(global_protos)} Global Prototypes to Clients."
-            )
+            logger.info(f"Pushing rank-{len(global_protos)} memory payload globally.")
 
-        # ── Step B: Fetch Task-Specific DataLoaders ──────────────────────
-        # Each round introduces a new task with new classes. Each client
-        # gets a Dirichlet-sampled proportion of the task's classes (non-IID).
         client_class_proportions = task_schedule[round_idx - 1]
         dataloaders = create_client_dataloaders(
-            dataset=dataset,
-            client_class_proportions=client_class_proportions,
-            batch_size=CONFIG["batch_size"],
-            num_workers=CONFIG["num_workers"],
-            pin_memory=CONFIG["pin_memory"],
-            shuffle=CONFIG["dataloader_shuffle"],
+            dataset=dataset, client_class_proportions=client_class_proportions,
+            batch_size=CONFIG["batch_size"], num_workers=CONFIG["num_workers"],
+            pin_memory=CONFIG["pin_memory"], shuffle=CONFIG["dataloader_shuffle"],
             seed=CONFIG["seed"] + round_idx,
         )
 
-        for i, (dl, class_props) in enumerate(zip(dataloaders, client_class_proportions)):
-            logger.info(
-                f"  Client {i}: {len(dl.dataset)} samples "
-                f"from {len(class_props)} classes"
-            )
-
-        # ── Step C: Client Local Training ────────────────────────────────
-        # Each client trains on its private data for one epoch:
-        #   Round 1:  Loss = MAE reconstruction loss only.
-        #   Round >1: Loss = MAE + lambda_proto × GPAD (anchored embeddings).
-        logger.info(">> Clients Training...")
-        losses = client_manager.train_round(
-            dataloaders,
-            global_prototypes=global_protos,
-            gpad_loss_fn=gpad_loss,
-        )
-        logger.info(f"Client Losses: {losses}")
-
-        # ── Step D: Local Prototype Extraction ───────────────────────────
-        # Round 1:  Run full K-Means from scratch to produce initial
-        #           client prototypes (k_init_prototypes clusters).
-        # Round >1: Prototypes are maintained online via per-embedding
-        #           routing (EMA updates + novelty buffer clustering).
+        # SGD Opt + Local Novelty Discovery via MAE and GPAD Gradients
+        losses = client_manager.train_round(dataloaders, global_prototypes=global_protos, gpad_loss_fn=gpad_loss)
+        
         client_payloads = []
-
         if round_idx == 1:
-            # --- Round 1: Full K-Means prototype initialization ---
-            logger.info(">> Generating Initial Local Prototypes (K-Means)...")
+            # Baseline zero-shot clustering formulation for absolute novel manifolds
             for i, client in enumerate(client_manager.clients):
-                local_protos = client.generate_prototypes(
-                    dataloaders[i], K_init=CONFIG["k_init_prototypes"]
-                )
-                # Extract only trainable weights (adapters) for server-side aggregation.
-                # Sending the frozen backbone wastes bandwidth and corrupts the model.
-                weights = {
-                    k: v.cpu() for k, v in client.model.state_dict().items()
-                    if client.model.get_parameter(k).requires_grad
-                }
-                payload = {
-                    "client_id": f"client_{i}",
-                    "protos": local_protos.cpu(),
-                    "weights": weights,
-                }
-                client_payloads.append(payload)
+                local_protos = client.generate_prototypes(dataloaders[i], K_init=CONFIG["k_init_prototypes"])
+                weights = {k: v.cpu() for k, v in client.model.state_dict().items() if client.model.get_parameter(k).requires_grad}
+                client_payloads.append({"client_id": f"client_{i}", "protos": local_protos.cpu(), "weights": weights})
         else:
-            # --- Round > 1: Collect online-maintained prototypes ---
-            logger.info(">> Collecting Local Prototypes (from routing/buffer)...")
+            # Iterative non-stationary extraction tracking dynamic parameter shift
             for i, client in enumerate(client_manager.clients):
                 local_protos = client.get_local_prototypes()
-                # Extract only trainable weights (adapters) for server-side aggregation.
-                # Sending the frozen backbone wastes bandwidth and corrupts the model.
-                weights = {
-                    k: v.cpu() for k, v in client.model.state_dict().items()
-                    if client.model.get_parameter(k).requires_grad
-                }
-                payload = {
-                    "client_id": f"client_{i}",
-                    "weights": weights,
-                }
-                # Include prototypes only if the client has generated them.
+                weights = {k: v.cpu() for k, v in client.model.state_dict().items() if client.model.get_parameter(k).requires_grad}
+                payload = {"client_id": f"client_{i}", "weights": weights}
                 if local_protos is not None:
                     payload["protos"] = local_protos.cpu()
-                    logger.info(
-                        f"  Client {i}: {local_protos.shape[0]} local protos, "
-                        f"buffer={len(client.novelty_buffer)}"
-                    )
-                else:
-                    logger.info(f"  Client {i}: No local prototypes yet")
                 client_payloads.append(payload)
 
-        # ── Step E: Server Aggregation ───────────────────────────────────
-        # The server receives all client payloads and executes two tasks:
-        #   (1) Merge local prototypes into the Global Prototype Bank.
-        #   (2) Average client model weights using FedAvg.
-        logger.info(">> Server Aggregation...")
+        # Apply Global Momentum bounds & Vector Algebra (FedAvg + EMA Prototype Merges)
         global_protos, global_weights = run_server_round(
-            proto_manager=proto_bank,
-            model_server=fed_server,
-            client_payloads=client_payloads,
-            current_global_weights=base_model.state_dict(),
-            round_idx=round_idx,
-            server_model_ema_alpha=CONFIG["server_model_ema_alpha"],
+            proto_manager=proto_bank, model_server=fed_server,
+            client_payloads=client_payloads, current_global_weights=base_model.state_dict(),
+            round_idx=round_idx, server_model_ema_alpha=CONFIG["server_model_ema_alpha"],
         )
-
-        # ── Step F: Global Model Update + Checkpoint ─────────────────────
-        # Load the FedAvg-aggregated weights into the base model. We use
-        # strict=False because clients send all weights but frozen backbone
-        # weights should not cause issues.
         base_model.load_state_dict(global_weights, strict=False)
 
-        # Record round timing.
         round_time = time.time() - round_start
-
-        # Update training history.
-        bank_size = (
-            global_protos.shape[0] if global_protos is not None else 0
-        )
         training_history["round_losses"].append(losses)
         training_history["avg_losses"].append(sum(losses) / len(losses))
-        training_history["proto_bank_sizes"].append(bank_size)
+        training_history["proto_bank_sizes"].append(global_protos.shape[0] if global_protos is not None else 0)
         training_history["round_times"].append(round_time)
-        # Track which classes were in this task
-        training_history["task_classes"].append(
-            [list(class_props.keys()) for class_props in client_class_proportions]
-        )
+        training_history["task_classes"].append([list(cp.keys()) for cp in client_class_proportions])
 
-        # Print formatted round summary.
-        print_round_summary(
-            round_idx=round_idx,
-            num_rounds=CONFIG["num_rounds"],
-            losses=losses,
-            proto_bank=proto_bank,
-            round_time=round_time,
-            training_history=training_history,
-        )
+        print_round_summary(round_idx, CONFIG["num_rounds"], losses, proto_bank, round_time, training_history)
+        save_checkpoint(CONFIG["save_dir"], round_idx, base_model, proto_bank, training_history)
 
-        # Update tqdm postfix with key metrics.
-        round_pbar.set_postfix({
-            "avg_loss": f"{training_history['avg_losses'][-1]:.4f}",
-            "bank": bank_size,
-            "time": f"{round_time:.0f}s",
-        })
-
-        # Save checkpoint after every round.
-        save_checkpoint(
-            save_dir=CONFIG["save_dir"],
-            round_idx=round_idx,
-            base_model=base_model,
-            proto_bank=proto_bank,
-            training_history=training_history,
-        )
-
-        # Log round completion.
-        if global_protos is not None:
-            logger.info(
-                f"Round {round_idx} Complete. "
-                f"Global Bank Size: {global_protos.shape[0]}"
-            )
-        else:
-            logger.error("Round Complete but Global Protos is None!")
-
-    # ── Phase 5: Final Save ───────────────────────────────────────────────────
-    # Save the final model checkpoint with all training history.
-    save_checkpoint(
-        save_dir=CONFIG["save_dir"],
-        round_idx=CONFIG["num_rounds"],
-        base_model=base_model,
-        proto_bank=proto_bank,
-        training_history=training_history,
-        is_final=True,
-    )
-
-    # Print final training summary.
+    # ── [Phase 5] Termination & Output
+    save_checkpoint(CONFIG["save_dir"], CONFIG["num_rounds"], base_model, proto_bank, training_history, is_final=True)
+    
     total_time = sum(training_history["round_times"])
-    print(f"\n{'═' * 60}")
-    print(f"  TRAINING COMPLETE")
-    print(f"{'═' * 60}")
-    print(f"  Total Rounds:    {CONFIG['num_rounds']}")
-    print(f"  Total Time:      {total_time:.1f}s ({total_time/60:.1f}min)")
-    print(f"  Final Avg Loss:  {training_history['avg_losses'][-1]:.6f}")
-    print(f"  Final Bank Size: {training_history['proto_bank_sizes'][-1]}")
-    print(f"  Checkpoints:     {CONFIG['save_dir']}/")
-    print(f"{'═' * 60}\n")
+    logger.info(f"Network Convergence Secured | Total Active State Time: {total_time:.1f}s")
 
-    logger.info("\nPipeline Finished Successfully.")
-
-
-# ==========================================================================
-# Entry Point
-# ==========================================================================
 
 if __name__ == "__main__":
     main()
