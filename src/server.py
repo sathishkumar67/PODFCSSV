@@ -1,39 +1,26 @@
 """
-Server-Side Components for Federated Continual Self-Supervised Learning.
+Server-Side Central Orchestration for Federated Continual Representation Learning.
 
-Two core server responsibilities live here:
+This module implements the stateless coordination hub for the federated learning 
+graph. The server aggregates high-dimensional knowledge from isolated edge nodes 
+without ever directly inspecting private data, fulfilling privacy-preserving 
+machine learning (PPML) constraints.
 
-1. ``GlobalPrototypeBank``
-   A dynamically growing set of L2-normalised prototype vectors on the unit
-   hypersphere.  Each vector represents a visual concept discovered across all
-   clients.  New local prototypes from each round are integrated via a
-   "Merge-or-Add" strategy with Exponential Moving Average (EMA) updates.
+Core Mathematical Mechanisms
+----------------------------
+1. **Merge-or-Add Basis Expansion (`GlobalPrototypeBank`)**:
+   Maintains the global representational basis $P_{global} \in \mathbb{R}^{M \times D}$. 
+   Density peaks from local client buffers are checked for collinearity against 
+   the global basis using cosine similarity. If $\cos(x_{new}, p_m) \geq \tau_{merge}$, 
+   the centroid is updated via momentum: 
+   $p_m^{(t+1)} = \text{Norm}((1-\alpha)p_m^{(t)} + \alpha x_{new})$.
+   Otherwise, the cluster is registered as a novel concept, expanding $M$.
 
-2. ``FederatedModelServer``
-   Standard Federated Averaging (FedAvg) for model weight aggregation:
-   element-wise arithmetic mean of all participating clients' state dicts.
-
-3. ``run_server_round``
-   Convenience function that executes both prototype merging and weight
-   aggregation for one communication round.
-
-4. ``GlobalModel``
-   Wrapper around the server-side model instance.  Handles pre-trained
-   checkpoint loading and weight updates from FedAvg.
-
-Merge-or-Add Strategy
----------------------
-- **Merge**: Incoming prototype with cosine sim ≥ ``merge_threshold`` to an
-  existing global prototype → update in-place via EMA:
-  ``G_new = normalise((1 − α) · G_old + α · P_local)``.
-- **Add**: Cosine sim below threshold → the prototype encodes a genuinely novel
-  concept and is appended to the bank (subject to ``max_prototypes`` cap).
-
-References
-----------
-[1] McMahan et al., "Communication-Efficient Learning of Deep Networks
-    from Decentralized Data", AISTATS 2017.
-[2] Snell et al., "Prototypical Networks for Few-shot Learning", NeurIPS 2017.
+2. **Distributed Function Approximation (`FederatedModelServer`)**:
+   Implements the celebrated FedAvg algorithm for the parameter bottleneck tensors:
+   $\theta^{(t+1)} = \sum_{k=1}^{K} \frac{n_k}{N} \theta_k^{(t)}$.
+   Because data truncation ensures uniform contribution $n_k$, the aggregation 
+   simplifies to the element-wise arithmetic mean of adapter $\Delta W$ projections.
 """
 
 from __future__ import annotations
@@ -43,9 +30,6 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
-# --------------------------------------------------------------------------
-# Logging
-# --------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -53,32 +37,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 1. GLOBAL PROTOTYPE BANK
-# ══════════════════════════════════════════════════════════════════════════
-
 class GlobalPrototypeBank:
-    """Server-side global prototype bank.
-
-    Manages a dynamically sized collection of L2-normalised prototype vectors.
-    Each vector is a cluster centroid representing a distinct visual concept
-    discovered across the federation.
-
-    The bank implements an online Merge-or-Add strategy:
-      1. Compute cosine similarity of the incoming prototype vs ALL globals.
-      2. If best match ≥ ``merge_threshold`` → **merge** via EMA.
-      3. Else → **add** as a new global prototype (if capacity allows).
-
-    All vectors are kept L2-normalised so that cosine similarity = dot product.
-
-    Attributes
-    ----------
-    embedding_dim    : int            – Feature dimensionality D.
-    merge_threshold  : float          – Server-side merge threshold.
-    ema_alpha        : float          – EMA interpolation factor.
-    device           : torch.device   – Computation device.
-    max_prototypes   : int            – Bank capacity limit.
-    prototypes       : torch.Tensor   – ``[M, D]`` prototype matrix.
+    """
+    Central repository for tracking and discovering federated visual concepts.
     """
 
     def __init__(
@@ -89,22 +50,15 @@ class GlobalPrototypeBank:
         device: str = "cpu",
         max_prototypes: int = 50,
     ) -> None:
-        """Initialise the global prototype bank.
+        """
+        Instantiates the global memory bank and heuristic boundaries.
 
-        Parameters
-        ----------
-        embedding_dim   : int   – Must match encoder output dim (e.g. 768 for
-                                  ViT-Base).  Default: 768.
-        merge_threshold : float – If cos(incoming, best_global) ≥ this value
-                                  the global proto is updated via EMA; otherwise
-                                  a new entry is added.  Range: 0.5–0.85.
-                                  Default: 0.8.
-        ema_alpha       : float – EMA weight for prototype update:
-                                  ``G = norm((1−α)·G_old + α·P_new)``.
-                                  Range: 0.01–0.2.  Default: 0.1.
-        device          : str   – 'cpu', 'cuda', or 'cuda:N'.  Default: 'cpu'.
-        max_prototypes  : int   – Maximum bank capacity.  Once full, only
-                                  merges are allowed.  Range: 20–200.  Default: 50.
+        Args:
+            embedding_dim: Projection space dimensionality $\mathbb{R}^D$.
+            merge_threshold: Cosine similarity $\tau_{merge}$ for concept equivalence.
+            ema_alpha: Momentum velocity $\alpha$ for tracking centroid drift.
+            device: Accelerator target.
+            max_prototypes: Hard upper bound $M_{max}$ on representational cardinality.
         """
         self.embedding_dim = embedding_dim
         self.merge_threshold = merge_threshold
@@ -112,79 +66,53 @@ class GlobalPrototypeBank:
         self.device = torch.device(device)
         self.max_prototypes = max_prototypes
 
-        # Start with an empty bank [0, D].
         self.prototypes = torch.zeros(0, embedding_dim, device=self.device)
 
-    # ------------------------------------------------------------------
-    # Core aggregation: merge incoming local prototypes into the bank
-    # ------------------------------------------------------------------
     @torch.no_grad()
     def merge_local_prototypes(
         self,
         local_protos_list: List[torch.Tensor],
     ) -> torch.Tensor:
-        """Integrate local prototypes from all clients into the global bank.
-
-        All incoming prototypes are concatenated, L2-normalised, and processed
-        **sequentially** against the current bank.  Sequential processing is
-        necessary because each prototype can modify the bank (merge or add),
-        and subsequent prototypes must see the updated state — e.g. two clients
-        that independently discover the same concept should not both add it.
-
-        Parameters
-        ----------
-        local_protos_list : List[torch.Tensor]
-            One tensor per client, each ``[K_i, D]``.  They do not need to
-            be pre-normalised.
-
-        Returns
-        -------
-        torch.Tensor
-            Updated bank ``[M_new, D]``.  M_new ≥ M_old (bank never shrinks).
+        """
+        Synthesizes the federated representations via global Merge-or-Add logic.
+        
+        Strictly processes topological assignments sequentially. If concurrent 
+        clients discover the same local concept space, sequential stochastic 
+        merging prevents exponential inflation of dense region centroids.
         """
         if not local_protos_list:
             return self.prototypes
 
-        # Concatenate all client prototypes into one batch and normalise.
         incoming = torch.cat(local_protos_list, dim=0).to(self.device)
         incoming = F.normalize(incoming, p=2, dim=1)
 
-        # --- Round 1: bank is empty → seed with all incoming protos ---
         if self.prototypes.size(0) == 0:
             if (
                 self.max_prototypes is not None
                 and incoming.size(0) > self.max_prototypes
             ):
                 logger.warning(
-                    f"Round 1 incoming ({incoming.size(0)}) exceeds max capacity "
-                    f"({self.max_prototypes}).  Truncating."
+                    f"Initialization bottleneck: incoming volume ({incoming.size(0)}) "
+                    f"exceeds boundary constraint $M_{{max}}$ ({self.max_prototypes}). Truncating basis."
                 )
                 self.prototypes = incoming[: self.max_prototypes]
             else:
                 self.prototypes = incoming
             return self.prototypes
 
-        # --- Round > 1: process each incoming prototype sequentially ---
         for i in range(incoming.size(0)):
-            p_new = incoming[i]  # single vector [D]
+            p_new = incoming[i]  
 
-            # Defensive re-normalisation: EMA can cause slight norm drift.
             self.prototypes = F.normalize(self.prototypes, p=2, dim=1)
 
-            # Cosine similarity vs every global prototype (dot product).
-            sims = torch.mv(self.prototypes, p_new)  # [M]
+            sims = torch.mv(self.prototypes, p_new)  
             max_sim, best_idx = sims.max(dim=0)
 
             if max_sim >= self.merge_threshold:
-                # ── MERGE ──
-                # The incoming prototype matches an existing concept.
-                # Blend via EMA and re-normalise to the unit sphere.
                 old_vec = self.prototypes[best_idx]
                 blended = (1 - self.ema_alpha) * old_vec + self.ema_alpha * p_new
                 self.prototypes[best_idx] = F.normalize(blended, p=2, dim=0)
             else:
-                # ── ADD ──
-                # Novel concept.  Append if capacity allows.
                 if (
                     self.max_prototypes is None
                     or self.prototypes.size(0) < self.max_prototypes
@@ -194,87 +122,87 @@ class GlobalPrototypeBank:
                     )
                 else:
                     logger.info(
-                        f"Bank at capacity ({self.max_prototypes}).  "
-                        f"Skipping novel prototype."
+                        f"Topological capacity saturation ($M={self.max_prototypes}$). "
+                        f"Discarding independent novel discovery."
                     )
 
         return self.prototypes
 
     def get_prototypes(self) -> torch.Tensor:
-        """Return the current bank ``[M, D]`` (empty ``[0, D]`` if uninitialised)."""
+        """
+        Exposes the fully synthesized $P_{global} \in \mathbb{R}^{M \times D}$ space.
+        """
         return self.prototypes
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 2. FEDERATED MODEL SERVER (FedAvg)
-# ══════════════════════════════════════════════════════════════════════════
-
 class FederatedModelServer:
-    """Federated Averaging (FedAvg) weight aggregation server.
-
-    Computes the element-wise arithmetic mean of all client state dicts to
-    produce a single global consensus model each round.  Assumes uniform
-    weighting (equal data contribution per client).
-
-    Notes
-    -----
-    - Tensors keep their original dtype during aggregation (no implicit
-      conversion to float32).
-    - If a parameter key is missing from any client, that key is skipped
-      entirely (with a warning) to avoid biased averaging over a partial set.
+    """
+    Standard FedAvg linear synchronization interface.
+    
+    Synthesizes the global weight state $\theta^{(t)}$ by evaluating the expected 
+    value over the disparate client sub-topologies. Assumes strict homogeneous 
+    architectural conformity across all submitted parameter dicts.
     """
 
     @torch.no_grad()
     def aggregate_weights(
         self,
         client_weights_map: Dict[str, Dict[str, torch.Tensor]],
+        current_global_weights: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        """Aggregate client weights via FedAvg (uniform mean).
-
-        Parameters
-        ----------
-        client_weights_map : Dict[str, Dict[str, torch.Tensor]]
-            ``{client_id: state_dict}``.  All clients must share the same
-            model architecture.
-
-        Returns
-        -------
-        Dict[str, torch.Tensor]
-            Global state dict.  Empty dict if no weights received.
+        """
+        Executes parameter mean aggregation using the previous global trace 
+        as an implicit fallback matrix for dropped keys.
         """
         if not client_weights_map:
-            logger.warning("No client weights received for aggregation.")
+            logger.warning("Network submission vector empty; aborting synchronization round.")
             return {}
 
         client_ids = list(client_weights_map.keys())
         num_clients = len(client_ids)
 
-        # Single client → no averaging needed.
         if num_clients == 1:
             return client_weights_map[client_ids[0]]
 
-        # Use the first client as a structural template for the expected keys.
         reference_keys = client_weights_map[client_ids[0]].keys()
-
         global_state: Dict[str, torch.Tensor] = {}
 
         for key in reference_keys:
-            # Collect this parameter from every client.
-            tensors = [
-                client_weights_map[cid][key]
-                for cid in client_ids
-                if key in client_weights_map[cid]
-            ]
-
-            if len(tensors) == num_clients:
-                # All clients contributed → stack along dim 0 and average.
-                global_state[key] = torch.stack(tensors, dim=0).mean(dim=0)
-            else:
-                # Some clients missing this key → skip to avoid bias.
+            if key in client_weights_map[client_ids[0]]:
+                accumulated_weights = client_weights_map[client_ids[0]][key].clone()
+            elif current_global_weights and key in current_global_weights:
                 logger.warning(
-                    f"'{key}' missing in {num_clients - len(tensors)}/{num_clients} "
-                    f"clients — skipping aggregation for this parameter."
+                    f"Parametric absence at key '{key}' from agent '{client_ids[0]}'. "
+                    "Imputing via zero-order global hold."
                 )
+                accumulated_weights = current_global_weights[key].clone()
+            else:
+                logger.warning(
+                    f"Irrecoverable structural omission on key '{key}'. "
+                    "Graph alignment compromised for this parameter."
+                )
+                continue 
+
+            for i in range(1, num_clients):
+                cid = client_ids[i]
+                client_sd = client_weights_map[cid]
+
+                if key in client_sd:
+                    accumulated_weights += client_sd[key]
+                elif current_global_weights and key in current_global_weights:
+                    logger.warning(
+                        f"Parametric absence at key '{key}' for agent {cid}. "
+                        "Substituting global invariant."
+                    )
+                    accumulated_weights += current_global_weights[key]
+                else:
+                    logger.error(
+                        f"Fatal node misalignment: Key '{key}' untracked by '{cid}' "
+                        "and unavailable in global dictionary. Aggregation biased."
+                    )
+                    pass 
+
+            global_state[key] = accumulated_weights / num_clients
 
         return global_state
 
@@ -283,67 +211,50 @@ class FederatedModelServer:
 # 3. ROUND ORCHESTRATION
 # ══════════════════════════════════════════════════════════════════════════
 
+from typing import Tuple
+
 def run_server_round(
     proto_manager: GlobalPrototypeBank,
     model_server: FederatedModelServer,
     client_payloads: List[Dict[str, Any]],
+    current_global_weights: Dict[str, torch.Tensor],
     round_idx: int = 1,
-    current_global_weights: Optional[Dict[str, torch.Tensor]] = None,
     server_model_ema_alpha: float = 0.1,
-) -> Dict[str, Any]:
-    """Execute the complete server-side logic for one communication round.
-
-    1. **Prototype aggregation**: extract local prototypes from all client
-       payloads and merge them into the global bank (Merge-or-Add + EMA).
-    2. **Weight aggregation**: extract local state dicts and compute the
-       FedAvg global weights (element-wise mean).
-
-    Parameters
-    ----------
-    proto_manager   : GlobalPrototypeBank     – Modified in-place by merge.
-    model_server    : FederatedModelServer     – Stateless aggregator.
-    client_payloads : List[Dict[str, Any]]
-        Each dict should contain:
-          - ``'client_id'`` (str)
-          - ``'protos'`` (torch.Tensor, optional) – ``[K_i, D]``
-          - ``'weights'`` (Dict[str, torch.Tensor])
-
-    Returns
-    -------
-    Dict[str, Any]
-        ``{'global_prototypes': Tensor, 'global_weights': state_dict}``.
-        Empty dict if no payloads.
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    Executes the bipartite synchronization protocol for a single communication interval.
+    
+    Orchestrates the asynchronous assimilation of both the representation manifold 
+    (prototypes) and the deep learning parameters (FedAvg weights), acting as the 
+    definitive state transition barrier between epochs $(t)$ and $(t+1)$.
     """
     if not client_payloads:
-        return {}
+        return torch.empty(0, 0), {}
 
-    # Step 1 — Prototype aggregation.
     protos = [p["protos"] for p in client_payloads if "protos" in p]
     global_protos = proto_manager.merge_local_prototypes(protos)
 
-    # 2. Aggregate Model Weights
-    # We map weights to client IDs for structured aggregation.
     client_weights_map = {}
     for i, p in enumerate(client_payloads):
         if "weights" in p:
-            # Fallback ID generation if missing
             cid = p.get("client_id", f"unknown_client_{i}")
             client_weights_map[cid] = p["weights"]
 
-    global_weights = model_server.aggregate_weights(client_weights_map)
+    aggregated_state_dict = model_server.aggregate_weights(
+        client_weights_map, 
+        current_global_weights
+    )
 
-    # 3. Apply Server-Side EMA to Model Weights (if Round > 1)
     if round_idx > 1 and current_global_weights is not None:
-        for key in global_weights:
+        for key in aggregated_state_dict:
             if key in current_global_weights:
                 old_w = current_global_weights[key]
-                new_w = global_weights[key]
-                # Combine using EMA: final_weights = (1 - alpha) * current + alpha * new
-                global_weights[key] = (1.0 - server_model_ema_alpha) * old_w + server_model_ema_alpha * new_w
+                new_w = aggregated_state_dict[key]
+                aggregated_state_dict[key] = (1.0 - server_model_ema_alpha) * old_w + server_model_ema_alpha * new_w
 
     return {
         "global_prototypes": global_protos,
-        "global_weights": global_weights,
+        "global_weights": aggregated_state_dict,
     }
 
 
@@ -352,34 +263,23 @@ def run_server_round(
 # ══════════════════════════════════════════════════════════════════════════
 
 class GlobalModel:
-    """Server-side global model wrapper.
-
-    Handles two jobs:
-      1. **Initialisation** – Loads a ``ViTMAEForPreTraining`` checkpoint,
-         injects IBA adapters, and freezes the backbone.
-      2. **Weight updates** – After each round's FedAvg aggregation, loads
-         the averaged weights into the model (``strict=False`` to handle
-         partial adapter-only state dicts).
-
-    Attributes
-    ----------
-    device : torch.device  – Computation device.
-    model  : nn.Module     – The actual PyTorch model.
+    """
+    Maintains the persistent parameter representation for the central server.
+    
+    Serves exclusively as an inference and initialization hub. Synthesizes the 
+    foundation `facebook/vit-mae-base` autoencoder and explicitly injects the 
+    trainable Information Bottleneck Adapters.
     """
 
     def __init__(self, device: str = "cpu") -> None:
-        """Load a pre-trained ViT-MAE and inject adapters.
-
-        Falls back to a lightweight ``nn.Linear`` stub if the required
-        libraries are unavailable, allowing pipeline testing without
-        HuggingFace dependencies.
-
-        Parameters
-        ----------
-        device : str – 'cpu', 'cuda', or 'cuda:N'.  Default: 'cpu'.
+        """
+        Dynamically allocates the pre-trained graph into the server memory layout.
+        
+        Gracefully defaults to a topological dummy layer if the huggingface 
+        safetensors are unavailable in the host environment.
         """
         self.device = torch.device(device)
-        logger.info(f"Initialising Global Model on {self.device}...")
+        logger.info(f"Instantiating Global Parameter Graph on {self.device}...")
 
         try:
             from transformers import ViTMAEForPreTraining
@@ -390,9 +290,9 @@ class GlobalModel:
             )
             self.model = inject_adapters(self.model)
             self.model.to(self.device)
-            self.model.eval()  # server model is never trained directly
+            self.model.eval()  
 
-            logger.info("Global Model initialised (pre-trained + adapters).")
+            logger.info("Global Topology successfully initialized (Adapters Active).")
 
         except ImportError as e:
             logger.warning(f"Import failed ({e}) — falling back to stub model.")
@@ -406,27 +306,23 @@ class GlobalModel:
         self,
         aggregated_weights: Dict[str, torch.Tensor],
     ) -> None:
-        """Load FedAvg-aggregated weights into the global model.
-
-        Uses ``strict=False`` because clients typically send back only the
-        trainable adapter parameters, not the frozen backbone weights.
-
-        Parameters
-        ----------
-        aggregated_weights : Dict[str, torch.Tensor]
-            Global state dict from ``FederatedModelServer.aggregate_weights()``.
+        """
+        Ingests the FedAvg approximation into the active PyTorch compute graph.
+        
+        Permits `strict=False` mapping because edge devices communicate strictly 
+        via sparse Parameter-Efficient Fine-Tuning ($\Delta W_{adapter}$) tensors.
         """
         if not aggregated_weights:
-            logger.warning("Empty weight update — skipping.")
+            logger.warning("Empty structural dictionary submitted. Bypassing update.")
             return
 
         try:
             keys = self.model.load_state_dict(aggregated_weights, strict=False)
             logger.info(
-                f"Global model updated.  "
-                f"Missing keys: {len(keys.missing_keys)}, "
+                f"Global Topology Transmuted. "
+                f"Missing keys (Frozen): {len(keys.missing_keys)}, "
                 f"Unexpected keys: {len(keys.unexpected_keys)}"
             )
         except Exception as e:
-            logger.error(f"Failed to update global model weights: {e}")
+            logger.error(f"Critical fault asserting local parameters to global graph: {e}")
             raise

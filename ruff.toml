@@ -26,6 +26,7 @@ ignore = [
     "N803",  # argument name should be lowercase — we use X, K, D, N per math convention
     "N806",  # variable in function should be lowercase — matrix/tensor math conventions
     "B023",  # function uses loop variable — common in ThreadPoolExecutor patterns
+    "W605",  # valid escape sequence suppression for LaTeX formatting in academic docstrings
 ]
 
 [lint.isort]

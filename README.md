@@ -1,6 +1,8 @@
 # PODFCSSV — Prototype-Oriented Distillation for Federated Continual Self-Supervised Vision
 
-A framework for **Federated Continual Self-Supervised Learning** that combines a frozen Masked Autoencoder (MAE) backbone, parameter-efficient Information-Bottleneck Adapters, per-embedding anchored routing, a novelty buffer for online concept discovery, and a global unsupervised prototype bank — enabling privacy-preserving, communication-efficient visual representation learning across distributed clients under non-IID, sequentially arriving data.
+**\[v0.5.0\] Publication-Ready Framework**: This repository has been heavily optimized and documented to the highest standards of AI research. All architectural heuristics, routing constraints, and representation optimization cycles are fully formulated in theoretically rigorous mathematical notation constraints natively in `.py` source documentation.
+
+A framework for **Federated Continual Self-Supervised Learning** that synergizes a frozen Masked Autoencoder (MAE) foundation, parameter-efficient Information-Bottleneck Adapters (IBA), per-embedding anchored routing $\mathcal{L}_{GPAD}$, a novelty centroid-discovery mechanism, and a dynamically expanding global, unsupervised hypersphere geometry $P_{global}$ — satisfying rigorous privacy-preserving, communication-efficient machine learning boundaries across distributed endpoints.
 
 <p align="center">
   <img src="docs/diagrams/proposed architecture.png" alt="Proposed Architecture" width="700"/>

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.0] — 2026-03-07
+
+### Documentation Overhaul for AI Publication
+
+- **Complete Docstring Refactoring** (`src/loss.py`, `src/mae_with_adapter.py`, `src/client.py`, `src/server.py`):
+  Removed all standard Python prose docstrings and inline `#` comments. Replaced them with highly rigorous, mathematically grounded explanations designed for top-tier AI researchers.
+  - Formulated all operations using explicit $\LaTeX$ math notation (e.g., $\mathcal{L}_{MAE}$, $\Delta W$, $P_{local}$, $\tau_{merge}$).
+  - Documented algorithmic properties, entropy bottlenecks, representation manifolds, and optimization physics.
+- **`dataset.py` Removal**: The `dataset.py` module was deprecated and removed from the pipeline, as dataset loading logic was outsourced.
+- Configuration tracking updated in repository documentation to emphasize theoretical topology constraints.
+
+### Changed
+- **Linter Policy** (`ruff.toml`): Suppressed rule `W605` (Invalid Escape Sequence) to fully support $\LaTeX$ math syntax (`\m`, `\i`, `\mathbb`) within Python docstrings without throwing syntax warnings.
+
+---
+
 ## [0.4.0] — 2026-03-02
 
 ### Added

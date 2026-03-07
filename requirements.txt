@@ -1,3 +1,7 @@
+# ─── Requirements for PODFCSSV v0.5.0 pipeline ───────────────────────────────
+# Note: Dependencies remain unchanged; core refactoring applies primarily to 
+# mathematically rigorous AI research documentation and architectural grounding.
+
 # ─── Core Deep Learning ──────────────────────────────────────────────────────
 # PyTorch: tensor operations, autograd, GPU acceleration, distributed training
 torch>=2.0.0

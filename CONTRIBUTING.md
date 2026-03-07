@@ -93,14 +93,10 @@ Mathematical variable names (e.g., `K`, `N`, `D`, `X`, `Z`) follow standard rese
 
 ### Docstrings
 
-Every public class and method should have a **compact, scannable** docstring following NumPy/SciPy style:
-- **Summary line**: One concise sentence describing what the component does.
-- **Structured body** (optional): Use attribute tables (e.g., `attr : type – description`) and short inline notes rather than full prose paragraphs.
-- **Parameters section**: All arguments with types, defaults, and valid ranges. Keep descriptions to one or two lines.
-- **Returns section**: Return type, shape (for tensors), and a brief description.
-- **Notes section** (optional): Mathematical background or edge-case handling, with tensor shape annotations (e.g., `[B, D]`).
-
-Prefer concise language. Avoid repeating information that is obvious from the function signature.
+The codebase adheres to **highly rigorous, AI publication-grade** documentation standards. Every public component must articulate its theoretical grounding and execution mechanics:
+- **Theory & Mathematics**: Formulate operations using explicit LaTeX math notation (e.g., $\mathcal{L}_{MAE}$, $\Delta W$, $P_{local}$, $\tau_{merge}$). Do not describe mathematical logic using plain text paragraphs if standard notation is clearer.
+- **Structural Definitions**: Enforce rigorous computational boundaries and dimensionality descriptors, e.g., $\mathbb{R}^{B \times D}$.
+- **Style**: Ensure compact, intellectually dense explanations. The project explicitly suppresses linter rule `W605` in `ruff.toml` to fully permit raw math escape sequences (`\m`, `\i`, `\mathbb`) within standard string blocks. Avoid verbose standard Python prose where notation suffices.
 
 ### Inline Comments
 
