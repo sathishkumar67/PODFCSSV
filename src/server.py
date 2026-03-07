@@ -252,10 +252,7 @@ def run_server_round(
                 new_w = aggregated_state_dict[key]
                 aggregated_state_dict[key] = (1.0 - server_model_ema_alpha) * old_w + server_model_ema_alpha * new_w
 
-    return {
-        "global_prototypes": global_protos,
-        "global_weights": aggregated_state_dict,
-    }
+    return global_protos, aggregated_state_dict
 
 
 # ══════════════════════════════════════════════════════════════════════════
