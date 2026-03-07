@@ -287,6 +287,9 @@ def run_server_round(
     proto_manager: GlobalPrototypeBank,
     model_server: FederatedModelServer,
     client_payloads: List[Dict[str, Any]],
+    round_idx: int = 1,
+    current_global_weights: Optional[Dict[str, torch.Tensor]] = None,
+    server_model_ema_alpha: float = 0.1,
 ) -> Dict[str, Any]:
     """Execute the complete server-side logic for one communication round.
 
@@ -318,14 +321,25 @@ def run_server_round(
     protos = [p["protos"] for p in client_payloads if "protos" in p]
     global_protos = proto_manager.merge_local_prototypes(protos)
 
-    # Step 2 — Weight aggregation (FedAvg).
+    # 2. Aggregate Model Weights
+    # We map weights to client IDs for structured aggregation.
     client_weights_map = {}
     for i, p in enumerate(client_payloads):
         if "weights" in p:
+            # Fallback ID generation if missing
             cid = p.get("client_id", f"unknown_client_{i}")
             client_weights_map[cid] = p["weights"]
 
     global_weights = model_server.aggregate_weights(client_weights_map)
+
+    # 3. Apply Server-Side EMA to Model Weights (if Round > 1)
+    if round_idx > 1 and current_global_weights is not None:
+        for key in global_weights:
+            if key in current_global_weights:
+                old_w = current_global_weights[key]
+                new_w = global_weights[key]
+                # Combine using EMA: final_weights = (1 - alpha) * current + alpha * new
+                global_weights[key] = (1.0 - server_model_ema_alpha) * old_w + server_model_ema_alpha * new_w
 
     return {
         "global_prototypes": global_protos,
