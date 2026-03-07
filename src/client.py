@@ -205,7 +205,7 @@ class FederatedClient:
         # Only track TRAINABLE parameters in the optimiser (critical for
         # PEFT: backbone is frozen, only adapter params have requires_grad).
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        opt_kwargs = optimizer_kwargs or {"lr": 1e-3}
+        opt_kwargs = optimizer_kwargs or {"lr": 1e-4}
         self.optimizer = optimizer_cls(trainable_params, **opt_kwargs)
 
         logger.info(
