@@ -1,4 +1,4 @@
-"""
+r"""
 Parameter-Efficient Fine-Tuning via Information-Bottleneck Adapters (IBA).
 
 This module implements the adapter-based fine-tuning strategy for scaling
@@ -35,7 +35,7 @@ from typing import Any, Tuple, Union
 from transformers import PreTrainedModel, ViTMAEForPreTraining
 
 class IBA_Adapter(nn.Module):
-    """
+    r"""
     Information-Bottleneck Adapter Block.
 
     This module learns a low-rank residual projection ΔH decoupled from 
@@ -44,7 +44,7 @@ class IBA_Adapter(nn.Module):
 
     Mathematical Formulation
     ------------------------
-    Given a hidden state tensor $H \in \mathbb{R}^{B \\times L \\times D}$:
+    Given a hidden state tensor $H \in \mathbb{R}^{B \times L \times D}$:
     1. $h_{down} = H W_{down}^T + b_{down}$ : $\mathbb{R}^D \rightarrow \mathbb{R}^d$
     2. $h_{act} = \text{GELU}(h_{down})$
     3. $h_{up} = h_{act} W_{up}^T + b_{up}$ : $\mathbb{R}^d \rightarrow \mathbb{R}^D$
@@ -83,7 +83,7 @@ class IBA_Adapter(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """
+        r"""
         Enforce identity equivalence at convergence step 0.
         """
         # Maintain variance of standard activations across the bottleneck
@@ -100,7 +100,7 @@ class IBA_Adapter(nn.Module):
             nn.init.zeros_(self.up_project.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
+        r"""
         Calculates the residual adaptation step $H_{n+1} = H_n + \Delta H$.
         """
         residual = x                      
@@ -112,7 +112,7 @@ class IBA_Adapter(nn.Module):
 
 
 class ViTBlockWithAdapter(nn.Module):
-    """
+    r"""
     Polymorphic wrapper class around a frozen ViT Encoder layer.
     
     This abstracts away the HuggingFace transformer implementation, 
@@ -163,7 +163,7 @@ def inject_adapters(
     model: PreTrainedModel,
     bottleneck_dim: int = 64,
 ) -> PreTrainedModel:
-    """
+    r"""
     Mutates the PreTrainedModel computation graph in-place.
 
     Execution Flow
@@ -229,7 +229,7 @@ def inject_adapters(
 
 
 def _log_param_stats(model: nn.Module) -> None:
-    """
+    r"""
     Calculates the topological parameter density ratio to verify the
     low-rank parameter footprint constraints required for federated networking.
     """

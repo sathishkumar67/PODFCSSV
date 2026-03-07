@@ -1,4 +1,4 @@
-"""
+r"""
 Client-Side Topology for Federated Continual Self-Supervised Learning.
 
 This module encapsulates the local execution physics of simulated edge devices 
@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 class FederatedClient:
-    """
+    r"""
     Isolated computational node representing a federated participant.
     """
 
@@ -69,7 +69,7 @@ class FederatedClient:
         kmeans_max_iters: int = 100,
         kmeans_tol: float = 1e-4,
     ) -> None:
-        """
+        r"""
         Initializes the client's memory boundaries and hyperparameter states.
         
         Args:
@@ -116,7 +116,7 @@ class FederatedClient:
         )
 
     def _extract_features(self, inputs: torch.Tensor) -> torch.Tensor:
-        """
+        r"""
         Extracts un-masked topology spatial features via the frozen backbone graph.
         Reserved strict for static inference/Generation phases ($t=0$).
         """
@@ -129,7 +129,7 @@ class FederatedClient:
         global_prototypes: Optional[torch.Tensor] = None,
         gpad_loss_fn: Optional[nn.Module] = None,
     ) -> float:
-        """
+        r"""
         Executes one full epoch of stochastic local optimization over $\mathcal{D}_k$.
         The graph propagates both the Generative Masked Autoencoder mapping 
         and the Contrastive GPAD distillation loss simultaneously.
@@ -202,7 +202,7 @@ class FederatedClient:
     # ==================================================================
     @torch.no_grad()
     def _route_non_anchored(self, embeddings: torch.Tensor) -> None:
-        """
+        r"""
         Processes embeddings orthogonal to the global prototype basis.
         
         If a local centroid exists within the $\tau_{local}$ neighborhood, 
@@ -242,7 +242,7 @@ class FederatedClient:
         self._maybe_cluster_buffer()
 
     def _maybe_cluster_buffer(self) -> None:
-        """
+        r"""
         Invokes deterministic clustering upon reaching $C_{buf}$ capacity.
         """
         if len(self.novelty_buffer) >= self.novelty_buffer_size:
@@ -255,7 +255,7 @@ class FederatedClient:
 
     @torch.no_grad()
     def _cluster_novelty_buffer(self) -> None:
-        """
+        r"""
         Implements the Merge-or-Add representation dynamics.
         
         Discovers local density peaks within the cache queue using $K_{buf}$-Means 
@@ -327,7 +327,7 @@ class FederatedClient:
         )
 
     def get_local_prototypes(self) -> Optional[torch.Tensor]:
-        """Return current local prototypes ``[K, D]`` (or None if unset)."""
+        r"""Return current local prototypes ``[K, D]`` (or None if unset)."""
         return self.local_prototypes
 
     # ==================================================================
@@ -337,7 +337,7 @@ class FederatedClient:
     def generate_prototypes(
         self, dataloader: DataLoader, K_init: int = 10
     ) -> torch.Tensor:
-        """
+        r"""
         Populates the $P_{local}$ matrix at $t=1$.
         
         Requires a complete empirical pass over the local dataset distribution $\mathcal{D}_1$ 
@@ -374,7 +374,7 @@ class FederatedClient:
     # Spherical K-Means Clustering (Pure PyTorch)
     # ==================================================================
     def _kmeans(self, X: torch.Tensor, K: int) -> torch.Tensor:
-        """
+        r"""
         Implements Spherical K-Means optimization algorithm.
         Minimizes cosine distance $\min \sum (1 - \cos(x_i, c_j))$ via Lloyd's heuristic, 
         projecting centroids back to strictly unit norm after every update iteration.
@@ -418,7 +418,7 @@ class FederatedClient:
 # ══════════════════════════════════════════════════════════════════════════
 
 class ClientManager:
-    """
+    r"""
     Topology orchestrator for federated participant simulation.
 
     Manages a deterministic ensemble of $\mathcal{N}$ `FederatedClient` objects, 
@@ -441,7 +441,7 @@ class ClientManager:
         kmeans_max_iters: int = 100,
         kmeans_tol: float = 1e-4,
     ) -> None:
-        """
+        r"""
         Constructs the client ensemble and orchestrates device allocation.
 
         Args:
@@ -475,7 +475,7 @@ class ClientManager:
 
     # ------------------------------------------------------------------
     def _initialize_clients(self, base_model: nn.Module) -> None:
-        """
+        r"""
         Maps federated nodes strictly 1:1 to available physical CUDA cores,
         or multiplexes them across the CPU host matrix logically.
         """
@@ -531,7 +531,7 @@ class ClientManager:
         global_prototypes: Optional[torch.Tensor] = None,
         gpad_loss_fn: Optional[nn.Module] = None,
     ) -> List[float]:
-        """
+        r"""
         Initiates communication round optimization cycles.
         
         Exploits ThreadPoolExecutor for OS-level threading when bypassing the GIL 
@@ -540,8 +540,8 @@ class ClientManager:
         """
         if len(dataloaders) != self.num_clients:
             raise ValueError(
-                f"Data boundary mismatch: $|\mathcal{{D}}| = {len(dataloaders)}$, "
-                f"$|\mathcal{{N}}| = {self.num_clients}$"
+                fr"Data boundary mismatch: $|\mathcal{{D}}| = {len(dataloaders)}$, "
+                fr"$|\mathcal{{N}}| = {self.num_clients}$"
             )
 
         round_losses = [0.0] * self.num_clients

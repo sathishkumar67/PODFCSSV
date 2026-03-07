@@ -1,4 +1,4 @@
-"""
+r"""
 Server-Side Central Orchestration for Federated Continual Representation Learning.
 
 This module implements the stateless coordination hub for the federated learning 
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 class GlobalPrototypeBank:
-    """
+    r"""
     Central repository for tracking and discovering federated visual concepts.
     """
 
@@ -50,7 +50,7 @@ class GlobalPrototypeBank:
         device: str = "cpu",
         max_prototypes: int = 50,
     ) -> None:
-        """
+        r"""
         Instantiates the global memory bank and heuristic boundaries.
 
         Args:
@@ -73,7 +73,7 @@ class GlobalPrototypeBank:
         self,
         local_protos_list: List[torch.Tensor],
     ) -> torch.Tensor:
-        """
+        r"""
         Synthesizes the federated representations via global Merge-or-Add logic.
         
         Strictly processes topological assignments sequentially. If concurrent 
@@ -129,14 +129,14 @@ class GlobalPrototypeBank:
         return self.prototypes
 
     def get_prototypes(self) -> torch.Tensor:
-        """
+        r"""
         Exposes the fully synthesized $P_{global} \in \mathbb{R}^{M \times D}$ space.
         """
         return self.prototypes
 
 
 class FederatedModelServer:
-    """
+    r"""
     Standard FedAvg linear synchronization interface.
     
     Synthesizes the global weight state $\theta^{(t)}$ by evaluating the expected 
@@ -150,7 +150,7 @@ class FederatedModelServer:
         client_weights_map: Dict[str, Dict[str, torch.Tensor]],
         current_global_weights: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        """
+        r"""
         Executes parameter mean aggregation using the previous global trace 
         as an implicit fallback matrix for dropped keys.
         """
@@ -221,7 +221,7 @@ def run_server_round(
     round_idx: int = 1,
     server_model_ema_alpha: float = 0.1,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """
+    r"""
     Executes the bipartite synchronization protocol for a single communication interval.
     
     Orchestrates the asynchronous assimilation of both the representation manifold 
@@ -263,7 +263,7 @@ def run_server_round(
 # ══════════════════════════════════════════════════════════════════════════
 
 class GlobalModel:
-    """
+    r"""
     Maintains the persistent parameter representation for the central server.
     
     Serves exclusively as an inference and initialization hub. Synthesizes the 
@@ -272,7 +272,7 @@ class GlobalModel:
     """
 
     def __init__(self, device: str = "cpu") -> None:
-        """
+        r"""
         Dynamically allocates the pre-trained graph into the server memory layout.
         
         Gracefully defaults to a topological dummy layer if the huggingface 
@@ -306,7 +306,7 @@ class GlobalModel:
         self,
         aggregated_weights: Dict[str, torch.Tensor],
     ) -> None:
-        """
+        r"""
         Ingests the FedAvg approximation into the active PyTorch compute graph.
         
         Permits `strict=False` mapping because edge devices communicate strictly 

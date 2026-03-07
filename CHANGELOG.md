@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.1] — 2026-03-07
+
+### Fixed
+- **LaTeX String Formatters**: Converted all docstrings and logging f-strings containing backslashes to raw strings (`r"""`, `fr"..."`). This resolves `SyntaxWarning: invalid escape sequence` alerts triggered by LaTeX math notation ($ \mathbb{D}, \mathcal{L}, \tau $) in modern Python environments.
+- **Verification**: Verified zero warnings via `py_compile` across the core module suite.
+
 ## [0.5.0] — 2026-03-07
 
 ### Documentation Overhaul for AI Publication

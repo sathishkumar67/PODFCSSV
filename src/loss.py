@@ -1,4 +1,4 @@
-"""
+r"""
 Gated Prototype Anchored Distillation (GPAD) formulation.
 
 This module provides the core metric-learning regularization objective 
@@ -11,7 +11,7 @@ hypersphere.
 Theoretical Framework
 ---------------------
 Given an $L_2$-normalized feature vector $z_i \in \mathbb{R}^D$ and a globally 
-aggregated prototype bank $V \in \mathbb{R}^{M \\times D}$, GPAD computes a 
+aggregated prototype bank $V \in \mathbb{R}^{M \times D}$, GPAD computes a 
 confidence-gated distillation loss:
 
     \mathcal{L}_{GPAD}(z_i) = g(z_i) \cdot \mathbb{D}(z_i, v^*)
@@ -44,7 +44,7 @@ from typing import Tuple
 
 
 class GPADLoss(nn.Module):
-    """
+    r"""
     Gated Prototype Anchored Distillation Objective.
     
     Operates explicitly on $L_2$-normalized dense embeddings.
@@ -58,7 +58,7 @@ class GPADLoss(nn.Module):
         soft_assign_temp: float = 0.1,
         epsilon: float = 1e-8,
     ):
-        """
+        r"""
         Hyperparameter configuration.
         
         Args:
@@ -83,12 +83,12 @@ class GPADLoss(nn.Module):
         embeddings: torch.Tensor,
         global_prototypes: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        r"""
         Compute the mean mini-batch GPAD objective.
         
         Args:
-            embeddings: $Z \in \mathbb{R}^{B \\times D}$
-            global_prototypes: $V \in \mathbb{R}^{M \\times D}$
+            embeddings: $Z \in \mathbb{R}^{B \times D}$
+            global_prototypes: $V \in \mathbb{R}^{M \times D}$
             
         Returns:
             Scalar objective $\mathcal{L}$.
@@ -115,15 +115,15 @@ class GPADLoss(nn.Module):
         embeddings: torch.Tensor,
         prototypes: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        $S = \frac{Z}{\|Z\|_2} \left(\frac{V}{\|V\|_2}\\right)^T$
+        r"""
+        $S = \frac{Z}{\|Z\|_2} \left(\frac{V}{\|V\|_2}\right)^T$
         """
         z = F.normalize(embeddings, p=2, dim=1)
         p = F.normalize(prototypes, p=2, dim=1)
         return torch.mm(z, p.t())
 
     def _compute_adaptive_threshold(self, sims: torch.Tensor) -> torch.Tensor:
-        """
+        r"""
         Computes $\tau(z_i)$ via Maximum Entropy penalization.
         """
         B, M = sims.shape
@@ -147,7 +147,7 @@ class GPADLoss(nn.Module):
         sims: torch.Tensor,
         tau_adaptive: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
+        r"""
         Evaluate the continuous routing gate $g \in [0, 1]$.
         """
         max_sim, _ = sims.max(dim=1)
@@ -167,7 +167,7 @@ class GPADLoss(nn.Module):
         max_sim: torch.Tensor,
         gate: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        r"""
         Compute the gated distance objective.
         Because $\|z\|=\|v^*\|=1$, distance simplifies algebraically to cosine derivation.
         """
@@ -182,7 +182,7 @@ class GPADLoss(nn.Module):
         embeddings: torch.Tensor,
         global_prototypes: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        r"""
         Inference-mode boolean extraction of the gating step function.
         Used by the local Client routing layer to direct non-anchored features 
         towards the stochastic Novelty Buffer.
