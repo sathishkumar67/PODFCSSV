@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "podfcssv"
-version = "0.5.1"
+version = "0.5.2"
 description = "Prototype-Oriented Distillation for Federated Continual Self-Supervised Vision"
 readme = "README.md"
 license = {text = "MIT"}

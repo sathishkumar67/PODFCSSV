@@ -577,16 +577,16 @@ def main():
             # Baseline zero-shot clustering formulation for absolute novel manifolds
             for i, client in enumerate(client_manager.clients):
                 local_protos = client.generate_prototypes(dataloaders[i], K_init=CONFIG["k_init_prototypes"])
-                weights = {k: v.cpu() for k, v in client.model.state_dict().items() if client.model.get_parameter(k).requires_grad}
-                client_payloads.append({"client_id": f"client_{i}", "protos": local_protos.cpu(), "weights": weights})
+                weights = {k: v for k, v in client.model.state_dict().items() if client.model.get_parameter(k).requires_grad}
+                client_payloads.append({"client_id": f"client_{i}", "protos": local_protos, "weights": weights})
         else:
             # Iterative non-stationary extraction tracking dynamic parameter shift
             for i, client in enumerate(client_manager.clients):
                 local_protos = client.get_local_prototypes()
-                weights = {k: v.cpu() for k, v in client.model.state_dict().items() if client.model.get_parameter(k).requires_grad}
+                weights = {k: v for k, v in client.model.state_dict().items() if client.model.get_parameter(k).requires_grad}
                 payload = {"client_id": f"client_{i}", "weights": weights}
                 if local_protos is not None:
-                    payload["protos"] = local_protos.cpu()
+                    payload["protos"] = local_protos
                 client_payloads.append(payload)
 
         # Apply Global Momentum bounds & Vector Algebra (FedAvg + EMA Prototype Merges)

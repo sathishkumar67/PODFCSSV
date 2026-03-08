@@ -248,7 +248,7 @@ def run_server_round(
     if round_idx > 1 and current_global_weights is not None:
         for key in aggregated_state_dict:
             if key in current_global_weights:
-                old_w = current_global_weights[key]
+                old_w = current_global_weights[key].to(aggregated_state_dict[key].device)
                 new_w = aggregated_state_dict[key]
                 aggregated_state_dict[key] = (1.0 - server_model_ema_alpha) * old_w + server_model_ema_alpha * new_w
 

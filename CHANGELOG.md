@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.2] — 2026-03-08
+
+### Fixed
+- **Distributed Device Mismatch (FedAvg/EMA)**: Resolved a `RuntimeError: Expected all tensors to be on the same device` occurring during server-side EMA parameter synchronization. Server aggregation now dynamically aligns `old_w` layers to the correct hardware device corresponding to the aggregated payload state.
+- **Client Payload Locality**: Removed unnecessary, aggressive `.cpu()` casts from the training orchestrator (`main.py`) which were coercing multi-GPU topologies into mixed-device CPU collisions. Accelerated client hardware residency is now properly preserved entering the synchronization phase.
+
 ## [0.5.1] — 2026-03-07
 
 ### Fixed
