@@ -30,6 +30,9 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
+# ==========================================================================
+# Logging Configuration
+# ==========================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -66,6 +69,8 @@ class GlobalPrototypeBank:
         self.device = torch.device(device)
         self.max_prototypes = max_prototypes
 
+        # Initialize an empty prototype matrix. Shape: [0, D].
+        # This will grow as prototypes are added during aggregation.
         self.prototypes = torch.zeros(0, embedding_dim, device=self.device)
 
     @torch.no_grad()
@@ -80,12 +85,16 @@ class GlobalPrototypeBank:
         clients discover the same local concept space, sequential stochastic 
         merging prevents exponential inflation of dense region centroids.
         """
+        # Early exit if no client submitted prototypes this round.
         if not local_protos_list:
             return self.prototypes
 
         incoming = torch.cat([p.to(self.device) for p in local_protos_list], dim=0)
         incoming = F.normalize(incoming, p=2, dim=1)
 
+        # --- Round 1 Initialization ---
+        # If the bank is empty, concatenate all local prototypes to form
+        # the initial global bank without applying merge/add logic.
         if self.prototypes.size(0) == 0:
             if (
                 self.max_prototypes is not None
@@ -101,29 +110,44 @@ class GlobalPrototypeBank:
             return self.prototypes
 
         for i in range(incoming.size(0)):
-            p_new = incoming[i]  
+            p_new = incoming[i]  # Single prototype vector, shape [D]
 
+            # Defensive re-normalization of the bank before similarity
+            # computation. EMA updates can cause slight norm drift due to
+            # floating-point precision, so we project back to the unit sphere.
             self.prototypes = F.normalize(self.prototypes, p=2, dim=1)
 
+            # Compute cosine similarity between p_new and ALL global prototypes.
+            # Since both are unit-norm, this is a simple matrix-vector product.
+            # Result shape: [M] — one similarity score per global prototype.
             sims = torch.mv(self.prototypes, p_new)  
+
+            # Identify the best-matching global prototype.
             max_sim, best_idx = sims.max(dim=0)
 
+            # --- Merge-or-Add Decision ---
             if max_sim >= self.merge_threshold:
+                # MERGE: The incoming prototype matches an existing concept.
+                # Update the best-match global prototype via EMA blending.
                 old_vec = self.prototypes[best_idx]
                 blended = (1 - self.ema_alpha) * old_vec + self.ema_alpha * p_new
+
+                # Re-normalize immediately: the EMA blend of two unit vectors
+                # is NOT a unit vector (its norm < 1), so we must project back
+                # onto the unit sphere to maintain the L2-norm invariant.
                 self.prototypes[best_idx] = F.normalize(blended, p=2, dim=0)
             else:
-                if (
-                    self.max_prototypes is None
-                    or self.prototypes.size(0) < self.max_prototypes
-                ):
+                # ADD: The incoming prototype represents a novel concept not
+                # yet captured by any existing global prototype.
+                # Append it to the bank only if the capacity limit allows.
+                if self.max_prototypes is None or self.prototypes.size(0) < self.max_prototypes:
                     self.prototypes = torch.cat(
                         [self.prototypes, p_new.unsqueeze(0)], dim=0
                     )
                 else:
                     logger.info(
-                        f"Topological capacity saturation ($M={self.max_prototypes}$). "
-                        f"Discarding independent novel discovery."
+                        f"Global bank at capacity ({self.max_prototypes}). "
+                        f"Skipping novel prototype."
                     )
 
         return self.prototypes
@@ -285,11 +309,18 @@ class GlobalModel:
             self.model = ViTMAEForPreTraining.from_pretrained(
                 "facebook/vit-mae-base"
             )
+
+            # Inject IBA adapters into every encoder layer. This freezes the
+            # backbone and makes only the adapter parameters trainable.
             self.model = inject_adapters(self.model)
+
             self.model.to(self.device)
+
+            # Server model stays in eval mode — it is used for aggregation
+            # and broadcasting, not for direct training.
             self.model.eval()  
 
-            logger.info("Global Topology successfully initialized (Adapters Active).")
+            logger.info("Global Model successfully initialized with Adapters.")
 
         except ImportError as e:
             logger.warning(f"Import failed ({e}) — falling back to stub model.")
@@ -303,21 +334,32 @@ class GlobalModel:
         self,
         aggregated_weights: Dict[str, torch.Tensor],
     ) -> None:
-        r"""
-        Ingests the FedAvg approximation into the active PyTorch compute graph.
-        
-        Permits `strict=False` mapping because edge devices communicate strictly 
-        via sparse Parameter-Efficient Fine-Tuning ($\Delta W_{adapter}$) tensors.
+        """
+        Load FedAvg-aggregated weights into the global model.
+
+        Uses ``strict=False`` because clients may only send back the trainable
+        adapter parameters (not the frozen backbone weights). Missing keys
+        (frozen backbone layers) and unexpected keys (if any) are logged for
+        debugging.
+
+        Parameters
+        ----------
+        aggregated_weights : Dict[str, torch.Tensor]
+            The global state dict produced by ``FederatedModelServer.aggregate_weights()``.
+            May be a full state dict or a partial dict containing only adapter
+            parameters.
         """
         if not aggregated_weights:
             logger.warning("Empty structural dictionary submitted. Bypassing update.")
             return
 
         try:
+            # strict=False allows partial state dict loading — essential when
+            # only adapter weights are communicated (backbone remains frozen).
             keys = self.model.load_state_dict(aggregated_weights, strict=False)
             logger.info(
-                f"Global Topology Transmuted. "
-                f"Missing keys (Frozen): {len(keys.missing_keys)}, "
+                f"Global Model Updated. "
+                f"Missing keys: {len(keys.missing_keys)}, "
                 f"Unexpected keys: {len(keys.unexpected_keys)}"
             )
         except Exception as e:
