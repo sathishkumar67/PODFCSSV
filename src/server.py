@@ -83,7 +83,7 @@ class GlobalPrototypeBank:
         if not local_protos_list:
             return self.prototypes
 
-        incoming = torch.cat(local_protos_list, dim=0).to(self.device)
+        incoming = torch.cat([p.to(self.device) for p in local_protos_list], dim=0)
         incoming = F.normalize(incoming, p=2, dim=1)
 
         if self.prototypes.size(0) == 0:

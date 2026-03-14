@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.3] — 2026-03-14
+
+### Fixed
+- **Multi-GPU Device Mismatch (Prototype Merging)**: Resolved a `RuntimeError` during Round 2+ synchronization where `torch.cat` crashed due to prototypes arriving from different GPU accelerators (`cuda:0` vs `cuda:1`). The `GlobalPrototypeBank` now enforces strict hardware alignment for all incoming tensors before synthesis.
+- **Topological Audit**: Verified and documented all tensor aggregation points (cat/stack) across `src/client.py` and `src/server.py` to ensure hardware safety in distributed environments.
+
 ## [0.5.2] — 2026-03-08
 
 ### Fixed
