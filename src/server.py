@@ -208,17 +208,14 @@ class FederatedModelServer:
                 continue 
 
             for i in range(1, num_clients):
-                cid = client_ids[i]
-                client_sd = client_weights_map[cid]
-
                 if key in client_sd:
-                    accumulated_weights += client_sd[key]
+                    accumulated_weights += client_sd[key].to(accumulated_weights.device)
                 elif current_global_weights and key in current_global_weights:
                     logger.warning(
                         f"Parametric absence at key '{key}' for agent {cid}. "
                         "Substituting global invariant."
                     )
-                    accumulated_weights += current_global_weights[key]
+                    accumulated_weights += current_global_weights[key].to(accumulated_weights.device)
                 else:
                     logger.error(
                         f"Fatal node misalignment: Key '{key}' untracked by '{cid}' "

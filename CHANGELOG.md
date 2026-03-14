@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.4] — 2026-03-14
+
+### Fixed
+- **Multi-GPU Device Mismatch (Weight Aggregation)**: Resolved a `RuntimeError` in `FederatedModelServer.aggregate_weights` triggered when client updates were submitted from different GPU device IDs. Parameters are now explicitly aligned to a common hardware target before sum-reduction.
+- **Documentation Refactoring**: Integrated researcher-grade commentary into the server and client orchestration modules to clarify topological synchronization and EMA blending dynamics.
+
 ## [0.5.3] — 2026-03-14
 
 ### Fixed
