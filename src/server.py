@@ -208,7 +208,10 @@ class FederatedModelServer:
                 continue 
 
             for i in range(1, num_clients):
-                if key in client_ids:
+                cid = client_ids[i]
+                client_sd = client_weights_map[cid]
+
+                if key in client_sd:
                     accumulated_weights += client_sd[key].to(accumulated_weights.device)
                 elif current_global_weights and key in current_global_weights:
                     logger.warning(

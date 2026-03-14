@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.5] — 2026-03-14
+
+### Fixed
+- **Aggregation Loop Restoration**: Corrected a `NameError` and logic regression in `FederatedModelServer.aggregate_weights`. Missing `cid` and `client_sd` variables were restored, and the key validation check was fixed to target the correct dictionary keys instead of client indices.
+
 ## [0.5.4] — 2026-03-14
 
 ### Fixed
