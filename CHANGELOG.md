@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Sequential 10-Dataset Experiment** (`new_main.py`): Added a publication-oriented continual-learning entrypoint with two clients, five datasets per client, stage-wise progression, linear-probe evaluation, forgetting analysis, JSON metric exports, checkpoints, and plots.
-- **Cross-Domain Dataset Suite** (`new_main.py`): Replaced the earlier toy multi-dataset mix with a more diverse sequence spanning `EuroSAT`, `PCAM`, `Country211`, `FGVC Aircraft`, `DTD`, `Oxford-IIIT Pet`, `Flowers102`, `Food101`, `GTSRB`, and `SVHN`.
+- **Cross-Domain Dataset Suite** (`new_main.py`): Replaced the earlier toy multi-dataset mix with a more diverse sequence spanning `EuroSAT`, `PCAM`, `FER2013`, `FGVC Aircraft`, `DTD`, `Oxford-IIIT Pet`, `Flowers102`, `Food101`, `GTSRB`, and `SVHN`.
 - **Medical Dataset Dependency Metadata** (`requirements.txt`, `pyproject.toml`): Added `h5py` so the `PCAM` path is reflected in the package metadata.
 
 ### Fixed

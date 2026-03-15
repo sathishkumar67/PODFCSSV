@@ -71,7 +71,7 @@ python new_main.py
 
 This script keeps the same federated-learning math but changes the data schedule:
 
-- Client 0 trains on `EuroSAT`, `PCAM`, `Country211`, `FGVC Aircraft`, and `DTD`.
+- Client 0 trains on `EuroSAT`, `PCAM`, `FER2013`, `FGVC Aircraft`, and `DTD`.
 - Client 1 trains on `Oxford-IIIT Pet`, `Flowers102`, `Food101`, `GTSRB`, and `SVHN`.
 - Each client completes the configured number of rounds on its current dataset before moving to the next one.
 - The global model, global prototypes, local prototypes, and novelty state persist across dataset transitions.

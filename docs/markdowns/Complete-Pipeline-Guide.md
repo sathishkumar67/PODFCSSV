@@ -281,7 +281,7 @@ Current repository experiments:
 - Round schedule: 5 rounds x 40 classes per round by default
 
 # Sequential experiment in new_main.py
-- Client 0: EuroSAT, PCAM, Country211, FGVC Aircraft, DTD
+- Client 0: EuroSAT, PCAM, FER2013, FGVC Aircraft, DTD
 - Client 1: Oxford-IIIT Pet, Flowers102, Food101, GTSRB, SVHN
 - Each client completes one dataset before moving to the next
 - The sequence intentionally spans satellite, medical, geography, texture,

@@ -15,7 +15,7 @@ The dataset mix spans several domains so the experiment showcases robustness
 under strong distribution shifts:
 1. Satellite imagery.
 2. Medical histopathology.
-3. Country and geography recognition.
+3. Facial expression recognition.
 4. Fine-grained aircraft recognition.
 5. Texture recognition.
 6. Pet breeds.
@@ -86,14 +86,14 @@ MULTI_DATASET_CONFIG: Dict[str, Any] = {
 }
 
 CLIENT_DATASET_SEQUENCE: Dict[int, List[str]] = {
-    0: ["eurosat", "pcam", "country211", "fgvcaircraft", "dtd"],
+    0: ["eurosat", "pcam", "fer2013", "fgvcaircraft", "dtd"],
     1: ["oxfordiiitpet", "flowers102", "food101", "gtsrb", "svhn"],
 }
 
 DATASET_DISPLAY_NAMES: Dict[str, str] = {
     "eurosat": "EuroSAT",
     "pcam": "PCAM",
-    "country211": "Country211",
+    "fer2013": "FER2013",
     "fgvcaircraft": "FGVC Aircraft",
     "dtd": "DTD",
     "oxfordiiitpet": "Oxford-IIIT Pet",
@@ -135,7 +135,8 @@ def load_named_dataset(
 
     All datasets come from ``torchvision`` and were chosen to create strong
     cross-domain shifts relative to the Tiny ImageNet baseline while covering
-    satellite, medical, geographic, fine-grained, texture, and traffic domains.
+    satellite, medical, facial-expression, fine-grained, texture, and traffic
+    domains.
     """
     transform = build_dataset_transform(image_size)
     root = Path(data_root) / "multidataset" / dataset_name
@@ -159,8 +160,8 @@ def load_named_dataset(
             download=True,
             transform=transform,
         )
-    if dataset_name == "country211":
-        return datasets.Country211(
+    if dataset_name == "fer2013":
+        return datasets.FER2013(
             root=str(root),
             split="train" if train else "test",
             download=True,
