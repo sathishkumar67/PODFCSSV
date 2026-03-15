@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "podfcssv"
-version = "0.5.5"
+version = "0.6.0"
 description = "Prototype-Oriented Distillation for Federated Continual Self-Supervised Vision"
 readme = "README.md"
 license = {text = "MIT"}
@@ -40,6 +40,8 @@ dependencies = [
     "transformers>=4.30.0",
     "numpy>=1.21.0",
     "scikit-learn>=1.0.0",
+    "matplotlib>=3.5.0",
+    "h5py>=3.8.0",
 ]
 
 [project.optional-dependencies]

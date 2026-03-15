@@ -2,6 +2,16 @@
 ## Federated Continual Self-Supervised Vision via Gated Prototype Anchored Distillation
 ### Full Implementation Guide with All Enhancements
 
+> Update note:
+> The executable source of truth is now `main.py`, `new_main.py`, and the
+> files under `src/`. This guide is retained as a broad research note, but the
+> current implementation uses the corrected GPAD gradient flow, server-to-client
+> weight broadcast, unified embedding extraction, non-dropping sample
+> allocation, and the 10-dataset sequential benchmark described in the README.
+> Sections in this document that discuss optional confidence-scoring
+> enhancements should be read as historical research notes rather than
+> executable features in the current codebase.
+
 ---
 
 ## TABLE OF CONTENTS
@@ -260,21 +270,41 @@ Critical Hyperparameters (tune these):
 
 ## 7.1 Datasets & Splits
 
+Current repository experiments:
+
 ```python
-# Primary dataset: CIFAR-100
-- 100 classes, 50K train, 10K test
-- Image size: 32×32 (resize to 224×224 for ViT)
-- Non-IID split: Dirichlet(α=0.5) across 10 clients
-- Class-incremental: 5 tasks of 20 classes each
+# Baseline experiment in main.py
+- Dataset: Tiny ImageNet
+- 200 classes, 100K train images
+- Image size: 64x64 resized to 224x224 for ViT-MAE
+- Non-IID split: Dirichlet allocation across 2 clients
+- Round schedule: 5 rounds x 40 classes per round by default
 
-# Alternative: Tiny-ImageNet
-- 200 classes, 100K train
-- Image size: 64×64
-- More challenging, larger scale
+# Sequential experiment in new_main.py
+- Client 0: EuroSAT, PCAM, Country211, FGVC Aircraft, DTD
+- Client 1: Oxford-IIIT Pet, Flowers102, Food101, GTSRB, SVHN
+- Each client completes one dataset before moving to the next
+- The sequence intentionally spans satellite, medical, geography, texture,
+  traffic-sign, and fine-grained recognition domains
+```
 
-# For testing domain shift:
-- CIFAR-10 → CIFAR-100 transition
-- Synthetic noise at task boundaries
+The older example block below is retained as a generic research note only.
+
+```python
+# Legacy example block: see the updated repository experiment summary above
+- This legacy note is not the current executable setup
+- The current baseline uses Tiny ImageNet across 2 clients
+- All datasets are resized to 224x224 and normalized for ViT-MAE
+- See README.md for the maintained dataset list and output artifacts
+
+# Current baseline summary
+- Tiny ImageNet remains the baseline dataset in main.py
+- The baseline uses a Dirichlet non-IID split and round-wise class scheduling
+- The sequential benchmark is implemented separately in new_main.py
+
+# For current domain-shift experiments:
+- The repository now uses the 10-dataset sequence listed above
+- Each client completes one dataset before moving to the next
 ```
 
 ## 7.2 Evaluation Protocol

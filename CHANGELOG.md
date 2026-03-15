@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.0] - 2026-03-14
+
+### Added
+- **Sequential 10-Dataset Experiment** (`new_main.py`): Added a publication-oriented continual-learning entrypoint with two clients, five datasets per client, stage-wise progression, linear-probe evaluation, forgetting analysis, JSON metric exports, checkpoints, and plots.
+- **Cross-Domain Dataset Suite** (`new_main.py`): Replaced the earlier toy multi-dataset mix with a more diverse sequence spanning `EuroSAT`, `PCAM`, `Country211`, `FGVC Aircraft`, `DTD`, `Oxford-IIIT Pet`, `Flowers102`, `Food101`, `GTSRB`, and `SVHN`.
+- **Medical Dataset Dependency Metadata** (`requirements.txt`, `pyproject.toml`): Added `h5py` so the `PCAM` path is reflected in the package metadata.
+
+### Fixed
+- **GPAD Gradient Flow** (`src/client.py`): GPAD now operates on gradient-carrying embeddings while routing logic uses a detached copy, so the adapter updates reflect both MAE reconstruction and prototype distillation.
+- **Server Broadcast Step** (`main.py`, `new_main.py`, `src/client.py`): The latest aggregated adapter weights are now synchronized back into every client before the next communication round.
+- **FedAvg Aggregation Robustness** (`src/server.py`): Rewrote the server aggregation loop so multi-client training averages the submitted state dicts correctly and uses the global state only as a safe fallback for missing keys.
+- **Unified Embedding Definition** (`src/client.py`): Initial prototype generation and later GPAD routing now use the same pooled encoder representation.
+- **Non-Dropping Dirichlet Allocation** (`main.py`): Client sample counts now use a largest-remainder allocation so class samples are not silently discarded after integer rounding.
+- **Adapter Wrapper Forwarding** (`src/mae_with_adapter.py`): Wrapped transformer blocks now forward all positional and keyword arguments to preserve original block behavior.
+- **Local Epoch Handling** (`src/client.py`, `main.py`, `new_main.py`): The configured `local_epochs` value is now honored during client-side training.
+- **ViT-MAE Preprocessing Alignment** (`main.py`, `new_main.py`): Dataset transforms now convert inputs to RGB and normalize them with the mean and standard deviation expected by `facebook/vit-mae-base`.
+
+---
+
 ## [0.5.5] — 2026-03-14
 
 ### Fixed
