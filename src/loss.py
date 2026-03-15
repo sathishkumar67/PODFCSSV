@@ -1,53 +1,48 @@
-r"""
-Gated Prototype Anchored Distillation (GPAD) formulation.
+"""Loss functions used by the federated continual learning pipeline.
 
-This module provides the core metric-learning regularization objective 
-to mitigate catastrophic forgetting in Federated Continual Learning. 
-Rather than relying on computationally heavy generative replay or rigid 
-weight-consolidation methods (e.g., EWC), GPAD anchors client representations 
-directly to a dynamic, non-parametric global prototype bank living on the 
-hypersphere.
+This module contains the implementation of Gated Prototype Anchored
+Distillation (GPAD). GPAD is the regularizer that keeps client embeddings close
+to the global prototype bank only when the match is confident enough.
 
-Theoretical Framework
----------------------
-Given an $L_2$-normalized feature vector $z_i \in \mathbb{R}^D$ and a globally 
-aggregated prototype bank $V \in \mathbb{R}^{M \times D}$, GPAD computes a 
-confidence-gated distillation loss:
-
-    \mathcal{L}_{GPAD}(z_i) = g(z_i) \cdot \mathbb{D}(z_i, v^*)
-
-Where:
-- $\mathbb{D}(z_i, v^*) = 2(1 - \cos(z_i, v^*))$ is the squared Euclidean distance.
-- $v^* = \arg\max_{v \in V} \cos(z_i, v)$ is the nearest neighbor prototype.
-- $g(z_i) \in [0, 1]$ is a routing gate combining a structural Heaviside step 
-  function with a Sigmoid smoothing transition, activated only when the similarity 
-  to $v^*$ exceeds an entropy-adaptive threshold $\tau(z_i)$.
-
-Adaptive Entropy Thresholding
------------------------------
-To prevent degenerate feature collapse (forcing $z_i$ into ambiguous or incorrect 
-prototypes), $\tau$ is dynamically penalized by the normalized Shannon Entropy 
-of the assignment distribution:
-
-    \tau(z_i) = \tau_{base} + \lambda_{H} \frac{\mathcal{H}(\text{softmax}(S / T))}{\log M}
-
-High entropy $\mathcal{H}$ indicates categorical ambiguity, raising $\tau$ to 
-reject the anchoring. Low entropy indicates a high-confidence semantic match, 
-lowering $\tau$ to allow gradient flow.
+The implementation follows the paper's sequence exactly:
+1. L2-normalize the client embeddings and the global prototypes.
+2. Compute cosine similarities between every embedding and every prototype.
+3. Build a soft assignment distribution over the prototype bank.
+4. Convert the assignment entropy into an adaptive anchor threshold.
+5. Mark an embedding as anchored when its best similarity is greater than or
+   equal to that threshold.
+6. Apply a smooth sigmoid gate on top of the hard anchor decision.
+7. Penalize anchored embeddings with squared Euclidean distance on the unit
+   sphere, which simplifies to ``2 * (1 - cosine_similarity)``.
 """
 
 from __future__ import annotations
+
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
 
 
 class GPADLoss(nn.Module):
-    r"""
-    Gated Prototype Anchored Distillation Objective.
-    
-    Operates explicitly on $L_2$-normalized dense embeddings.
+    """Compute the GPAD objective for a mini-batch of embeddings.
+
+    Parameters
+    ----------
+    base_tau:
+        Base cosine-similarity threshold used when the assignment entropy is
+        zero.
+    temp_gate:
+        Temperature of the sigmoid gate. Smaller values make the transition
+        around the threshold steeper.
+    lambda_entropy:
+        Multiplier applied to the normalized entropy when building the adaptive
+        threshold.
+    soft_assign_temp:
+        Temperature used inside the prototype softmax assignment.
+    epsilon:
+        Small constant used to avoid ``log(0)`` and division-by-zero issues.
     """
 
     def __init__(
@@ -57,20 +52,7 @@ class GPADLoss(nn.Module):
         lambda_entropy: float = 0.1,
         soft_assign_temp: float = 0.1,
         epsilon: float = 1e-8,
-    ):
-        r"""
-        Hyperparameter configuration.
-        
-        Args:
-            base_tau: $\tau_{base}$, the absolute minimum cosine similarity 
-                      required to trigger anchoring at zero entropy.
-            temp_gate: Sigmoid temperature scalar controlling the Lipschitz 
-                       constant of the gating gradient near the threshold plane.
-            lambda_entropy: $\lambda_H$, scaling coefficient for the entropy penalty.
-            soft_assign_temp: $T$, the temperature defining the sharpness of the 
-                              prototype assignment distribution.
-            epsilon: Numerical stability dampener.
-        """
+    ) -> None:
         super().__init__()
         self.base_tau = base_tau
         self.temp_gate = temp_gate
@@ -83,98 +65,79 @@ class GPADLoss(nn.Module):
         embeddings: torch.Tensor,
         global_prototypes: torch.Tensor,
     ) -> torch.Tensor:
-        r"""
-        Compute the mean mini-batch GPAD objective.
-        
-        Args:
-            embeddings: $Z \in \mathbb{R}^{B \times D}$
-            global_prototypes: $V \in \mathbb{R}^{M \times D}$
-            
-        Returns:
-            Scalar objective $\mathcal{L}$.
+        """Return the mean GPAD loss for the provided embeddings.
+
+        The function returns a zero-valued tensor that remains connected to the
+        graph when the prototype bank is empty. That keeps the training loop
+        simple and avoids special-case loss handling in the caller.
         """
-        # Edge case: Federated round 1 has an empty global bank |V| = 0
-        if global_prototypes.size(0) == 0:
-            return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
+        if global_prototypes.size(0) == 0 or embeddings.size(0) == 0:
+            return embeddings.sum() * 0.0
 
-        # 1. Cosine similarity mapping
-        sims = self._compute_similarity_matrix(embeddings, global_prototypes)
-
-        # 2. Entropy-adaptive threshold generation
-        tau_adaptive = self._compute_adaptive_threshold(sims)
-
-        # 3. Heaviside/Sigmoid routing modulation
-        max_sim, gate = self._compute_gating(sims, tau_adaptive)
-
-        # 4. Squared Euclidean projection
-        loss = self._compute_anchored_loss(max_sim, gate)
-        return loss
+        similarities = self._compute_similarity_matrix(
+            embeddings=embeddings,
+            prototypes=global_prototypes,
+        )
+        tau_adaptive = self._compute_adaptive_threshold(similarities)
+        max_similarity, gate = self._compute_gating(similarities, tau_adaptive)
+        return self._compute_anchored_loss(max_similarity, gate)
 
     def _compute_similarity_matrix(
         self,
         embeddings: torch.Tensor,
         prototypes: torch.Tensor,
     ) -> torch.Tensor:
-        r"""
-        $S = \frac{Z}{\|Z\|_2} \left(\frac{V}{\|V\|_2}\right)^T$
+        """Compute the cosine-similarity matrix ``[batch, num_prototypes]``."""
+        normalized_embeddings = F.normalize(embeddings, p=2, dim=1)
+        normalized_prototypes = F.normalize(prototypes, p=2, dim=1)
+        return torch.mm(normalized_embeddings, normalized_prototypes.t())
+
+    def _compute_adaptive_threshold(self, similarities: torch.Tensor) -> torch.Tensor:
+        """Convert prototype-assignment entropy into an adaptive threshold.
+
+        When there is only one prototype in the bank, the assignment entropy is
+        always zero. In that case the adaptive threshold collapses cleanly to
+        ``base_tau``.
         """
-        z = F.normalize(embeddings, p=2, dim=1)
-        p = F.normalize(prototypes, p=2, dim=1)
-        return torch.mm(z, p.t())
+        batch_size, num_prototypes = similarities.shape
+        if num_prototypes <= 1:
+            return similarities.new_full((batch_size,), self.base_tau)
 
-    def _compute_adaptive_threshold(self, sims: torch.Tensor) -> torch.Tensor:
-        r"""
-        Computes $\tau(z_i)$ via Maximum Entropy penalization.
-        """
-        B, M = sims.shape
-
-        # Parametric softmax distribution
-        softmax_all = F.softmax(sims / self.soft_assign_temp, dim=1)
-
-        # Shannon Entropy vector $H \\in \mathbb{R}^B$
+        assignment = F.softmax(similarities / self.soft_assign_temp, dim=1)
         entropy = -torch.sum(
-            softmax_all * torch.log(softmax_all.clamp(min=self.epsilon)), dim=1
+            assignment * torch.log(assignment.clamp(min=self.epsilon)),
+            dim=1,
         )
-
-        # Min-max normalize against the uniform continuous distribution log(M)
-        max_ent = torch.log(torch.tensor(float(M), device=sims.device))
-        ent_norm = entropy / (max_ent + self.epsilon)
-
-        return self.base_tau + self.lambda_entropy * ent_norm
+        max_entropy = torch.log(
+            similarities.new_tensor(float(num_prototypes)).clamp(min=1.0)
+        )
+        normalized_entropy = entropy / max_entropy.clamp(min=self.epsilon)
+        return self.base_tau + self.lambda_entropy * normalized_entropy
 
     def _compute_gating(
         self,
-        sims: torch.Tensor,
+        similarities: torch.Tensor,
         tau_adaptive: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        r"""
-        Evaluate the continuous routing gate $g \in [0, 1]$.
+        """Return the best similarity and the final GPAD gate.
+
+        The paper defines the anchor condition with ``>=``. The implementation
+        matches that exactly so the code and the equations now share the same
+        boundary behavior.
         """
-        max_sim, _ = sims.max(dim=1)
-
-        # Step function prevents arbitrary gradient injection from noise
-        is_anchored = (max_sim > tau_adaptive).to(max_sim.dtype)
-
-        # Sigmoid relaxation enforces $C^1$ continuity near the decision boundary
-        gate_logit = max_sim - tau_adaptive
-        gate_sigmoid = torch.sigmoid(gate_logit / self.temp_gate)
-
-        gate = gate_sigmoid * is_anchored
-        return max_sim, gate
+        max_similarity, _ = similarities.max(dim=1)
+        hard_anchor = (max_similarity >= tau_adaptive).to(max_similarity.dtype)
+        soft_gate = torch.sigmoid((max_similarity - tau_adaptive) / self.temp_gate)
+        return max_similarity, hard_anchor * soft_gate
 
     def _compute_anchored_loss(
         self,
-        max_sim: torch.Tensor,
+        max_similarity: torch.Tensor,
         gate: torch.Tensor,
     ) -> torch.Tensor:
-        r"""
-        Compute the gated distance objective.
-        Because $\|z\|=\|v^*\|=1$, distance simplifies algebraically to cosine derivation.
-        """
-        # Squared Euclidean proxy: $2(1 - S_{max})$
-        dist_sq = 2.0 * (1.0 - max_sim)
-        loss_per_sample = gate * dist_sq
-        return loss_per_sample.mean()
+        """Compute the gated squared Euclidean distance on the unit sphere."""
+        squared_distance = 2.0 * (1.0 - max_similarity)
+        return (gate * squared_distance).mean()
 
     @torch.no_grad()
     def compute_anchor_mask(
@@ -182,19 +145,19 @@ class GPADLoss(nn.Module):
         embeddings: torch.Tensor,
         global_prototypes: torch.Tensor,
     ) -> torch.Tensor:
-        r"""
-        Inference-mode boolean extraction of the gating step function.
-        Used by the local Client routing layer to direct non-anchored features 
-        towards the stochastic Novelty Buffer.
+        """Return a boolean mask that marks which embeddings are anchored.
+
+        The caller uses this mask only for routing decisions. No gradients are
+        required here, so the method stays in inference mode.
         """
-        if global_prototypes.size(0) == 0:
+        if global_prototypes.size(0) == 0 or embeddings.size(0) == 0:
             return torch.zeros(
-                embeddings.size(0), dtype=torch.bool, device=embeddings.device
+                embeddings.size(0),
+                dtype=torch.bool,
+                device=embeddings.device,
             )
 
-        sims = self._compute_similarity_matrix(embeddings, global_prototypes)
-        tau_adaptive = self._compute_adaptive_threshold(sims)
-        max_sim, _ = sims.max(dim=1)
-        
-        return max_sim > tau_adaptive
-
+        similarities = self._compute_similarity_matrix(embeddings, global_prototypes)
+        tau_adaptive = self._compute_adaptive_threshold(similarities)
+        max_similarity, _ = similarities.max(dim=1)
+        return max_similarity >= tau_adaptive

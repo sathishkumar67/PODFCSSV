@@ -1,44 +1,32 @@
-"""
-PODFCSSV — Prototype-Oriented Distillation for Federated Continual Self-Supervised Vision.
+"""Public exports for the PODFCSSV package.
 
-Public API Exports
-------------------
-Loss:
-    GPADLoss            — Gated Prototype Anchored Distillation loss
-
-Server:
-    GlobalPrototypeBank — EMA-based global prototype management
-    FederatedModelServer — FedAvg weight aggregation
-    GlobalModel         — Server-side model wrapper
-    run_server_round    — Single-round server orchestrator
-
-Client:
-    FederatedClient     — Single edge-device simulation
-    ClientManager       — Multi-GPU client orchestrator
-
-Adapters:
-    IBA_Adapter         — Information-Bottlenecked Adapter module
-    inject_adapters     — Adapter injection into frozen ViT-MAE
+The package is intentionally small, so the top-level namespace re-exports the
+main building blocks used by the training scripts:
+1. Adapter injection and adapter modules.
+2. GPAD loss.
+3. Client-side training utilities.
+4. Server-side aggregation utilities.
 """
 
+from src.client import ClientManager, FederatedClient
 from src.loss import GPADLoss
+from src.mae_with_adapter import IBA_Adapter, ViTBlockWithAdapter, inject_adapters
 from src.server import (
-    GlobalPrototypeBank,
     FederatedModelServer,
     GlobalModel,
+    GlobalPrototypeBank,
     run_server_round,
 )
-from src.client import FederatedClient, ClientManager
-from src.mae_with_adapter import IBA_Adapter, inject_adapters
 
 __all__ = [
-    "GPADLoss",
-    "GlobalPrototypeBank",
+    "ClientManager",
+    "FederatedClient",
     "FederatedModelServer",
     "GlobalModel",
-    "run_server_round",
-    "FederatedClient",
-    "ClientManager",
+    "GlobalPrototypeBank",
+    "GPADLoss",
     "IBA_Adapter",
+    "ViTBlockWithAdapter",
     "inject_adapters",
+    "run_server_round",
 ]
