@@ -9,7 +9,7 @@ This repository implements a federated continual self-supervised learning pipeli
 - `main.py`
   Runs the paper-aligned Tiny ImageNet baseline with a Dirichlet non-IID client split.
 - `new_main.py`
-  Runs a sequential continual-learning experiment with 10 diverse non-ImageNet datasets, 5 datasets per client, stage-wise linear evaluation, forgetting analysis, saved plots, JSON metrics, and checkpoints.
+  Runs a sequential continual-learning experiment with 10 diverse non-ImageNet datasets, 5 datasets per client, stage-wise linear evaluation, final-only artifact saving, dataset cleanup after each stage, saved plots, JSON metrics, and a final checkpoint.
 - `src/mae_with_adapter.py`
   Freezes the backbone and injects adapters into the upper half of the transformer.
 - `src/loss.py`
@@ -79,12 +79,11 @@ This script keeps the same federated-learning math but changes the data schedule
 
 Additional outputs from `new_main.py`:
 
-- Per-stage linear-probe evaluation on every seen dataset
+- Per-stage linear-probe evaluation on the current stage datasets
 - Final per-dataset accuracy
-- Forgetting per dataset
 - Accuracy heatmap
 - Final-accuracy bar chart
-- Forgetting bar chart
+- Automatic dataset cleanup after each stage
 
 Outputs are written under:
 
@@ -111,7 +110,7 @@ Both entrypoints save:
 - Stage-by-stage evaluation history
 - Linear-probe accuracy heatmap
 - Final accuracy chart
-- Forgetting chart
+- A final adapter checkpoint without duplicate training-history payloads
 
 ## Configuration
 
@@ -143,6 +142,7 @@ Important fields:
 - The multi-dataset script intentionally uses datasets outside ImageNet-1K so it does not reuse the MAE pre-training dataset itself.
 - `PCAM` uses an HDF5-backed dataset reader, so `h5py` is included in the project dependencies.
 - Only trainable adapter parameters are exchanged during federation; the frozen MAE backbone is never averaged.
+- `new_main.py` saves its checkpoint, metric JSON, and plots only after training finishes, and deletes finished stage datasets to reduce local storage usage.
 
 ## License
 
