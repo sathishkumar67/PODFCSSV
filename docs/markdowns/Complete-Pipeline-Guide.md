@@ -286,6 +286,7 @@ Current repository experiments:
 - Each client completes one dataset before moving to the next
 - The sequence intentionally spans satellite, medical, geography, texture,
   traffic-sign, and fine-grained recognition domains
+- Finished stage datasets are deleted after evaluation to reduce local storage
 ```
 
 The older example block below is retained as a generic research note only.
@@ -310,11 +311,11 @@ The older example block below is retained as a generic research note only.
 ## 7.2 Evaluation Protocol
 
 ```python
-# After each task:
-1. Accuracy on all seen tasks
-2. Forgetting measure: drop in old task accuracy
-3. Backward transfer: improvement in old tasks from new learning
-4. Forward transfer: improvement in new task from old knowledge
+# Current new_main.py evaluation flow:
+1. Linear-probe accuracy on the current stage datasets
+2. Average stage accuracy across the active datasets
+3. Final per-dataset accuracy summary at the end of the run
+4. Forgetting is not computed in the storage-saving workflow because finished datasets are deleted after each stage
 
 # Communication tracking:
 1. Bytes sent per round (adapters + prototypes)
