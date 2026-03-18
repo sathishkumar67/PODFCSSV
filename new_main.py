@@ -24,17 +24,20 @@ under strong distribution shifts:
 9. Traffic signs.
 10. Street-view house numbers.
 
-The script also adds publication-oriented reporting:
-1. Per-round training metrics and communication tracking.
-2. Per-stage linear-probe evaluation on every seen dataset.
-3. Final accuracy and forgetting summaries.
-4. Plots saved to disk for later inclusion in the paper.
+The script also adds publication-oriented reporting while keeping disk usage
+under control:
+1. Per-round training metrics and communication tracking are kept in memory.
+2. Per-stage linear-probe evaluation runs only on the datasets used in that stage.
+3. The final checkpoint and summary artifacts are saved after training finishes.
+4. Stage datasets are deleted from disk after they are no longer needed.
 """
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -255,6 +258,34 @@ def create_standard_dataloader(
     )
 
 
+def delete_downloaded_dataset(dataset_name: str, data_root: str) -> None:
+    """Delete a finished dataset from disk to reclaim local storage."""
+    dataset_root = Path(data_root) / "multidataset" / dataset_name
+    if not dataset_root.exists():
+        return
+
+    for attempt in range(1, 4):
+        try:
+            shutil.rmtree(dataset_root)
+            logger.info(
+                "Deleted dataset directory | dataset=%s | path=%s",
+                dataset_name,
+                dataset_root,
+            )
+            return
+        except OSError as exc:
+            if attempt == 3:
+                logger.warning(
+                    "Could not delete dataset directory | dataset=%s | path=%s | error=%s",
+                    dataset_name,
+                    dataset_root,
+                    exc,
+                )
+                return
+            gc.collect()
+            time.sleep(1.0)
+
+
 def pool_model_hidden_states(hidden_states: torch.Tensor) -> torch.Tensor:
     """Apply the same embedding pooling rule used by the training clients."""
     if hidden_states.size(1) > 1:
@@ -368,14 +399,14 @@ def run_linear_probe(
     return correct / total if total > 0 else 0.0
 
 
-def evaluate_seen_datasets(
+def evaluate_datasets(
     model: nn.Module,
-    seen_dataset_names: List[str],
+    dataset_names: List[str],
     config: Dict[str, Any],
 ) -> Dict[str, float]:
-    """Run linear-probe evaluation on every dataset seen so far."""
+    """Run linear-probe evaluation on the provided dataset names."""
     results: Dict[str, float] = {}
-    for dataset_name in seen_dataset_names:
+    for dataset_name in dataset_names:
         train_dataset = load_named_dataset(
             dataset_name=dataset_name,
             data_root=config["data_root"],
@@ -428,31 +459,6 @@ def evaluate_seen_datasets(
         )
 
     return results
-
-
-def compute_forgetting(
-    stage_evaluations: List[Dict[str, Any]],
-    dataset_first_seen_stage: Dict[str, int],
-) -> Tuple[Dict[str, float], float]:
-    """Compute per-dataset and average forgetting from stage evaluations."""
-    forgetting: Dict[str, float] = {}
-    if not stage_evaluations:
-        return forgetting, 0.0
-
-    for dataset_name, first_stage in dataset_first_seen_stage.items():
-        accuracies = [
-            stage_result["accuracies"][dataset_name]
-            for stage_result in stage_evaluations
-            if stage_result["stage"] >= first_stage
-            and dataset_name in stage_result["accuracies"]
-        ]
-        if accuracies:
-            forgetting[dataset_name] = max(accuracies) - accuracies[-1]
-
-    average_forgetting = (
-        sum(forgetting.values()) / len(forgetting) if forgetting else 0.0
-    )
-    return forgetting, average_forgetting
 
 
 def save_evaluation_history(
@@ -535,35 +541,6 @@ def plot_final_accuracy_bar(
     return figure_path
 
 
-def plot_forgetting_bar(
-    evaluation_history: Dict[str, Any],
-    plots_dir: Path,
-) -> Path:
-    """Plot forgetting for each dataset."""
-    forgetting = evaluation_history.get("forgetting", {})
-    if not forgetting:
-        return plots_dir / "new_main_forgetting.png"
-
-    dataset_names = list(forgetting.keys())
-    forgetting_values = [forgetting[name] for name in dataset_names]
-
-    figure, axis = plt.subplots(figsize=(12, 6))
-    axis.bar(
-        [DATASET_DISPLAY_NAMES[name] for name in dataset_names],
-        forgetting_values,
-    )
-    axis.set_title("Forgetting After Sequential Multi-Dataset Training")
-    axis.set_xlabel("Dataset")
-    axis.set_ylabel("Forgetting")
-    axis.tick_params(axis="x", rotation=45)
-    figure.tight_layout()
-
-    figure_path = plots_dir / "new_main_forgetting.png"
-    figure.savefig(figure_path, dpi=200, bbox_inches="tight")
-    plt.close(figure)
-    return figure_path
-
-
 def initialize_evaluation_history(config: Dict[str, Any]) -> Dict[str, Any]:
     """Create the history container used for stage evaluation."""
     return {
@@ -577,10 +554,12 @@ def initialize_evaluation_history(config: Dict[str, Any]) -> Dict[str, Any]:
             for dataset_name in stage_pair
         ],
         "stage_results": [],
-        "dataset_first_seen_stage": {},
         "final_accuracy": {},
         "forgetting": {},
-        "average_forgetting": 0.0,
+        "average_forgetting": None,
+        "forgetting_note": (
+            "Not computed because each stage dataset is deleted after use to save disk space."
+        ),
     }
 
 
@@ -661,12 +640,6 @@ def main() -> None:
             )
             for dataset in stage_datasets
         ]
-
-        for dataset_name in stage_dataset_names:
-            evaluation_history["dataset_first_seen_stage"].setdefault(
-                dataset_name,
-                stage_number,
-            )
 
         for stage_round in range(1, config["rounds_per_dataset"] + 1):
             global_round_idx += 1
@@ -765,30 +738,9 @@ def main() -> None:
                 }
             )
 
-            save_checkpoint(
-                checkpoint_dir=output_dirs["checkpoints"],
-                round_idx=global_round_idx,
-                base_model=base_model,
-                proto_bank=proto_bank,
-                training_history=training_history,
-                config=config,
-                is_final=False,
-            )
-            save_history(training_history, output_dirs["metrics"])
-            plot_training_history(
-                training_history,
-                output_dirs["plots"],
-                prefix="new_main",
-            )
-
-        seen_dataset_names = []
-        for client_index in range(config["num_clients"]):
-            seen_dataset_names.extend(CLIENT_DATASET_SEQUENCE[client_index][:stage_number])
-        seen_dataset_names = list(dict.fromkeys(seen_dataset_names))
-
-        stage_accuracies = evaluate_seen_datasets(
+        stage_accuracies = evaluate_datasets(
             model=base_model,
-            seen_dataset_names=seen_dataset_names,
+            dataset_names=stage_dataset_names,
             config=config,
         )
         average_accuracy = (
@@ -804,19 +756,17 @@ def main() -> None:
                 "average_accuracy": average_accuracy,
             }
         )
+        evaluation_history["final_accuracy"].update(stage_accuracies)
+        evaluation_history["forgetting"] = {}
+        evaluation_history["average_forgetting"] = None
 
-        forgetting, average_forgetting = compute_forgetting(
-            stage_evaluations=evaluation_history["stage_results"],
-            dataset_first_seen_stage=evaluation_history["dataset_first_seen_stage"],
-        )
-        evaluation_history["final_accuracy"] = stage_accuracies
-        evaluation_history["forgetting"] = forgetting
-        evaluation_history["average_forgetting"] = average_forgetting
-
-        save_evaluation_history(evaluation_history, output_dirs["metrics"])
-        plot_accuracy_heatmap(evaluation_history, output_dirs["plots"])
-        plot_final_accuracy_bar(evaluation_history, output_dirs["plots"])
-        plot_forgetting_bar(evaluation_history, output_dirs["plots"])
+        del stage_dataloaders
+        del stage_datasets
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        for dataset_name in stage_dataset_names:
+            delete_downloaded_dataset(dataset_name, config["data_root"])
 
     save_checkpoint(
         checkpoint_dir=output_dirs["checkpoints"],
@@ -826,7 +776,17 @@ def main() -> None:
         training_history=training_history,
         config=config,
         is_final=True,
+        include_training_history=False,
     )
+    save_history(training_history, output_dirs["metrics"])
+    save_evaluation_history(evaluation_history, output_dirs["metrics"])
+    plot_training_history(
+        training_history,
+        output_dirs["plots"],
+        prefix="new_main",
+    )
+    plot_accuracy_heatmap(evaluation_history, output_dirs["plots"])
+    plot_final_accuracy_bar(evaluation_history, output_dirs["plots"])
 
 
 if __name__ == "__main__":
