@@ -432,17 +432,19 @@ def save_checkpoint(
     training_history: Dict[str, Any],
     config: Dict[str, Any],
     is_final: bool = False,
+    include_training_history: bool = True,
 ) -> Path:
-    """Save the trainable model weights, prototypes, history, and config."""
+    """Save the trainable model weights, prototypes, config, and optional history."""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint = {
         "round": round_idx,
         "model_state_dict": extract_trainable_state_dict(base_model),
         "global_prototypes": proto_bank.get_prototypes().detach().cpu(),
-        "training_history": training_history,
         "config": serialize_config(config),
     }
+    if include_training_history:
+        checkpoint["training_history"] = training_history
 
     filename = "final_model.pt" if is_final else f"round_{round_idx}.pt"
     checkpoint_path = checkpoint_dir / filename
