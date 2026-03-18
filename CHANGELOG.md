@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+- **Storage-First Sequential Artifacts** (`new_main.py`, `main.py`): The 10-dataset sequential entrypoint now saves only a final checkpoint after training, keeps metric/plot generation until the end of the run, and omits duplicate `training_history` payloads from its final checkpoint to reduce disk usage.
+- **Stage Dataset Cleanup** (`new_main.py`): Finished sequential datasets are now deleted from `data_root/multidataset/<dataset_name>` after stage evaluation, with retry logic to better handle transient Windows file locks.
+
+### Documentation
+- **Sequential Experiment Docs** (`README.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Updated the repository documentation to match the current storage-saving `new_main.py` behavior, including current-stage-only evaluation and the removal of forgetting plots from the active workflow.
+
 ## [0.6.0] - 2026-03-14
 
 ### Added
