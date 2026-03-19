@@ -40,9 +40,8 @@ def parse_args() -> argparse.Namespace:
         description="Evaluate a saved adapter checkpoint against the base Hugging Face model.",
     )
     parser.add_argument(
-        "--checkpoint",
+        "saved_model_path",
         type=Path,
-        default=Path("multidataset_outputs/checkpoints/final_model.pt"),
         help="Path to the saved fine-tuned checkpoint.",
     )
     parser.add_argument(
@@ -207,17 +206,17 @@ def save_results(
 def main() -> None:
     """Evaluate the saved fine-tuned checkpoint against the base model."""
     args = parse_args()
-    config = build_runtime_config(args.checkpoint)
+    config = build_runtime_config(args.saved_model_path)
     set_random_seed(config.get("seed"))
 
     logger.info(
         "Starting evaluation | checkpoint=%s | device=%s | datasets=%s",
-        args.checkpoint,
+        args.saved_model_path,
         config["device"],
         ", ".join(DATASET_DISPLAY_NAMES[name] for name in args.datasets),
     )
 
-    finetuned_model = load_finetuned_model(args.checkpoint, config)
+    finetuned_model = load_finetuned_model(args.saved_model_path, config)
     finetuned_results = evaluate_model(
         model=finetuned_model,
         model_name="Fine-tuned",
@@ -248,7 +247,7 @@ def main() -> None:
     if args.output_json is not None:
         save_results(
             output_path=args.output_json,
-            checkpoint_path=args.checkpoint,
+            checkpoint_path=args.saved_model_path,
             dataset_names=args.datasets,
             base_results=base_results,
             finetuned_results=finetuned_results,
