@@ -57,6 +57,7 @@ from main import (
     initialize_history,
     plot_training_history,
     prepare_output_dirs,
+    print_round_summary,
     resolve_runtime_config,
     save_checkpoint,
     save_history,
@@ -563,6 +564,15 @@ def main() -> None:
     resolve_runtime_config(config)
     set_random_seed(config["seed"])
     output_dirs = prepare_output_dirs(config["save_dir"])
+    total_rounds = len(CLIENT_DATASET_SEQUENCE[0]) * config["rounds_per_dataset"]
+    logger.info(
+        "Starting sequential run | device=%s | stages=%s | rounds_per_dataset=%s | total_rounds=%s | output_dir=%s",
+        config["device"],
+        len(CLIENT_DATASET_SEQUENCE[0]),
+        config["rounds_per_dataset"],
+        total_rounds,
+        output_dirs["root"],
+    )
 
     proto_bank = GlobalPrototypeBank(
         embedding_dim=config["embedding_dim"],
@@ -613,6 +623,11 @@ def main() -> None:
             DATASET_DISPLAY_NAMES[stage_dataset_names[0]],
             DATASET_DISPLAY_NAMES[stage_dataset_names[1]],
         )
+        logger.info(
+            "Loading datasets for stage %s/%s...",
+            stage_number,
+            num_stages,
+        )
 
         stage_datasets = [
             load_named_dataset(
@@ -634,10 +649,26 @@ def main() -> None:
             )
             for dataset in stage_datasets
         ]
+        logger.info(
+            "Datasets ready | client_0=%s (%s samples) | client_1=%s (%s samples)",
+            DATASET_DISPLAY_NAMES[stage_dataset_names[0]],
+            len(stage_datasets[0]),
+            DATASET_DISPLAY_NAMES[stage_dataset_names[1]],
+            len(stage_datasets[1]),
+        )
 
         for stage_round in range(1, config["rounds_per_dataset"] + 1):
             global_round_idx += 1
             round_start = time.time()
+            logger.info(
+                "Stage %s/%s | stage_round %s/%s | global_round %s/%s | syncing clients and starting training",
+                stage_number,
+                num_stages,
+                stage_round,
+                config["rounds_per_dataset"],
+                global_round_idx,
+                total_rounds,
+            )
             client_manager.sync_clients(current_global_weights)
 
             download_bytes = config["num_clients"] * (
@@ -731,7 +762,31 @@ def main() -> None:
                     "results": client_results,
                 }
             )
+            logger.info(
+                "Completed stage %s/%s round %s/%s | datasets=(%s, %s) | client_prototypes=%s",
+                stage_number,
+                num_stages,
+                stage_round,
+                config["rounds_per_dataset"],
+                DATASET_DISPLAY_NAMES[stage_dataset_names[0]],
+                DATASET_DISPLAY_NAMES[stage_dataset_names[1]],
+                client_prototype_counts,
+            )
+            print_round_summary(
+                round_idx=global_round_idx,
+                num_rounds=total_rounds,
+                client_results=client_results,
+                proto_bank=proto_bank,
+                round_time=round_time,
+                upload_bytes=upload_bytes,
+                download_bytes=download_bytes,
+            )
 
+        logger.info(
+            "Evaluating stage %s/%s on current datasets...",
+            stage_number,
+            num_stages,
+        )
         stage_accuracies = evaluate_datasets(
             model=base_model,
             dataset_names=stage_dataset_names,
@@ -753,7 +808,22 @@ def main() -> None:
         evaluation_history["final_accuracy"].update(stage_accuracies)
         evaluation_history["forgetting"] = {}
         evaluation_history["average_forgetting"] = None
+        logger.info(
+            "Stage %s/%s evaluation complete | avg_accuracy=%.4f | %s=%.4f | %s=%.4f",
+            stage_number,
+            num_stages,
+            average_accuracy,
+            DATASET_DISPLAY_NAMES[stage_dataset_names[0]],
+            stage_accuracies.get(stage_dataset_names[0], 0.0),
+            DATASET_DISPLAY_NAMES[stage_dataset_names[1]],
+            stage_accuracies.get(stage_dataset_names[1], 0.0),
+        )
 
+        logger.info(
+            "Cleaning up stage %s/%s datasets from memory and disk...",
+            stage_number,
+            num_stages,
+        )
         del stage_dataloaders
         del stage_datasets
         gc.collect()
@@ -762,6 +832,7 @@ def main() -> None:
         for dataset_name in stage_dataset_names:
             delete_downloaded_dataset(dataset_name, config["data_root"])
 
+    logger.info("Training complete | saving final checkpoint, metrics, and plots...")
     save_checkpoint(
         checkpoint_dir=output_dirs["checkpoints"],
         round_idx=global_round_idx,
@@ -781,6 +852,12 @@ def main() -> None:
     )
     plot_accuracy_heatmap(evaluation_history, output_dirs["plots"])
     plot_final_accuracy_bar(evaluation_history, output_dirs["plots"])
+    logger.info(
+        "Run complete | checkpoint=%s | metrics_dir=%s | plots_dir=%s",
+        output_dirs["checkpoints"] / "final_model.pt",
+        output_dirs["metrics"],
+        output_dirs["plots"],
+    )
 
 
 if __name__ == "__main__":
