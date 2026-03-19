@@ -7,7 +7,7 @@
 > files under `src/`. This guide is retained as a broad research note, but the
 > current implementation uses the corrected GPAD gradient flow, server-to-client
 > weight broadcast, unified embedding extraction, non-dropping sample
-> allocation, and the 10-dataset sequential benchmark described in the README.
+> allocation, and the 4-dataset sequential benchmark described in the README.
 > Sections in this document that discuss optional confidence-scoring
 > enhancements should be read as historical research notes rather than
 > executable features in the current codebase.
@@ -281,11 +281,11 @@ Current repository experiments:
 - Round schedule: 5 rounds x 40 classes per round by default
 
 # Sequential experiment in new_main.py
-- Client 0: EuroSAT, PCAM, FER2013, FGVC Aircraft, DTD
-- Client 1: Oxford-IIIT Pet, Flowers102, Food101, GTSRB, SVHN
+- Client 0: EuroSAT, PCAM
+- Client 1: Oxford-IIIT Pet, Flowers102
 - Each client completes one dataset before moving to the next
-- The sequence intentionally spans satellite, medical, geography, texture,
-  traffic-sign, and fine-grained recognition domains
+- The sequence intentionally spans satellite, medical, pet-recognition,
+  and flower-classification domains
 - Finished stage datasets are deleted after evaluation to reduce local storage
 ```
 
@@ -304,7 +304,7 @@ The older example block below is retained as a generic research note only.
 - The sequential benchmark is implemented separately in new_main.py
 
 # For current domain-shift experiments:
-- The repository now uses the 10-dataset sequence listed above
+- The repository now uses the 4-dataset sequence listed above
 - Each client completes one dataset before moving to the next
 ```
 

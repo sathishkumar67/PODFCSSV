@@ -1,11 +1,11 @@
-"""Sequential 10-dataset continual training entrypoint.
+"""Sequential 4-dataset continual training entrypoint.
 
 This script keeps the same federated-learning math as ``main.py`` but replaces
 the Tiny ImageNet schedule with a deliberately diverse two-client benchmark.
 
 The continual schedule is:
 1. There are exactly two clients.
-2. Each client owns five datasets.
+2. Each client owns two datasets.
 3. Every client finishes the configured rounds on its current dataset before
    moving to the next dataset in its sequence.
 4. The global adapter weights, local prototypes, novelty buffers, and global
@@ -15,14 +15,8 @@ The dataset mix spans several domains so the experiment showcases robustness
 under strong distribution shifts:
 1. Satellite imagery.
 2. Medical histopathology.
-3. Facial expression recognition.
-4. Fine-grained aircraft recognition.
-5. Texture recognition.
-6. Pet breeds.
-7. Flower species.
-8. Food categories.
-9. Traffic signs.
-10. Street-view house numbers.
+3. Pet breeds.
+4. Flower species.
 
 The script also adds publication-oriented reporting while keeping disk usage
 under control:
@@ -89,8 +83,8 @@ MULTI_DATASET_CONFIG: Dict[str, Any] = {
 }
 
 CLIENT_DATASET_SEQUENCE: Dict[int, List[str]] = {
-    0: ["eurosat", "pcam", "fer2013", "fgvcaircraft", "dtd"],
-    1: ["oxfordiiitpet", "flowers102", "food101", "gtsrb", "svhn"],
+    0: ["eurosat", "pcam"],
+    1: ["oxfordiiitpet", "flowers102"],
 }
 
 DATASET_DISPLAY_NAMES: Dict[str, str] = {
@@ -564,7 +558,7 @@ def initialize_evaluation_history(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def main() -> None:
-    """Run the 10-dataset sequential continual-learning experiment."""
+    """Run the 4-dataset sequential continual-learning experiment."""
     config = dict(MULTI_DATASET_CONFIG)
     resolve_runtime_config(config)
     set_random_seed(config["seed"])

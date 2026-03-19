@@ -9,7 +9,7 @@ This repository implements a federated continual self-supervised learning pipeli
 - `main.py`
   Runs the paper-aligned Tiny ImageNet baseline with a Dirichlet non-IID client split.
 - `new_main.py`
-  Runs a sequential continual-learning experiment with 10 diverse non-ImageNet datasets, 5 datasets per client, stage-wise linear evaluation, final-only artifact saving, dataset cleanup after each stage, saved plots, JSON metrics, and a final checkpoint.
+  Runs a sequential continual-learning experiment with 4 diverse non-ImageNet datasets, 2 datasets per client, stage-wise linear evaluation, final-only artifact saving, dataset cleanup after each stage, saved plots, JSON metrics, and a final checkpoint.
 - `src/mae_with_adapter.py`
   Freezes the backbone and injects adapters into the upper half of the transformer.
 - `src/loss.py`
@@ -63,7 +63,7 @@ checkpoints/
   plots/
 ```
 
-## Run The 10-Dataset Sequential Experiment
+## Run The 4-Dataset Sequential Experiment
 
 ```bash
 python new_main.py
@@ -71,11 +71,11 @@ python new_main.py
 
 This script keeps the same federated-learning math but changes the data schedule:
 
-- Client 0 trains on `EuroSAT`, `PCAM`, `FER2013`, `FGVC Aircraft`, and `DTD`.
-- Client 1 trains on `Oxford-IIIT Pet`, `Flowers102`, `Food101`, `GTSRB`, and `SVHN`.
+- Client 0 trains on `EuroSAT` and `PCAM`.
+- Client 1 trains on `Oxford-IIIT Pet` and `Flowers102`.
 - Each client completes the configured number of rounds on its current dataset before moving to the next one.
 - The global model, global prototypes, local prototypes, and novelty state persist across dataset transitions.
-- The full sequence spans satellite imagery, medical histopathology, geography, textures, traffic signs, and fine-grained natural-image recognition.
+- The full sequence spans satellite imagery, medical histopathology, pet-breed recognition, and flower classification.
 
 Additional outputs from `new_main.py`:
 
