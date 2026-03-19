@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **Storage-First Sequential Artifacts** (`new_main.py`, `main.py`): The 10-dataset sequential entrypoint now saves only a final checkpoint after training, keeps metric/plot generation until the end of the run, and omits duplicate `training_history` payloads from its final checkpoint to reduce disk usage.
 - **Stage Dataset Cleanup** (`new_main.py`): Finished sequential datasets are now deleted from `data_root/multidataset/<dataset_name>` after stage evaluation, with retry logic to better handle transient Windows file locks.
+- **Balanced Sequential Pairing** (`new_main.py`): The 4-dataset benchmark now pairs `EuroSAT` with `Oxford-IIIT Pet` on one client and `GTSRB` with `FGVC Aircraft` on the other to keep stage workloads closer in size and reduce idle waiting between clients.
 
 ### Documentation
 - **Sequential Experiment Docs** (`README.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Updated the repository documentation to match the current storage-saving `new_main.py` behavior, including current-stage-only evaluation and the removal of forgetting plots from the active workflow.

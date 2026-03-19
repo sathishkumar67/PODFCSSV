@@ -71,11 +71,11 @@ python new_main.py
 
 This script keeps the same federated-learning math but changes the data schedule:
 
-- Client 0 trains on `EuroSAT` and `PCAM`.
-- Client 1 trains on `Oxford-IIIT Pet` and `Flowers102`.
+- Client 0 trains on `EuroSAT` and `Oxford-IIIT Pet`.
+- Client 1 trains on `GTSRB` and `FGVC Aircraft`.
 - Each client completes the configured number of rounds on its current dataset before moving to the next one.
 - The global model, global prototypes, local prototypes, and novelty state persist across dataset transitions.
-- The full sequence spans satellite imagery, medical histopathology, pet-breed recognition, and flower classification.
+- The full sequence spans satellite imagery, traffic-sign recognition, pet-breed recognition, and fine-grained aircraft recognition.
 
 Additional outputs from `new_main.py`:
 

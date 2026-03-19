@@ -281,11 +281,11 @@ Current repository experiments:
 - Round schedule: 5 rounds x 40 classes per round by default
 
 # Sequential experiment in new_main.py
-- Client 0: EuroSAT, PCAM
-- Client 1: Oxford-IIIT Pet, Flowers102
+- Client 0: EuroSAT, Oxford-IIIT Pet
+- Client 1: GTSRB, FGVC Aircraft
 - Each client completes one dataset before moving to the next
-- The sequence intentionally spans satellite, medical, pet-recognition,
-  and flower-classification domains
+- The sequence intentionally spans satellite, traffic-sign, pet-recognition,
+  and fine-grained aircraft-recognition domains
 - Finished stage datasets are deleted after evaluation to reduce local storage
 ```
 

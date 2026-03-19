@@ -14,9 +14,9 @@ The continual schedule is:
 The dataset mix spans several domains so the experiment showcases robustness
 under strong distribution shifts:
 1. Satellite imagery.
-2. Medical histopathology.
+2. Traffic-sign recognition.
 3. Pet breeds.
-4. Flower species.
+4. Fine-grained aircraft recognition.
 
 The script also adds publication-oriented reporting while keeping disk usage
 under control:
@@ -83,9 +83,11 @@ MULTI_DATASET_CONFIG: Dict[str, Any] = {
     "save_dir": "multidataset_outputs",
 }
 
+# Stage pairs are chosen to keep client workloads closer in size so one client
+# is less likely to finish early and wait for the other.
 CLIENT_DATASET_SEQUENCE: Dict[int, List[str]] = {
-    0: ["eurosat", "pcam"],
-    1: ["oxfordiiitpet", "flowers102"],
+    0: ["eurosat", "oxfordiiitpet"],
+    1: ["gtsrb", "fgvcaircraft"],
 }
 
 DATASET_DISPLAY_NAMES: Dict[str, str] = {
