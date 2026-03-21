@@ -1,12 +1,14 @@
-"""Server-side aggregation utilities for the federated pipeline.
+"""Server-side aggregation for adapters and prototypes.
 
-The server has two responsibilities:
-1. Maintain the global prototype bank with the paper's merge-or-add rule.
-2. Aggregate trainable adapter weights with FedAvg followed by optional EMA
-   smoothing across communication rounds.
+The server logic is split into two simple pieces:
+1. Maintain one global prototype bank that merges or appends incoming local
+   prototypes.
+2. Average trainable adapter weights across clients and optionally smooth the
+   update with server-side EMA.
 
-The code in this module is intentionally strict about normalization and device
-placement so prototype math and weight aggregation stay numerically consistent.
+The code stays strict about tensor normalization and device placement so the
+same aggregation path works for both the Tiny ImageNet baseline and the
+multi-dataset sequential run.
 """
 
 from __future__ import annotations
