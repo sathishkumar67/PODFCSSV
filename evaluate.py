@@ -23,12 +23,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
+from torchvision import datasets as tv_datasets
 
 from main import (
     DATASET_DISPLAY_NAMES,
     MULTI_DATASET_CONFIG,
     build_base_model,
+    build_dataset_transform,
     build_dataset_order_by_stage,
     create_standard_dataloader,
     load_named_dataset,
@@ -53,8 +55,6 @@ GENERATED_EVAL_SPLIT_DATASETS = {
     "sun397",
 }
 
-PROBE_TRAIN_CAP_THRESHOLD = 10000
-PROBE_TRAIN_SAMPLE_BUDGET = 4000
 PROBE_MIN_TRAIN_SAMPLES = 1000
 
 
@@ -150,8 +150,7 @@ def load_probe_train_dataset(
 
     The probe-fit rule is:
     1. Skip datasets with fewer than 1,000 train samples.
-    2. Use the full train split when it has 1,000 to 10,000 samples.
-    3. Use a deterministic 4,000-sample subset when the train split is larger.
+    2. Use the full train split for every supported dataset at or above that threshold.
     """
     full_train_dataset = load_named_dataset(
         dataset_name=dataset_name,
@@ -171,17 +170,12 @@ def load_probe_train_dataset(
             PROBE_MIN_TRAIN_SAMPLES,
         )
         return None
-    if train_size > PROBE_TRAIN_CAP_THRESHOLD:
-        sample_seed = stable_int_from_parts(config["seed"], dataset_name, "train", "probe_fit")
-        generator = torch.Generator().manual_seed(sample_seed)
-        selected_indices = torch.randperm(train_size, generator=generator)[:PROBE_TRAIN_SAMPLE_BUDGET].tolist()
-        logger.info(
-            "Prepared %s probe-train split | original=%s | used=%s | mode=subsampled",
-            DATASET_DISPLAY_NAMES[dataset_name],
-            train_size,
-            PROBE_TRAIN_SAMPLE_BUDGET,
-        )
-        return Subset(full_train_dataset, selected_indices)
+    logger.info(
+        "Prepared %s probe-train split | original=%s | used=%s | mode=full_train",
+        DATASET_DISPLAY_NAMES[dataset_name],
+        train_size,
+        train_size,
+    )
     return full_train_dataset
 
 
@@ -196,6 +190,32 @@ def load_probe_eval_dataset(
             DATASET_DISPLAY_NAMES[dataset_name],
         )
         return None
+
+    if dataset_name in {"flowers102", "dtd"}:
+        transform = build_dataset_transform(config["image_size"])
+        root = Path(config["data_root"]) / "multidataset" / dataset_name
+        if dataset_name == "flowers102":
+            eval_dataset = tv_datasets.Flowers102(
+                root=str(root),
+                split="val",
+                download=True,
+                transform=transform,
+            )
+        else:
+            eval_dataset = tv_datasets.DTD(
+                root=str(root),
+                split="val",
+                download=True,
+                transform=transform,
+            )
+        logger.info(
+            "Prepared %s probe-eval split | original=%s | used=%s | mode=val_only",
+            DATASET_DISPLAY_NAMES[dataset_name],
+            len(eval_dataset),
+            len(eval_dataset),
+        )
+        return eval_dataset
+
     eval_dataset = load_named_evaluation_dataset(
         dataset_name=dataset_name,
         data_root=config["data_root"],
