@@ -43,6 +43,12 @@ python main.py
 
 This loads the pre-trained `facebook/vit-mae-base` checkpoint, injects IBA adapters, freezes the backbone, and runs the federated learning loop on Tiny ImageNet.
 
+For the sequential multi-dataset run, use:
+
+```bash
+python new_main.py
+```
+
 ---
 
 ## Architecture Overview
@@ -93,10 +99,13 @@ Mathematical variable names (e.g., `K`, `N`, `D`, `X`, `Z`) follow standard rese
 
 ### Docstrings
 
-The codebase adheres to **highly rigorous, AI publication-grade** documentation standards. Every public component must articulate its theoretical grounding and execution mechanics:
-- **Theory & Mathematics**: Formulate operations using explicit LaTeX math notation (e.g., $\mathcal{L}_{MAE}$, $\Delta W$, $P_{local}$, $\tau_{merge}$). Do not describe mathematical logic using plain text paragraphs if standard notation is clearer.
-- **Structural Definitions**: Enforce rigorous computational boundaries and dimensionality descriptors, e.g., $\mathbb{R}^{B \times D}$.
-- **Style**: Ensure compact, intellectually dense explanations. The project explicitly suppresses linter rule `W605` in `ruff.toml` to fully permit raw math escape sequences (`\m`, `\i`, `\mathbb`) within standard string blocks. Avoid verbose standard Python prose where notation suffices.
+The codebase now uses a **clear, step-by-step** documentation style. Public components should explain:
+- what stage of the pipeline they belong to
+- what data enters and leaves that stage
+- what state persists across rounds or dataset transitions
+- why a branch or reset exists when the behavior is non-obvious
+
+Prefer implementation-oriented explanations over dense research prose. Use notation only when it genuinely improves clarity.
 
 ### Inline Comments
 
