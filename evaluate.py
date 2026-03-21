@@ -48,7 +48,6 @@ TORCH_DTYPE_LOOKUP: Dict[str, torch.dtype] = {
 }
 
 GENERATED_EVAL_SPLIT_DATASETS = {
-    "eurosat",
     "caltech101",
     "caltech256",
     "sun397",
@@ -138,8 +137,8 @@ def choose_devices(usable_gpu_count: int) -> Tuple[str, str]:
     return "cpu", "cpu"
 
 
-def supports_official_eval_split(dataset_name: str) -> bool:
-    """Return whether the dataset has an official held-out split in this repo."""
+def supports_evaluation_split(dataset_name: str) -> bool:
+    """Return whether the dataset has a supported held-out split in this repo."""
     return dataset_name not in GENERATED_EVAL_SPLIT_DATASETS
 
 
@@ -189,8 +188,8 @@ def load_probe_eval_dataset(
     dataset_name: str,
     config: Dict[str, Any],
 ) -> torch.utils.data.Dataset | None:
-    """Load the official held-out split or split-combination for one dataset."""
-    if not supports_official_eval_split(dataset_name):
+    """Load the supported held-out split or split-combination for one dataset."""
+    if not supports_evaluation_split(dataset_name):
         logger.warning(
             "Skipping %s because it does not have an official eval/test split in this pipeline.",
             DATASET_DISPLAY_NAMES[dataset_name],

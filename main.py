@@ -105,6 +105,9 @@ MULTI_DATASET_CONFIG: Dict[str, Any] = {
     "save_dir": "multidataset_outputs_2client",
 }
 
+EUROSAT_TRAIN_SPLIT_SAMPLES = 10000
+EUROSAT_EVAL_SPLIT_SAMPLES = 5000
+
 CLIENT_DATASET_SEQUENCE: Dict[int, List[str]] = {
     0: ["eurosat", "oxfordiiitpet", "flowers102"],
     1: ["gtsrb", "fgvcaircraft", "dtd"],
@@ -611,6 +614,31 @@ def build_split_subset(
     return Subset(dataset, train_indices if train else test_indices)
 
 
+def build_fixed_count_split_subset(
+    dataset: torch.utils.data.Dataset,
+    dataset_name: str,
+    train: bool,
+    seed: int,
+    train_samples: int,
+    eval_samples: int,
+) -> torch.utils.data.Dataset:
+    """Create a deterministic fixed-size train/eval split for one combined dataset."""
+    required_samples = train_samples + eval_samples
+    dataset_size = len(dataset)
+    if dataset_size < required_samples:
+        raise ValueError(
+            f"{DATASET_DISPLAY_NAMES[dataset_name]} has only {dataset_size} samples, "
+            f"but the fixed split needs {required_samples} samples."
+        )
+
+    split_seed = stable_int_from_parts(seed, dataset_name, "fixed_split")
+    generator = torch.Generator().manual_seed(split_seed)
+    selected_indices = torch.randperm(dataset_size, generator=generator)[:required_samples].tolist()
+    train_indices = selected_indices[:train_samples]
+    eval_indices = selected_indices[train_samples:]
+    return Subset(dataset, train_indices if train else eval_indices)
+
+
 def load_named_dataset(
     dataset_name: str,
     data_root: str,
@@ -629,11 +657,13 @@ def load_named_dataset(
     root = Path(data_root) / "multidataset" / dataset_name
 
     if dataset_name == "eurosat":
-        dataset = build_split_subset(
+        dataset = build_fixed_count_split_subset(
             datasets.EuroSAT(root=str(root), download=True, transform=transform),
             dataset_name=dataset_name,
             train=train,
             seed=seed,
+            train_samples=EUROSAT_TRAIN_SPLIT_SAMPLES,
+            eval_samples=EUROSAT_EVAL_SPLIT_SAMPLES,
         )
     elif dataset_name == "pcam":
         dataset = datasets.PCAM(

@@ -36,6 +36,7 @@ Important current behavior:
 
 - no ImageNet normalization in the multi-dataset path
 - RGB conversion + resize + `ToTensor()` only
+- `EuroSAT` uses a fixed deterministic split of `10000` train and `5000` eval samples
 - train splits smaller than `1000` samples are rejected
 - larger splits are deterministically subsampled to the configured budget
 - smaller valid splits are deterministically repeated up to the configured budget
@@ -103,6 +104,7 @@ Probe-fit policy:
 
 Held-out evaluation policy:
 
+- `EuroSAT` uses the repo-defined deterministic `10000`-train / `5000`-eval split
 - if both `val` and `test` exist in the repo loader, both are used
 - if only one official held-out split exists, that split is used
 - if the repo only has a generated split and no official held-out split, the dataset is skipped

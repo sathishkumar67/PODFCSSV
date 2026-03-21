@@ -38,6 +38,7 @@ Each stage follows the same order:
 
 ### Data-budget rule
 
+- `EuroSAT` uses a fixed deterministic split of `10000` train and `5000` eval samples
 - if a train split is below `1000`, the run fails for that dataset
 - if it is above the target budget, it is deterministically subsampled
 - if it is below the target budget but above the minimum, it is deterministically repeated
@@ -108,6 +109,7 @@ Unlike `main.py`, `base.py` uses the full train split of each dataset.
 
 ### Held-out evaluation policy
 
+- `EuroSAT` is evaluated with the repo-defined deterministic `10000`-train / `5000`-eval split
 - use `val + test` when both are explicitly supported by the loader
 - use the official non-train split when only one held-out split exists
 - skip datasets without an official held-out split in the current loader logic

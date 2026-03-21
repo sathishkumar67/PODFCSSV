@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Current Main Entrypoint** (`main.py`): `main.py` remains the federated 2-client, 6-dataset sequential benchmark with persistent local memory, adapter-only communication, and deterministic `10000`-sample train budgets.
-- **Current Baseline Entrypoint** (`base.py`): `base.py` is now the reconstruction-only continual baseline that uses the same adapter-injected model but trains a single model across the full train splits without federation or GPAD.
-- **Current Evaluation Policy** (`evaluate.py`): Linear probes now use the train split for fitting, use official held-out splits for reporting, cap oversized train splits at a deterministic `4000` samples, and skip datasets that do not have a real held-out split or have fewer than `1000` train samples.
+- **Current Baseline Entrypoint** (`base.py`): `base.py` is now the reconstruction-only continual baseline that uses the same adapter-injected model but trains a single model across the full train splits without federation or GPAD. The current baseline batch size is `192`.
+- **Current Evaluation Policy** (`evaluate.py`): Linear probes now use the train split for fitting, use supported held-out splits for reporting, cap oversized train splits at a deterministic `4000` samples, and skip datasets that do not have a supported held-out split or have fewer than `1000` train samples.
+- **EuroSAT Split Policy** (`main.py`, `evaluate.py`): `EuroSAT` now uses a fixed deterministic split of `10000` train samples and `5000` eval samples so it remains usable in the current training and evaluation flow.
 - **Documentation Refresh** (`README.md`, `CONTRIBUTING.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Repository documentation now reflects the current 2-client federated run, the current single-model baseline, and the current evaluation flow.
 - **Python Documentation Refresh** (`main.py`, `base.py`, `evaluate.py`, `src/*.py`): Module docstrings and key function docstrings were rewritten in a step-by-step style to match the current pipeline.
 
