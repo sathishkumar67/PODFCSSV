@@ -13,11 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Checkpoint Comparison Script** (`evaluate.py`): Added a standalone evaluation entrypoint that compares a saved adapter checkpoint against the original Hugging Face base model on one or more datasets.
 
 ### Changed
-- **8-Client Sequential Benchmark** (`new_main.py`): Replaced the old 2-client sequence with an 8-client, 24-dataset schedule that runs one client per GPU across three sequential stages.
-- **Balanced Dataset Timing** (`new_main.py`): Added deterministic per-dataset sample fitting so every client trains on an effective 10,000 images per stage and is less likely to idle waiting for slower datasets.
+- **2-Client Sequential Benchmark** (`new_main.py`): Restored the smaller sequential setup with 2 clients, 2 GPUs, and 4 datasets total while keeping the newer training behavior.
+- **Balanced Dataset Timing** (`new_main.py`): The 2-client sequential run still uses deterministic per-dataset sample fitting so each client trains on an effective 10,000 images per stage.
 - **Sequential Preprocessing Policy** (`new_main.py`): Removed ImageNet-style normalization from the multi-dataset path while keeping RGB conversion and resizing.
 - **Separated Evaluation Flow** (`new_main.py`, `evaluate.py`): Removed in-training linear-probe evaluation from the sequential trainer and moved comparison work fully into the standalone evaluation script.
-- **Sequential Client Memory Persistence** (`src/client.py`, `new_main.py`): The 8-client sequential run now keeps each client's local prototypes, novelty buffer, and optimizer state across dataset transitions to better match a real-world continual setting.
+- **Sequential Client Memory Persistence** (`src/client.py`, `new_main.py`): The sequential run keeps each client's local prototypes, novelty buffer, and optimizer state across dataset transitions to better match a real-world continual setting.
 
 ### Fixed
 - **Checkpoint-Aware Dataset Order** (`evaluate.py`, `new_main.py`): Evaluation now reads the saved client dataset sequence from checkpoint metadata instead of assuming a hardcoded 2-client schedule.
