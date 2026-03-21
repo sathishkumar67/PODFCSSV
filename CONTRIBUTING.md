@@ -41,12 +41,18 @@ python -c "from src import GPADLoss, ClientManager; print('Imports OK')"
 python main.py
 ```
 
-This loads the pre-trained `facebook/vit-mae-base` checkpoint, injects IBA adapters, freezes the backbone, and runs the federated learning loop on Tiny ImageNet.
+This loads the pre-trained `facebook/vit-mae-base` checkpoint, injects IBA adapters, freezes the backbone, and runs the federated sequential multi-dataset learning loop.
 
-For the sequential multi-dataset run, use:
+For the single-model continual baseline, use:
 
 ```bash
-python new_main.py
+python main.py
+```
+
+For the single-model continual baseline, use:
+
+```bash
+python base.py
 ```
 
 ---

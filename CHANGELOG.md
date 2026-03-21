@@ -11,16 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Checkpoint Comparison Script** (`evaluate.py`): Added a standalone evaluation entrypoint that compares a saved adapter checkpoint against the original Hugging Face base model on one or more datasets.
+- **Single-Model Continual Baseline** (`base.py`): Added a reconstruction-only continual baseline that uses the same adapter-injected ViT-MAE model, trains on one dataset at a time, evaluates on non-train splits, and tracks forgetting.
 
 ### Changed
-- **2-Client Sequential Benchmark** (`new_main.py`): Expanded the current sequential setup to 2 clients, 2 GPUs, and 6 datasets total with three datasets per client while keeping the newer training behavior.
-- **Balanced Dataset Timing** (`new_main.py`): The 2-client sequential run still uses deterministic per-dataset sample fitting so each client trains on an effective 10,000 images per stage.
-- **Sequential Preprocessing Policy** (`new_main.py`): Removed ImageNet-style normalization from the multi-dataset path while keeping RGB conversion and resizing.
-- **Separated Evaluation Flow** (`new_main.py`, `evaluate.py`): Removed in-training linear-probe evaluation from the sequential trainer and moved comparison work fully into the standalone evaluation script.
-- **Sequential Client Memory Persistence** (`src/client.py`, `new_main.py`): The sequential run keeps each client's local prototypes, novelty buffer, and optimizer state across dataset transitions to better match a real-world continual setting.
+- **Main Entrypoint Swap** (`main.py`): Promoted the sequential federated multi-dataset run into `main.py` and removed `new_main.py`.
+- **Balanced Dataset Timing** (`main.py`): The 2-client sequential federated run still uses deterministic per-dataset sample fitting so each client trains on an effective 10,000 images per stage.
+- **Sequential Preprocessing Policy** (`main.py`, `base.py`): The multi-dataset paths keep RGB conversion and resizing without ImageNet-style normalization.
+- **Separated Evaluation Flow** (`main.py`, `evaluate.py`): The federated trainer still skips in-training linear-probe evaluation, while `base.py` now owns the continual forgetting baseline and `evaluate.py` remains the checkpoint comparison entrypoint.
+- **Sequential Client Memory Persistence** (`src/client.py`, `main.py`): The federated sequential run keeps each client's local prototypes, novelty buffer, and optimizer state across dataset transitions to better match a real-world continual setting.
 
 ### Fixed
-- **Checkpoint-Aware Dataset Order** (`evaluate.py`, `new_main.py`): Evaluation now reads the saved client dataset sequence from checkpoint metadata instead of assuming a hardcoded 2-client schedule.
+- **Checkpoint-Aware Dataset Order** (`evaluate.py`, `main.py`, `base.py`): Evaluation now reads the saved dataset sequence from checkpoint metadata instead of assuming an outdated hardcoded schedule.
 
 ## [0.6.0] - 2026-03-14
 

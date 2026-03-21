@@ -20,12 +20,14 @@ from typing import Any, Dict, List
 import torch
 from transformers import ViTMAEForPreTraining
 
-from main import build_base_model, resolve_runtime_config, set_random_seed
-from new_main import (
+from main import (
     DATASET_DISPLAY_NAMES,
     MULTI_DATASET_CONFIG,
+    build_base_model,
     build_dataset_order_by_stage,
     evaluate_datasets,
+    resolve_runtime_config,
+    set_random_seed,
 )
 
 logger = logging.getLogger("PODFCSSV_Evaluate")
@@ -53,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         choices=sorted(DATASET_DISPLAY_NAMES.keys()),
         default=None,
-        help="Datasets to evaluate. Defaults to the current new_main.py sequence.",
+        help="Datasets to evaluate. Defaults to the current main.py sequence.",
     )
     parser.add_argument(
         "--output-json",

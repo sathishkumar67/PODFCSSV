@@ -7,9 +7,9 @@ This repository implements a federated continual self-supervised learning pipeli
 ## What Is In The Repo
 
 - `main.py`
-  Runs the paper-aligned Tiny ImageNet baseline with a Dirichlet non-IID client split.
-- `new_main.py`
   Runs the 2-client sequential continual-learning experiment with 6 datasets, balanced sample fitting, stage-wise dataset progression, training metrics, saved plots, JSON history, and checkpoints.
+- `base.py`
+  Runs the single-model continual baseline on the same 6-dataset sequence with reconstruction-only training, post-dataset evaluation, forgetting metrics, and comparison plots.
 - `evaluate.py`
   Loads a saved checkpoint later and compares it against the base Hugging Face model with a separate linear-probe pass.
 - `src/mae_with_adapter.py`
@@ -41,7 +41,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Run The Tiny ImageNet Baseline
+## Run The Federated Sequential Experiment
 
 ```bash
 python main.py
@@ -51,7 +51,7 @@ This script:
 
 1. Loads `facebook/vit-mae-base`.
 2. Injects adapters into the upper half of the encoder.
-3. Builds a non-IID round schedule over Tiny ImageNet classes.
+3. Assigns one client per GPU across the 2-client sequential schedule.
 4. Trains clients with MAE reconstruction and GPAD.
 5. Aggregates local prototypes and adapter weights at the server.
 6. Broadcasts the updated adapter state back to every client.
@@ -60,34 +60,29 @@ This script:
 Outputs are written under:
 
 ```text
-checkpoints/
+multidataset_outputs/
   checkpoints/
   metrics/
   plots/
 ```
 
-## Run The 2-Client Sequential Experiment
+## Run The Single-Model Continual Baseline
 
 ```bash
-python new_main.py
+python base.py
 ```
 
-This script keeps the same federated-learning math but changes the data schedule:
+This script keeps the same adapter-injected ViT-MAE model but removes federation and GPAD:
 
-- Client 0: `EuroSAT` -> `Oxford-IIIT Pet` -> `Flowers102`
-- Client 1: `GTSRB` -> `FGVC Aircraft` -> `DTD`
-- Each stage runs on 2 GPUs with one client per GPU.
-- Every training split is deterministically fitted to `10000` samples so all clients run for the same number of local steps.
-- Larger datasets are subsampled and smaller datasets are repeated deterministically to hit the same effective stage budget.
-- Each client keeps its local prototypes, novelty buffer, and optimizer state when it switches to the next dataset, while the global model and global prototype bank also continue across stages.
-- The preprocessing path does not use ImageNet mean/std normalization.
-
-Unlike earlier sequential variants, `new_main.py` does not run linear-probe evaluation during training. That comparison is now handled separately by `evaluate.py` after the checkpoint is saved.
+- Dataset order: `EuroSAT` -> `GTSRB` -> `Oxford-IIIT Pet` -> `FGVC Aircraft` -> `Flowers102` -> `DTD`
+- One model is trained on the full train split of each dataset in sequence.
+- Evaluation runs after each dataset using the non-train split(s) of every seen dataset.
+- The baseline saves forgetting metrics and plots so catastrophic forgetting can be measured directly.
 
 Outputs are written under:
 
 ```text
-multidataset_outputs_2client/
+base_outputs/
   checkpoints/
   metrics/
   plots/
@@ -104,11 +99,11 @@ Both entrypoints save:
 - Routing-fraction plots
 - Communication-cost plots
 
-`new_main.py` also saves:
+`base.py` also saves:
 
-- Stage-by-stage training history
-- Communication tracking for the 2-client run
-- Training summary plots for loss, routing, prototype growth, and communication
+- Stage-by-stage evaluation history
+- Accuracy heatmaps and final accuracy bars
+- Forgetting plots for the continual baseline
 
 ## Compare A Saved Checkpoint Later
 
@@ -125,7 +120,7 @@ The central training config lives in `main.py` as `CONFIG`.
 Important fields:
 
 - `num_clients`
-- `num_rounds`
+- `rounds_per_dataset`
 - `local_epochs`
 - `client_lr`
 - `merge_threshold`
@@ -134,9 +129,8 @@ Important fields:
 - `k_init_prototypes`
 - `novelty_buffer_size`
 
-`new_main.py` extends that config with:
+The sequential entrypoints extend that config with:
 
-- `rounds_per_dataset`
 - `train_samples_per_dataset`
 - `min_train_samples_per_dataset`
 - `max_global_prototypes`
@@ -151,7 +145,7 @@ Important fields:
 - The multi-dataset script intentionally spans satellite, medical, sentiment-text, scene, traffic, face, pet, food, and character domains instead of reusing ImageNet-1K itself.
 - `PCAM` uses an HDF5-backed dataset reader, so `h5py` is included in the project dependencies.
 - Only trainable adapter parameters are exchanged during federation; the frozen MAE backbone is never averaged.
-- The checkpoint written by `new_main.py` stores the client dataset sequence so `evaluate.py` can recover the correct default evaluation order later.
+- The checkpoints written by `main.py` and `base.py` both store the dataset sequence so later evaluation can recover the correct default order.
 
 ## License
 

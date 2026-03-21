@@ -3,7 +3,7 @@
 ### Full Implementation Guide with All Enhancements
 
 > Update note:
-> The executable source of truth is now `main.py`, `new_main.py`, and the
+> The executable source of truth is now `main.py`, `base.py`, and the
 > files under `src/`. This guide is retained as a broad research note, but the
 > current implementation uses the corrected GPAD gradient flow, server-to-client
 > weight broadcast, unified embedding extraction, non-dropping sample
@@ -273,14 +273,7 @@ Critical Hyperparameters (tune these):
 Current repository experiments:
 
 ```python
-# Baseline experiment in main.py
-- Dataset: Tiny ImageNet
-- 200 classes, 100K train images
-- Image size: 64x64 resized to 224x224 for ViT-MAE
-- Non-IID split: Dirichlet allocation across 2 clients
-- Round schedule: 5 rounds x 40 classes per round by default
-
-# Sequential experiment in new_main.py
+# Federated sequential experiment in main.py
 - 2 clients on 2 GPUs
 - 3 datasets per client, executed sequentially
 - Client 0: EuroSAT -> Oxford-IIIT Pet -> Flowers102
@@ -292,6 +285,14 @@ Current repository experiments:
   ImageNet normalization
 - Linear-probe evaluation is not run inside training; it is handled later by
   evaluate.py
+
+# Continual baseline experiment in base.py
+- One adapter-injected ViT-MAE model
+- Dataset order follows the federated stage order:
+  EuroSAT -> GTSRB -> Oxford-IIIT Pet -> FGVC Aircraft -> Flowers102 -> DTD
+- Uses the full train split of each dataset
+- Evaluates on the non-train split(s) of every seen dataset after each stage
+- Saves forgetting metrics and forgetting plots
 ```
 
 The older example block below is retained as a generic research note only.
@@ -307,7 +308,7 @@ The older example block below is retained as a generic research note only.
 # Current baseline summary
 - Tiny ImageNet remains the baseline dataset in main.py
 - The baseline uses a Dirichlet non-IID split and round-wise class scheduling
-- The sequential benchmark is implemented separately in new_main.py
+- The federated sequential benchmark is implemented in main.py
 
 # For current domain-shift experiments:
 - The repository now uses the 4-dataset sequence listed above
@@ -320,9 +321,10 @@ The older example block below is retained as a generic research note only.
 ```python
 # Current executable setup:
 1. main.py trains and logs round-level training metrics.
-2. new_main.py trains the 2-client sequential schedule and saves
+2. main.py trains the 2-client sequential federated schedule and saves
    checkpoints, communication metrics, and training plots only.
-3. evaluate.py is the post-training path for dataset-by-dataset linear-probe
+3. base.py is the single-model continual baseline used to measure forgetting.
+4. evaluate.py is the post-training path for dataset-by-dataset linear-probe
    comparison against the Hugging Face base model.
 
 # Communication tracking:
