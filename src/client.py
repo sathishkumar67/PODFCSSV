@@ -1,19 +1,16 @@
-"""Client-side training and prototype management.
+"""Client-side learning, routing, and local prototype maintenance.
 
-This module implements the local part of the paper's algorithm.
+Each client owns one isolated copy of the adapter-augmented MAE model and
+repeats the same local cycle:
+1. Receive the newest global adapter weights.
+2. Train locally with MAE reconstruction.
+3. Use GPAD only on samples anchored to the global prototype bank.
+4. Route the remaining samples to a local EMA update or the novelty buffer.
+5. Cluster the novelty buffer when it fills up.
+6. Return trainable weights plus local prototypes to the server.
 
-Each client repeatedly performs the following sequence:
-1. Receive the latest global adapter weights from the server.
-2. Run MAE reconstruction training on its local batch.
-3. When a global prototype bank exists, compute GPAD on anchored samples.
-4. Route non-anchored samples to either a local EMA update or the novelty
-   buffer.
-5. Cluster the novelty buffer when it reaches the configured threshold.
-6. Send updated trainable weights and local prototypes back to the server.
-
-The implementation also tracks detailed routing statistics so the training
-scripts can write publication-ready metrics and plots without modifying the
-core learning logic.
+For sequential runs, the client also exposes a reset hook so stage-local
+prototype memory can be cleared cleanly when the dataset changes.
 """
 
 from __future__ import annotations
@@ -384,6 +381,12 @@ class FederatedClient:
         if self.local_prototypes is None:
             return None
         return self.local_prototypes.detach().clone()
+
+    def reset_local_memory(self) -> None:
+        """Clear stage-local state before a client switches datasets."""
+        self.local_prototypes = None
+        self.novelty_buffer.clear()
+        self.optimizer.state.clear()
 
     @torch.no_grad()
     def generate_prototypes(
