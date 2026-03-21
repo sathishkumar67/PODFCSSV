@@ -1,8 +1,12 @@
-"""Compare a saved fine-tuned checkpoint against the Hugging Face base model.
+"""Post-training checkpoint evaluation for the federated multi-dataset run.
 
-The script evaluates frozen representations with the same linear-probe
-procedure used in ``new_main.py`` so the saved adapter model can be compared to
-the original ``facebook/vit-mae-base`` backbone on one or more datasets.
+This script stays outside the training loop on purpose:
+1. Load a saved adapter checkpoint.
+2. Rebuild the exact runtime config stored with that checkpoint.
+3. Recover the dataset schedule from checkpoint metadata when available.
+4. Run linear-probe evaluation on the saved model.
+5. Run the same evaluation on the untouched Hugging Face base model.
+6. Print and optionally save a side-by-side comparison table.
 """
 
 from __future__ import annotations
@@ -18,9 +22,9 @@ from transformers import ViTMAEForPreTraining
 
 from main import build_base_model, resolve_runtime_config, set_random_seed
 from new_main import (
-    CLIENT_DATASET_SEQUENCE,
     DATASET_DISPLAY_NAMES,
     MULTI_DATASET_CONFIG,
+    build_dataset_order_by_stage,
     evaluate_datasets,
 )
 
@@ -48,7 +52,7 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         nargs="+",
         choices=sorted(DATASET_DISPLAY_NAMES.keys()),
-        default=default_dataset_order(),
+        default=None,
         help="Datasets to evaluate. Defaults to the current new_main.py sequence.",
     )
     parser.add_argument(
@@ -60,14 +64,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def default_dataset_order() -> List[str]:
-    """Return the current sequential dataset order without duplicates."""
-    dataset_order: List[str] = []
-    for stage_pair in zip(CLIENT_DATASET_SEQUENCE[0], CLIENT_DATASET_SEQUENCE[1]):
-        for dataset_name in stage_pair:
-            if dataset_name not in dataset_order:
-                dataset_order.append(dataset_name)
-    return dataset_order
+def default_dataset_order(config: Dict[str, Any]) -> List[str]:
+    """Return the stage-ordered dataset list from the checkpoint or current code."""
+    dataset_sequence = config.get("client_dataset_sequence")
+    if isinstance(dataset_sequence, dict) and dataset_sequence:
+        return build_dataset_order_by_stage(dataset_sequence)
+    return build_dataset_order_by_stage()
 
 
 def deserialize_config(serialized_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -208,19 +210,20 @@ def main() -> None:
     args = parse_args()
     config = build_runtime_config(args.saved_model_path)
     set_random_seed(config.get("seed"))
+    dataset_names = args.datasets or default_dataset_order(config)
 
     logger.info(
         "Starting evaluation | checkpoint=%s | device=%s | datasets=%s",
         args.saved_model_path,
         config["device"],
-        ", ".join(DATASET_DISPLAY_NAMES[name] for name in args.datasets),
+        ", ".join(DATASET_DISPLAY_NAMES[name] for name in dataset_names),
     )
 
     finetuned_model = load_finetuned_model(args.saved_model_path, config)
     finetuned_results = evaluate_model(
         model=finetuned_model,
         model_name="Fine-tuned",
-        dataset_names=args.datasets,
+        dataset_names=dataset_names,
         config=config,
     )
     del finetuned_model
@@ -231,7 +234,7 @@ def main() -> None:
     base_results = evaluate_model(
         model=base_model,
         model_name="HF Base",
-        dataset_names=args.datasets,
+        dataset_names=dataset_names,
         config=config,
     )
     del base_model
@@ -239,7 +242,7 @@ def main() -> None:
         torch.cuda.empty_cache()
 
     print_comparison_table(
-        dataset_names=args.datasets,
+        dataset_names=dataset_names,
         base_results=base_results,
         finetuned_results=finetuned_results,
     )
@@ -248,7 +251,7 @@ def main() -> None:
         save_results(
             output_path=args.output_json,
             checkpoint_path=args.saved_model_path,
-            dataset_names=args.datasets,
+            dataset_names=dataset_names,
             base_results=base_results,
             finetuned_results=finetuned_results,
         )
