@@ -282,9 +282,9 @@ Current repository experiments:
 
 # Sequential experiment in new_main.py
 - 2 clients on 2 GPUs
-- 2 datasets per client, executed sequentially
-- Client 0: EuroSAT -> Oxford-IIIT Pet
-- Client 1: GTSRB -> FGVC Aircraft
+- 3 datasets per client, executed sequentially
+- Client 0: EuroSAT -> Oxford-IIIT Pet -> Flowers102
+- Client 1: GTSRB -> FGVC Aircraft -> DTD
 - Each training split is fitted to 10000 samples for balanced stage time
 - Larger datasets are subsampled and smaller datasets are repeated
   deterministically to keep stage runtime aligned

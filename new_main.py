@@ -1,4 +1,4 @@
-"""Sequential federated training entrypoint for the 2-client, 4-dataset run.
+"""Sequential federated training entrypoint for the 2-client, 6-dataset run.
 
 The baseline math from ``main.py`` stays the same:
 1. Build one shared ViT-MAE backbone with trainable adapters.
@@ -9,9 +9,9 @@ The baseline math from ``main.py`` stays the same:
 6. Save round-level checkpoints, metrics, and plots.
 
 This entrypoint changes the data schedule only. Each stage uses two datasets
-in parallel, one per client. Every training split is deterministically fitted
-to the same number of samples so all clients run for the same number of steps
-per round without ImageNet-style normalization.
+in parallel, one per client, across three sequential stages. Every training
+split is deterministically fitted to the same number of samples so all clients
+run for the same number of steps per round without ImageNet-style normalization.
 """
 
 from __future__ import annotations
@@ -74,8 +74,8 @@ MULTI_DATASET_CONFIG: Dict[str, Any] = {
 }
 
 CLIENT_DATASET_SEQUENCE: Dict[int, List[str]] = {
-    0: ["eurosat", "oxfordiiitpet"],
-    1: ["gtsrb", "fgvcaircraft"],
+    0: ["eurosat", "oxfordiiitpet", "flowers102"],
+    1: ["gtsrb", "fgvcaircraft", "dtd"],
 }
 
 DATASET_DISPLAY_NAMES: Dict[str, str] = {

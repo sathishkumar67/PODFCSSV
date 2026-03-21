@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Checkpoint Comparison Script** (`evaluate.py`): Added a standalone evaluation entrypoint that compares a saved adapter checkpoint against the original Hugging Face base model on one or more datasets.
 
 ### Changed
-- **2-Client Sequential Benchmark** (`new_main.py`): Restored the smaller sequential setup with 2 clients, 2 GPUs, and 4 datasets total while keeping the newer training behavior.
+- **2-Client Sequential Benchmark** (`new_main.py`): Expanded the current sequential setup to 2 clients, 2 GPUs, and 6 datasets total with three datasets per client while keeping the newer training behavior.
 - **Balanced Dataset Timing** (`new_main.py`): The 2-client sequential run still uses deterministic per-dataset sample fitting so each client trains on an effective 10,000 images per stage.
 - **Sequential Preprocessing Policy** (`new_main.py`): Removed ImageNet-style normalization from the multi-dataset path while keeping RGB conversion and resizing.
 - **Separated Evaluation Flow** (`new_main.py`, `evaluate.py`): Removed in-training linear-probe evaluation from the sequential trainer and moved comparison work fully into the standalone evaluation script.

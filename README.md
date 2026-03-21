@@ -9,7 +9,7 @@ This repository implements a federated continual self-supervised learning pipeli
 - `main.py`
   Runs the paper-aligned Tiny ImageNet baseline with a Dirichlet non-IID client split.
 - `new_main.py`
-  Runs the 2-client sequential continual-learning experiment with 4 datasets, balanced sample fitting, stage-wise dataset progression, training metrics, saved plots, JSON history, and checkpoints.
+  Runs the 2-client sequential continual-learning experiment with 6 datasets, balanced sample fitting, stage-wise dataset progression, training metrics, saved plots, JSON history, and checkpoints.
 - `evaluate.py`
   Loads a saved checkpoint later and compares it against the base Hugging Face model with a separate linear-probe pass.
 - `src/mae_with_adapter.py`
@@ -74,8 +74,8 @@ python new_main.py
 
 This script keeps the same federated-learning math but changes the data schedule:
 
-- Client 0: `EuroSAT` -> `Oxford-IIIT Pet`
-- Client 1: `GTSRB` -> `FGVC Aircraft`
+- Client 0: `EuroSAT` -> `Oxford-IIIT Pet` -> `Flowers102`
+- Client 1: `GTSRB` -> `FGVC Aircraft` -> `DTD`
 - Each stage runs on 2 GPUs with one client per GPU.
 - Every training split is deterministically fitted to `10000` samples so all clients run for the same number of local steps.
 - Larger datasets are subsampled and smaller datasets are repeated deterministically to hit the same effective stage budget.
