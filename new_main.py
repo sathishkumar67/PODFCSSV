@@ -321,7 +321,6 @@ def load_named_dataset(
         dataset = datasets.FER2013(
             root=str(root),
             split="train" if train else "test",
-            download=True,
             transform=transform,
         )
     elif dataset_name == "fgvcaircraft":
