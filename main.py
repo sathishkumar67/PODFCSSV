@@ -149,10 +149,55 @@ def set_random_seed(seed: Optional[int]) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def cuda_device_passes_smoke_test(device_index: int) -> tuple[bool, str]:
+    """Run a tiny conv on one CUDA device to confirm kernels actually execute."""
+    device = torch.device(f"cuda:{device_index}")
+    try:
+        with torch.inference_mode():
+            inputs = torch.zeros((1, 3, 32, 32), device=device, dtype=torch.float32)
+            weights = torch.zeros((4, 3, 3, 3), device=device, dtype=torch.float32)
+            outputs = F.conv2d(inputs, weights)
+            _ = float(outputs.sum().item())
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize(device)
+            except Exception:
+                pass
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+
+def get_usable_cuda_device_count() -> int:
+    """Count CUDA devices that pass a minimal execution smoke test."""
+    if not torch.cuda.is_available():
+        return 0
+
+    usable_device_count = 0
+    detected_device_count = torch.cuda.device_count()
+    for device_index in range(detected_device_count):
+        passes_smoke_test, error_message = cuda_device_passes_smoke_test(device_index)
+        if passes_smoke_test:
+            usable_device_count += 1
+        else:
+            logger.warning(
+                "Ignoring cuda:%s because a minimal CUDA kernel could not run on it: %s",
+                device_index,
+                error_message,
+            )
+    return usable_device_count
+
+
 def resolve_runtime_config(config: Dict[str, Any]) -> None:
     """Populate runtime device information inside the config."""
-    if torch.cuda.is_available():
-        config["gpu_count"] = torch.cuda.device_count()
+    usable_gpu_count = get_usable_cuda_device_count()
+    if usable_gpu_count > 0:
+        config["gpu_count"] = usable_gpu_count
         config["device"] = "cuda"
     else:
         config["gpu_count"] = 0

@@ -129,14 +129,12 @@ def freeze_encoder_model(model: nn.Module) -> None:
     model.eval()
 
 
-def choose_devices() -> Tuple[str, str]:
+def choose_devices(usable_gpu_count: int) -> Tuple[str, str]:
     """Choose one device per model when possible."""
-    if torch.cuda.is_available():
-        gpu_count = torch.cuda.device_count()
-        if gpu_count >= 2:
-            return "cuda:0", "cuda:1"
-        if gpu_count == 1:
-            return "cuda:0", "cuda:0"
+    if usable_gpu_count >= 2:
+        return "cuda:0", "cuda:1"
+    if usable_gpu_count == 1:
+        return "cuda:0", "cuda:0"
     return "cpu", "cpu"
 
 
@@ -643,7 +641,7 @@ def main() -> None:
     )
     resolve_runtime_config(eval_config)
     eval_config["pin_memory"] = eval_config["device"] == "cuda"
-    federated_device, base_device = choose_devices()
+    federated_device, base_device = choose_devices(eval_config["gpu_count"])
 
     logger.info(
         "Starting linear-probe evaluation | fed_ckpt=%s | base_ckpt=%s | datasets=%s | devices=(%s, %s)",
