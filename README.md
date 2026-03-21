@@ -9,7 +9,7 @@ This repository implements a federated continual self-supervised learning pipeli
 - `main.py`
   Runs the paper-aligned Tiny ImageNet baseline with a Dirichlet non-IID client split.
 - `new_main.py`
-  Runs the 8-client sequential continual-learning experiment with 24 datasets, balanced sample caps, stage-wise dataset progression, training metrics, saved plots, JSON history, and checkpoints.
+  Runs the 2-client sequential continual-learning experiment with 4 datasets, balanced sample fitting, stage-wise dataset progression, training metrics, saved plots, JSON history, and checkpoints.
 - `evaluate.py`
   Loads a saved checkpoint later and compares it against the base Hugging Face model with a separate linear-probe pass.
 - `src/mae_with_adapter.py`
@@ -30,7 +30,7 @@ This repository implements a federated continual self-supervised learning pipeli
 - The Dirichlet partition no longer drops leftover samples after integer rounding.
 - Configured local epochs are now honored during client-side training.
 - Tiny ImageNet preprocessing matches the expected normalization for `facebook/vit-mae-base`.
-- The 8-client sequential run intentionally avoids ImageNet-style normalization and uses only RGB conversion, resize, and `ToTensor()`.
+- The 2-client sequential run intentionally avoids ImageNet-style normalization and uses only RGB conversion, resize, and `ToTensor()`.
 - Training history, communication statistics, checkpoints, JSON metrics, and plots are written automatically.
 
 ## Installation
@@ -66,7 +66,7 @@ checkpoints/
   plots/
 ```
 
-## Run The 8-Client Sequential Experiment
+## Run The 2-Client Sequential Experiment
 
 ```bash
 python new_main.py
@@ -74,15 +74,9 @@ python new_main.py
 
 This script keeps the same federated-learning math but changes the data schedule:
 
-- Client 0: `EuroSAT` -> `GTSRB` -> `STL10`
-- Client 1: `PCAM` -> `SVHN` -> `LFW People`
-- Client 2: `FER2013` -> `Stanford Cars` -> `CIFAR10`
-- Client 3: `FGVC Aircraft` -> `Country211` -> `FashionMNIST`
-- Client 4: `DTD` -> `Caltech101` -> `Rendered SST2`
-- Client 5: `Oxford-IIIT Pet` -> `Caltech256` -> `USPS`
-- Client 6: `Flowers102` -> `SUN397` -> `EMNIST Letters`
-- Client 7: `Food101` -> `CIFAR100` -> `Omniglot`
-- Each stage runs on 8 GPUs with one client per GPU.
+- Client 0: `EuroSAT` -> `Oxford-IIIT Pet`
+- Client 1: `GTSRB` -> `FGVC Aircraft`
+- Each stage runs on 2 GPUs with one client per GPU.
 - Every training split is deterministically fitted to `10000` samples so all clients run for the same number of local steps.
 - Larger datasets are subsampled and smaller datasets are repeated deterministically to hit the same effective stage budget.
 - Each client keeps its local prototypes, novelty buffer, and optimizer state when it switches to the next dataset, while the global model and global prototype bank also continue across stages.
@@ -93,7 +87,7 @@ Unlike earlier sequential variants, `new_main.py` does not run linear-probe eval
 Outputs are written under:
 
 ```text
-multidataset_outputs_8client/
+multidataset_outputs_2client/
   checkpoints/
   metrics/
   plots/
@@ -113,7 +107,7 @@ Both entrypoints save:
 `new_main.py` also saves:
 
 - Stage-by-stage training history
-- Communication tracking for the 8-client run
+- Communication tracking for the 2-client run
 - Training summary plots for loss, routing, prototype growth, and communication
 
 ## Compare A Saved Checkpoint Later
