@@ -1,12 +1,12 @@
-"""GPAD loss used by both training entrypoints.
+"""Implement the GPAD loss used in the federated training path.
 
-The GPAD path is intentionally easy to follow:
-1. Normalize embeddings and global prototypes.
+The loss follows the same sequence each time it is called:
+1. Normalize the batch embeddings and the current global prototypes.
 2. Measure cosine similarity between every embedding and every prototype.
-3. Turn the similarity distribution into an entropy-aware anchor threshold.
-4. Mark confident samples as anchored.
-5. Apply a smooth gate around the hard anchor decision.
-6. Penalize anchored samples when they drift away from the prototype bank.
+3. Turn the full similarity distribution into an adaptive anchor threshold.
+4. Decide which samples are anchored strongly enough to trust the bank.
+5. Smooth that hard decision with a sigmoid gate.
+6. Penalize anchored embeddings when they drift away from their best match.
 """
 
 from __future__ import annotations
@@ -19,23 +19,14 @@ import torch.nn.functional as F
 
 
 class GPADLoss(nn.Module):
-    """Compute the GPAD objective for a mini-batch of embeddings.
+    """Compute prototype anchoring for one mini-batch of embeddings.
 
-    Parameters
-    ----------
-    base_tau:
-        Base cosine-similarity threshold used when the assignment entropy is
-        zero.
-    temp_gate:
-        Temperature of the sigmoid gate. Smaller values make the transition
-        around the threshold steeper.
-    lambda_entropy:
-        Multiplier applied to the normalized entropy when building the adaptive
-        threshold.
-    soft_assign_temp:
-        Temperature used inside the prototype softmax assignment.
-    epsilon:
-        Small constant used to avoid ``log(0)`` and division-by-zero issues.
+    The constructor stores the few knobs that control GPAD:
+    1. ``base_tau`` is the minimum similarity needed before any entropy term.
+    2. ``temp_gate`` controls how sharp the soft gate becomes near the threshold.
+    3. ``lambda_entropy`` decides how much uncertain assignments raise the bar.
+    4. ``soft_assign_temp`` shapes the prototype assignment distribution.
+    5. ``epsilon`` keeps the entropy math numerically stable.
     """
 
     def __init__(
@@ -58,11 +49,14 @@ class GPADLoss(nn.Module):
         embeddings: torch.Tensor,
         global_prototypes: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the mean GPAD loss for the provided embeddings.
+        """Return the mean GPAD loss for one batch.
 
-        The function returns a zero-valued tensor that remains connected to the
-        graph when the prototype bank is empty. That keeps the training loop
-        simple and avoids special-case loss handling in the caller.
+        The forward path is intentionally short:
+        1. Exit with a graph-connected zero if there is no prototype bank yet.
+        2. Build the full embedding-to-prototype similarity matrix.
+        3. Convert that matrix into one adaptive threshold per sample.
+        4. Compute the final soft anchor gate.
+        5. Apply the gated distance penalty and average it across the batch.
         """
         if global_prototypes.size(0) == 0 or embeddings.size(0) == 0:
             return embeddings.sum() * 0.0
@@ -80,17 +74,17 @@ class GPADLoss(nn.Module):
         embeddings: torch.Tensor,
         prototypes: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute the cosine-similarity matrix ``[batch, num_prototypes]``."""
+        """Build the cosine-similarity matrix with shape ``[batch, prototypes]``."""
         normalized_embeddings = F.normalize(embeddings, p=2, dim=1)
         normalized_prototypes = F.normalize(prototypes, p=2, dim=1)
         return torch.mm(normalized_embeddings, normalized_prototypes.t())
 
     def _compute_adaptive_threshold(self, similarities: torch.Tensor) -> torch.Tensor:
-        """Convert prototype-assignment entropy into an adaptive threshold.
+        """Turn prototype-assignment entropy into one threshold per sample.
 
-        When there is only one prototype in the bank, the assignment entropy is
-        always zero. In that case the adaptive threshold collapses cleanly to
-        ``base_tau``.
+        A confident sample keeps a threshold close to ``base_tau``. A sample
+        that spreads probability mass across many prototypes gets a higher
+        threshold, which makes anchoring more conservative.
         """
         batch_size, num_prototypes = similarities.shape
         if num_prototypes <= 1:
@@ -112,11 +106,13 @@ class GPADLoss(nn.Module):
         similarities: torch.Tensor,
         tau_adaptive: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return the best similarity and the final GPAD gate.
+        """Return the best similarity and the final gate for each sample.
 
-        The paper defines the anchor condition with ``>=``. The implementation
-        matches that exactly so the code and the equations now share the same
-        boundary behavior.
+        The gate combines:
+        1. The paper's hard ``>=`` anchor rule.
+        2. A smooth sigmoid transition around the same threshold.
+        This keeps the routing rule crisp while still letting gradients change
+        smoothly near the decision boundary.
         """
         max_similarity, _ = similarities.max(dim=1)
         hard_anchor = (max_similarity >= tau_adaptive).to(max_similarity.dtype)
@@ -128,7 +124,7 @@ class GPADLoss(nn.Module):
         max_similarity: torch.Tensor,
         gate: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute the gated squared Euclidean distance on the unit sphere."""
+        """Compute the gated squared distance between anchored embeddings and prototypes."""
         squared_distance = 2.0 * (1.0 - max_similarity)
         return (gate * squared_distance).mean()
 
@@ -138,10 +134,11 @@ class GPADLoss(nn.Module):
         embeddings: torch.Tensor,
         global_prototypes: torch.Tensor,
     ) -> torch.Tensor:
-        """Return a boolean mask that marks which embeddings are anchored.
+        """Return a boolean mask that marks which samples are anchored.
 
-        The caller uses this mask only for routing decisions. No gradients are
-        required here, so the method stays in inference mode.
+        The training loop uses this mask only to decide how to route each
+        embedding, so the helper runs under ``torch.no_grad()`` and mirrors the
+        same threshold logic used in the differentiable forward pass.
         """
         if global_prototypes.size(0) == 0 or embeddings.size(0) == 0:
             return torch.zeros(

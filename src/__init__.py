@@ -1,10 +1,11 @@
-"""Convenience exports for the core PODFCSSV building blocks.
+"""Expose the core building blocks used by every entrypoint in the repo.
 
-The package surface is intentionally small:
-1. Adapter injection utilities.
-2. GPAD loss.
-3. Client-side training orchestration.
-4. Server-side aggregation helpers.
+The package is intentionally small so the high-level scripts can read almost
+like a pipeline description:
+1. Adapter wrappers define which MAE parameters remain trainable.
+2. GPAD defines the prototype-anchored loss used in the federated run.
+3. Client helpers run local training and maintain local prototype memory.
+4. Server helpers merge client updates back into one global state.
 """
 
 from src.client import ClientManager, FederatedClient

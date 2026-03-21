@@ -1,17 +1,17 @@
-"""Sequential federated training entrypoint for the 2-client, 6-dataset run.
+"""Run the federated continual-learning experiment used as the main pipeline.
 
-The baseline math from ``main.py`` stays the same:
-1. Build one shared ViT-MAE backbone with trainable adapters.
-2. Assign one client to each GPU.
-3. Feed every client one dataset at a time for three sequential stages.
-4. Run local MAE + GPAD updates on each client.
-5. Aggregate adapter weights and local prototypes on the server.
-6. Save round-level checkpoints, metrics, and plots.
+The current entrypoint is the 2-client, 6-dataset sequential benchmark:
+1. Build one pretrained ViT-MAE backbone with injected residual adapters.
+2. Place one client on each usable GPU when CUDA really works.
+3. Feed each client one dataset per stage across three sequential stages.
+4. Train locally with MAE reconstruction and GPAD.
+5. Merge trainable adapter weights and local prototypes on the server.
+6. Carry global and local memory forward into the next dataset stage.
+7. Save checkpoints, histories, communication statistics, and plots.
 
-This entrypoint changes the data schedule only. Each stage uses two datasets
-in parallel, one per client, across three sequential stages. Every training
-split is deterministically fitted to the same number of samples so all clients
-run for the same number of steps per round without ImageNet-style normalization.
+Every training split is fitted to the same effective sample budget so both
+clients spend roughly the same number of steps on each stage, and the image
+pipeline intentionally avoids ImageNet-style normalization.
 """
 
 from __future__ import annotations
@@ -139,7 +139,7 @@ DATASET_DISPLAY_NAMES: Dict[str, str] = {
 
 
 def set_random_seed(seed: Optional[int]) -> None:
-    """Seed Python, NumPy, and PyTorch for reproducible runs."""
+    """Seed every random source used by training and evaluation."""
     if seed is None:
         return
     random.seed(seed)
@@ -150,7 +150,7 @@ def set_random_seed(seed: Optional[int]) -> None:
 
 
 def cuda_device_passes_smoke_test(device_index: int) -> tuple[bool, str]:
-    """Run a tiny conv on one CUDA device to confirm kernels actually execute."""
+    """Run a tiny convolution on one CUDA device to confirm kernels really execute."""
     device = torch.device(f"cuda:{device_index}")
     try:
         with torch.inference_mode():
@@ -174,7 +174,7 @@ def cuda_device_passes_smoke_test(device_index: int) -> tuple[bool, str]:
 
 
 def get_usable_cuda_device_count() -> int:
-    """Count CUDA devices that pass a minimal execution smoke test."""
+    """Count how many CUDA devices pass the minimal execution smoke test."""
     if not torch.cuda.is_available():
         return 0
 
@@ -194,7 +194,7 @@ def get_usable_cuda_device_count() -> int:
 
 
 def resolve_runtime_config(config: Dict[str, Any]) -> None:
-    """Populate runtime device information inside the config."""
+    """Populate device information after checking whether CUDA kernels actually run."""
     usable_gpu_count = get_usable_cuda_device_count()
     if usable_gpu_count > 0:
         config["gpu_count"] = usable_gpu_count
@@ -205,14 +205,14 @@ def resolve_runtime_config(config: Dict[str, Any]) -> None:
 
 
 def convert_to_rgb(image: Any) -> Any:
-    """Convert PIL-like images to RGB before tensor conversion."""
+    """Convert input images to RGB before any resize or tensor conversion."""
     if hasattr(image, "convert"):
         return image.convert("RGB")
     return image
 
 
 def serialize_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert non-JSON config values into string form."""
+    """Convert config values into a JSON-safe representation for checkpoints."""
     serialized: Dict[str, Any] = {}
     for key, value in config.items():
         serialized[key] = str(value) if isinstance(value, torch.dtype) else value
@@ -220,19 +220,19 @@ def serialize_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def tensor_num_bytes(tensor: Optional[torch.Tensor]) -> int:
-    """Return the number of bytes required to transmit a tensor."""
+    """Return how many bytes one tensor would occupy on the wire."""
     if tensor is None:
         return 0
     return int(tensor.numel() * tensor.element_size())
 
 
 def state_dict_num_bytes(state_dict: Dict[str, torch.Tensor]) -> int:
-    """Return the number of bytes required to transmit a state dict."""
+    """Return the total communication cost of one state-dict payload."""
     return sum(tensor_num_bytes(tensor) for tensor in state_dict.values())
 
 
 def extract_trainable_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
-    """Return a CPU copy of every trainable parameter in the model."""
+    """Return a CPU copy of only the trainable parameters in the model."""
     trainable_state: Dict[str, torch.Tensor] = {}
     for name, parameter in model.named_parameters():
         if parameter.requires_grad:
@@ -241,7 +241,7 @@ def extract_trainable_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
 
 
 def prepare_output_dirs(save_dir: str) -> Dict[str, Path]:
-    """Create the checkpoint, metric, and plot directories for a run."""
+    """Create the checkpoint, metric, and plot directories for one run."""
     root = Path(save_dir)
     checkpoints_dir = root / "checkpoints"
     metrics_dir = root / "metrics"
@@ -258,7 +258,7 @@ def prepare_output_dirs(save_dir: str) -> Dict[str, Path]:
 
 
 def build_base_model(config: Dict[str, Any]) -> nn.Module:
-    """Load ViT-MAE and inject adapters into the same layers for all runs."""
+    """Load pretrained ViT-MAE and inject adapters into the shared trainable layers."""
     model = ViTMAEForPreTraining.from_pretrained(config["pretrained_model_name"])
     model = inject_adapters(model, bottleneck_dim=config["adapter_bottleneck_dim"])
     model = model.to(device=config["device"], dtype=config["dtype"])
@@ -276,7 +276,7 @@ def build_base_model(config: Dict[str, Any]) -> nn.Module:
 
 
 def build_gpad_loss(config: Dict[str, Any]) -> GPADLoss:
-    """Instantiate the GPAD loss from the config dictionary."""
+    """Build the GPAD loss object from the current config values."""
     return GPADLoss(
         base_tau=config["gpad_base_tau"],
         temp_gate=config["gpad_temp_gate"],
@@ -287,7 +287,7 @@ def build_gpad_loss(config: Dict[str, Any]) -> GPADLoss:
 
 
 def average_client_metric(client_results: List[Dict[str, float]], key: str) -> float:
-    """Return the mean value of a metric across all clients."""
+    """Return the average of one logged client metric across the current round."""
     if not client_results:
         return 0.0
     return float(sum(result.get(key, 0.0) for result in client_results) / len(client_results))
@@ -298,7 +298,7 @@ def save_history(
     metrics_dir: Path,
     filename: str = "training_history.json",
 ) -> Path:
-    """Write a history dictionary to disk as JSON."""
+    """Write one history dictionary to disk as JSON."""
     history_path = metrics_dir / filename
     with history_path.open("w", encoding="utf-8") as handle:
         json.dump(history, handle, indent=2)
@@ -315,7 +315,7 @@ def save_checkpoint(
     is_final: bool = False,
     include_training_history: bool = True,
 ) -> Path:
-    """Save trainable weights, config, and optional prototypes/history."""
+    """Save one checkpoint with the trainable weights and optional run metadata."""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "round": round_idx,
@@ -337,7 +337,7 @@ def plot_training_history(
     plots_dir: Path,
     prefix: str = "main",
 ) -> Path:
-    """Create the 2x2 federated training summary figure."""
+    """Create the federated training summary figure used by the main run."""
     plots_dir.mkdir(parents=True, exist_ok=True)
     rounds = history.get("round_ids", [])
     figure_path = plots_dir / f"{prefix}_training_summary.png"
@@ -389,7 +389,7 @@ def print_round_summary(
     upload_bytes: int,
     download_bytes: int,
 ) -> None:
-    """Print a concise terminal summary for one completed round."""
+    """Print the key round metrics shown after each communication round."""
     average_loss = average_client_metric(client_results, "loss")
     average_anchor_fraction = average_client_metric(client_results, "anchored_fraction")
     average_novel_fraction = average_client_metric(client_results, "novel_fraction")
@@ -409,7 +409,7 @@ def print_round_summary(
 
 
 def initialize_history() -> Dict[str, Any]:
-    """Create the federated training history container."""
+    """Create the round-history structure used by the federated trainer."""
     return {
         "round_ids": [],
         "round_times": [],
@@ -430,7 +430,7 @@ def initialize_history() -> Dict[str, Any]:
 
 
 def validate_dataset_schedule(config: Dict[str, Any]) -> None:
-    """Check that the client schedule matches the requested run shape."""
+    """Check that the hardcoded client schedule matches the requested run shape."""
     if len(CLIENT_DATASET_SEQUENCE) != config["num_clients"]:
         raise ValueError(
             "The client schedule does not match the configured client count. "
@@ -466,12 +466,12 @@ def validate_dataset_schedule(config: Dict[str, Any]) -> None:
 
 
 def get_num_stages() -> int:
-    """Return the number of sequential stages in the current client schedule."""
+    """Return how many sequential stages exist in the current client schedule."""
     return len(next(iter(CLIENT_DATASET_SEQUENCE.values())))
 
 
 def get_stage_dataset_names(stage_index: int) -> List[str]:
-    """Return the datasets assigned to one stage in client order."""
+    """Return the dataset names assigned to one stage in client order."""
     return [
         CLIENT_DATASET_SEQUENCE[client_index][stage_index]
         for client_index in sorted(CLIENT_DATASET_SEQUENCE)
@@ -481,7 +481,7 @@ def get_stage_dataset_names(stage_index: int) -> List[str]:
 def build_dataset_order_by_stage(
     dataset_sequence: Optional[Dict[Any, Sequence[str]]] = None,
 ) -> List[str]:
-    """Flatten a client schedule into the stage order used across the run."""
+    """Flatten the client schedule into the stage-by-stage order used for logs and eval."""
     sequence = dataset_sequence or CLIENT_DATASET_SEQUENCE
     normalized_sequence = {
         int(client_index): list(dataset_names)
@@ -497,7 +497,7 @@ def build_dataset_order_by_stage(
 
 
 def stable_int_from_parts(seed: int, *parts: str) -> int:
-    """Create a reproducible integer seed from the base seed and text parts."""
+    """Create one reproducible integer seed from a base seed plus string tags."""
     joined = "::".join([str(seed), *parts]).encode("utf-8")
     digest = hashlib.sha256(joined).digest()
     return int.from_bytes(digest[:8], byteorder="big", signed=False)
@@ -508,7 +508,7 @@ def build_deterministic_split_indices(
     seed: int,
     train_fraction: float,
 ) -> Tuple[List[int], List[int]]:
-    """Create a deterministic train/test split for datasets without built-in splits."""
+    """Create a deterministic train/test split for datasets without official splits."""
     generator = torch.Generator().manual_seed(seed)
     indices = torch.randperm(dataset_size, generator=generator).tolist()
     train_size = int(dataset_size * train_fraction)
@@ -523,7 +523,14 @@ def fit_dataset_to_sample_budget(
     target_samples: Optional[int],
     min_samples: Optional[int],
 ) -> torch.utils.data.Dataset:
-    """Fit a split to a fixed sample budget with deterministic sub/over-sampling."""
+    """Fit one split to the configured sample budget in a deterministic way.
+
+    The sample-budget rule is:
+    1. Fail early if the split is below the required minimum.
+    2. Keep the full split when no target sample count is requested.
+    3. Deterministically subsample when the split is larger than the target.
+    4. Deterministically repeat samples when the split is smaller than the target.
+    """
     dataset_size = len(dataset)
     split_name = "train" if train else "test"
 
@@ -577,7 +584,7 @@ def fit_dataset_to_sample_budget(
 
 
 def build_dataset_transform(image_size: int) -> transforms.Compose:
-    """Resize each image for ViT-MAE without applying dataset normalization."""
+    """Resize each image for ViT-MAE without applying dataset-specific normalization."""
     return transforms.Compose(
         [
             transforms.Lambda(convert_to_rgb),
@@ -613,7 +620,11 @@ def load_named_dataset(
     max_samples: Optional[int] = None,
     min_samples: Optional[int] = None,
 ) -> torch.utils.data.Dataset:
-    """Load one named dataset and optionally cap it to a fixed sample budget."""
+    """Load one named dataset and optionally fit it to a training or eval budget.
+
+    This helper centralizes every dataset-specific split rule so the training
+    and evaluation entrypoints all go through the same loading logic.
+    """
     transform = build_dataset_transform(image_size)
     root = Path(data_root) / "multidataset" / dataset_name
 
@@ -821,7 +832,7 @@ def load_named_evaluation_dataset(
     max_samples: Optional[int] = None,
     min_samples: Optional[int] = None,
 ) -> torch.utils.data.Dataset:
-    """Load the non-train split or combined non-train splits for evaluation."""
+    """Load the official held-out split or split-combination used for evaluation."""
     transform = build_dataset_transform(image_size)
     root = Path(data_root) / "multidataset" / dataset_name
 
@@ -907,7 +918,7 @@ def create_standard_dataloader(
 
 
 def pool_model_hidden_states(hidden_states: torch.Tensor) -> torch.Tensor:
-    """Mirror the training-time embedding pooling for later linear evaluation."""
+    """Pool the last hidden state exactly the same way training code does."""
     if hidden_states.size(1) > 1:
         hidden_states = hidden_states[:, 1:, :]
     return hidden_states.mean(dim=1)
@@ -920,7 +931,14 @@ def collect_labeled_embeddings(
     device: str,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Extract normalized embeddings and labels from a dataset split."""
+    """Extract normalized embeddings and labels from one labeled dataset split.
+
+    This is the frozen-feature stage used by linear probing:
+    1. Run the MAE encoder on full images.
+    2. Pool the last hidden state into one embedding per image.
+    3. L2-normalize the embedding.
+    4. Return features and labels on CPU.
+    """
     model.eval()
     feature_batches: List[torch.Tensor] = []
     label_batches: List[torch.Tensor] = []
@@ -965,7 +983,7 @@ def run_linear_probe(
     test_labels: torch.Tensor,
     config: Dict[str, Any],
 ) -> float:
-    """Train a linear probe on frozen features and return test accuracy."""
+    """Train one linear probe on frozen features and return held-out accuracy."""
     if train_features.numel() == 0 or test_features.numel() == 0:
         return 0.0
 
@@ -1026,7 +1044,7 @@ def evaluate_datasets(
     dataset_names: Sequence[str],
     config: Dict[str, Any],
 ) -> Dict[str, float]:
-    """Evaluate frozen representations on a list of datasets with linear probing."""
+    """Evaluate frozen representations on one or more datasets with linear probing."""
     results: Dict[str, float] = {}
     for dataset_name in dataset_names:
         train_dataset = load_named_dataset(
@@ -1096,7 +1114,7 @@ def evaluate_seen_datasets(
 
 
 def main() -> None:
-    """Run the 2-client sequential continual-learning schedule end to end."""
+    """Run the full 2-client sequential federated continual-learning benchmark."""
     config = dict(MULTI_DATASET_CONFIG)
     resolve_runtime_config(config)
     validate_dataset_schedule(config)
@@ -1127,6 +1145,7 @@ def main() -> None:
     set_random_seed(config["seed"])
     output_dirs = prepare_output_dirs(config["save_dir"])
 
+    # Build the shared global objects once before the dataset stages begin.
     logger.info(
         "Starting 2-client sequential run | clients=%s | stages=%s | rounds_per_stage=%s | total_rounds=%s | train_budget=%s | device=%s | output=%s",
         config["num_clients"],
@@ -1181,6 +1200,7 @@ def main() -> None:
         )
         logger.info("Starting stage %s/%s | %s", stage_number, config["num_stages"], stage_label)
 
+        # Load exactly one dataset per client for the current stage.
         stage_datasets: List[torch.utils.data.Dataset] = []
         for client_index, dataset_name in enumerate(stage_dataset_names):
             dataset = load_named_dataset(
@@ -1200,6 +1220,7 @@ def main() -> None:
                 len(dataset),
             )
 
+        # Build one dataloader per client after the stage datasets are ready.
         stage_dataloaders = [
             create_standard_dataloader(
                 dataset=dataset,
@@ -1211,6 +1232,7 @@ def main() -> None:
             for dataset in stage_datasets
         ]
 
+        # Run the configured number of communication rounds for this stage.
         for stage_round in range(1, config["rounds_per_dataset"] + 1):
             global_round_idx += 1
             logger.info(
@@ -1240,6 +1262,7 @@ def main() -> None:
             client_prototype_counts: List[int] = []
 
             for client_index, client in enumerate(client_manager.clients):
+                # Stage round 1 refreshes prototypes from the current dataset; later rounds reuse local memory.
                 if stage_round == 1:
                     local_prototypes = client.generate_prototypes(
                         stage_dataloaders[client_index],
@@ -1281,6 +1304,7 @@ def main() -> None:
             global_prototypes = aggregated_prototypes.detach().cpu()
             round_time = time.time() - round_start
 
+            # Store the full round state so plots, JSON logs, and later analysis stay in sync.
             training_history["round_ids"].append(global_round_idx)
             training_history["round_times"].append(round_time)
             training_history["avg_total_loss"].append(
@@ -1349,6 +1373,7 @@ def main() -> None:
                 prefix="main",
             )
 
+        # Release only the stage-local dataloaders and datasets before moving to the next pair.
         logger.info("Stage %s complete | releasing stage dataloaders and cached tensors", stage_number)
         del stage_dataloaders
         del stage_datasets

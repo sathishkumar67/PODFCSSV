@@ -2,36 +2,136 @@
 
 Prototype-Oriented Distillation for Federated Continual Self-Supervised Vision.
 
-This repository implements a federated continual self-supervised learning pipeline built around a frozen ViT-MAE backbone, trainable residual adapters, client-side novelty handling, and a server-side global prototype bank.
+This repository contains three aligned entrypoints built on the same pretrained `facebook/vit-mae-base` backbone with injected residual adapters:
 
-## What Is In The Repo
+- `main.py`: federated continual learning with 2 clients and GPAD
+- `base.py`: single-model continual learning without federation or GPAD
+- `evaluate.py`: frozen-feature linear-probe comparison between saved `main.py` and `base.py` checkpoints
 
-- `main.py`
-  Runs the 2-client sequential continual-learning experiment with 6 datasets, balanced sample fitting, stage-wise dataset progression, training metrics, saved plots, JSON history, and checkpoints.
-- `base.py`
-  Runs the single-model continual baseline on the same 6-dataset sequence with reconstruction-only training, post-dataset evaluation, forgetting metrics, and comparison plots.
-- `evaluate.py`
-  Loads a saved checkpoint later and compares it against the base Hugging Face model with a separate linear-probe pass.
+## Current Pipeline
+
+### `main.py`
+
+`main.py` is the main experiment entrypoint.
+
+It runs a 2-client sequential schedule over 6 datasets:
+
+- Client 0: `EuroSAT` -> `Oxford-IIIT Pet` -> `Flowers102`
+- Client 1: `GTSRB` -> `FGVC Aircraft` -> `DTD`
+
+Each stage trains one dataset per client in parallel, then moves to the next pair.
+
+The federated stage loop is:
+
+1. Load one dataset per client for the current stage.
+2. Fit each training split to an effective budget of `10000` samples.
+3. Run local MAE reconstruction and GPAD on both clients.
+4. Generate or reuse local prototypes.
+5. Merge prototypes and average adapter weights on the server.
+6. Broadcast the updated adapter weights to both clients.
+7. Preserve global prototypes, local prototypes, novelty buffers, and optimizer state across dataset transitions.
+8. Save checkpoints, JSON history, and plots.
+
+Important current behavior:
+
+- no ImageNet normalization in the multi-dataset path
+- RGB conversion + resize + `ToTensor()` only
+- train splits smaller than `1000` samples are rejected
+- larger splits are deterministically subsampled to the configured budget
+- smaller valid splits are deterministically repeated up to the configured budget
+- CUDA is used only if a real kernel-execution smoke test passes
+
+Outputs:
+
+```text
+multidataset_outputs_2client/
+  checkpoints/
+  metrics/
+  plots/
+```
+
+### `base.py`
+
+`base.py` is the single-model continual baseline.
+
+It uses the same adapter-injected MAE model as `main.py`, but:
+
+- there is only one model
+- there is no federation
+- there is no GPAD
+- training uses only reconstruction loss
+- the full train split is used for each dataset
+- model weights and optimizer state persist across dataset transitions
+
+The dataset order follows the same stage order flattened into one sequence:
+
+- `EuroSAT`
+- `GTSRB`
+- `Oxford-IIIT Pet`
+- `FGVC Aircraft`
+- `Flowers102`
+- `DTD`
+
+Outputs:
+
+```text
+base_outputs/
+  checkpoints/
+  metrics/
+  plots/
+```
+
+### `evaluate.py`
+
+`evaluate.py` compares a saved federated checkpoint and a saved baseline checkpoint.
+
+The evaluation flow is:
+
+1. Load both checkpoints into the same adapter-injected MAE architecture.
+2. Freeze both models.
+3. Use encoder-only inference with `mask_ratio = 0.0`.
+4. Extract frozen features from full images.
+5. Train one dataset-specific linear probe per checkpoint.
+6. Evaluate on the official held-out split for that dataset.
+7. Save JSON metrics and comparison plots.
+
+Probe-fit policy:
+
+- if train split `< 1000`: skip the dataset
+- if train split is `1000..10000`: use the full train split
+- if train split `> 10000`: use a deterministic `4000`-sample subset
+
+Held-out evaluation policy:
+
+- if both `val` and `test` exist in the repo loader, both are used
+- if only one official held-out split exists, that split is used
+- if the repo only has a generated split and no official held-out split, the dataset is skipped
+
+Saved evaluation metrics:
+
+- accuracy
+- macro precision
+- macro recall
+- macro F1
+- eval loss
+
+Saved evaluation artifacts:
+
+- side-by-side bar charts
+- federated-minus-base delta charts
+- accuracy heatmap
+- JSON summary with evaluated and skipped datasets
+
+## Core Modules
+
 - `src/mae_with_adapter.py`
-  Freezes the backbone and injects adapters into the upper half of the transformer.
+  Freezes ViT-MAE and injects residual adapters into the upper half of the encoder.
 - `src/loss.py`
-  Implements GPAD with entropy-adaptive thresholding and the paper's `>=` anchor rule.
+  Implements GPAD, including adaptive thresholds, anchor masks, and the gated prototype loss.
 - `src/client.py`
-  Handles local MAE training, GPAD routing, local EMA prototype updates, novelty buffering, and spherical K-means.
+  Handles local MAE training, GPAD routing, local prototype updates, novelty buffering, and local spherical K-means.
 - `src/server.py`
-  Handles global prototype merge-or-add, FedAvg aggregation, and server-side EMA smoothing.
-
-## Key Corrections In This Version
-
-- GPAD gradients now reach the adapters instead of being cut off by detached embeddings.
-- Server-aggregated adapter weights are broadcast back to every client before the next round.
-- Weight aggregation is fixed for true multi-client runs.
-- Round-1 prototype extraction and later GPAD routing now use the same embedding definition.
-- The Dirichlet partition no longer drops leftover samples after integer rounding.
-- Configured local epochs are now honored during client-side training.
-- Tiny ImageNet preprocessing matches the expected normalization for `facebook/vit-mae-base`.
-- The 2-client sequential run intentionally avoids ImageNet-style normalization and uses only RGB conversion, resize, and `ToTensor()`.
-- Training history, communication statistics, checkpoints, JSON metrics, and plots are written automatically.
+  Handles prototype-bank updates, FedAvg-style adapter aggregation, and server-side EMA smoothing.
 
 ## Installation
 
@@ -41,112 +141,39 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Run The Federated Sequential Experiment
+## Run
+
+Federated continual run:
 
 ```bash
 python main.py
 ```
 
-This script:
-
-1. Loads `facebook/vit-mae-base`.
-2. Injects adapters into the upper half of the encoder.
-3. Assigns one client per GPU across the 2-client sequential schedule.
-4. Trains clients with MAE reconstruction and GPAD.
-5. Aggregates local prototypes and adapter weights at the server.
-6. Broadcasts the updated adapter state back to every client.
-7. Saves checkpoints, training history JSON, and plots.
-
-Outputs are written under:
-
-```text
-multidataset_outputs/
-  checkpoints/
-  metrics/
-  plots/
-```
-
-## Run The Single-Model Continual Baseline
+Single-model continual baseline:
 
 ```bash
 python base.py
 ```
 
-This script keeps the same adapter-injected ViT-MAE model but removes federation and GPAD:
-
-- Dataset order: `EuroSAT` -> `GTSRB` -> `Oxford-IIIT Pet` -> `FGVC Aircraft` -> `Flowers102` -> `DTD`
-- One model is trained on the full train split of each dataset in sequence.
-- Evaluation runs after each dataset using the non-train split(s) of every seen dataset.
-- The baseline saves forgetting metrics and plots so catastrophic forgetting can be measured directly.
-
-Outputs are written under:
-
-```text
-base_outputs/
-  checkpoints/
-  metrics/
-  plots/
-```
-
-## Publication-Oriented Artifacts
-
-Both entrypoints save:
-
-- JSON training history
-- Adapter-only checkpoints
-- Global prototype snapshots
-- Loss curves
-- Routing-fraction plots
-- Communication-cost plots
-
-`base.py` also saves:
-
-- Stage-by-stage evaluation history
-- Accuracy heatmaps and final accuracy bars
-- Forgetting plots for the continual baseline
-
-## Compare A Saved Checkpoint Later
+Checkpoint comparison:
 
 ```bash
-python evaluate.py path\to\final_model.pt --datasets eurosat gtsrb svhn
+python evaluate.py path\to\federated_final_model.pt path\to\base_final_model.pt
 ```
 
-This script rebuilds the checkpoint config, restores the saved dataset order by default, and compares the fine-tuned adapter model against the untouched Hugging Face base model with a separate linear-probe pass.
+Optional dataset override:
 
-## Configuration
-
-The central training config lives in `main.py` as `CONFIG`.
-
-Important fields:
-
-- `num_clients`
-- `rounds_per_dataset`
-- `local_epochs`
-- `client_lr`
-- `merge_threshold`
-- `gpad_base_tau`
-- `client_local_update_threshold`
-- `k_init_prototypes`
-- `novelty_buffer_size`
-
-The sequential entrypoints extend that config with:
-
-- `train_samples_per_dataset`
-- `min_train_samples_per_dataset`
-- `max_global_prototypes`
-- `linear_eval_batch_size`
-- `linear_eval_epochs`
-- `linear_eval_lr`
-- `linear_eval_weight_decay`
+```bash
+python evaluate.py path\to\federated_final_model.pt path\to\base_final_model.pt --datasets gtsrb fgvcaircraft flowers102 dtd
+```
 
 ## Notes
 
-- `train.ipynb` is a lightweight notebook wrapper for manual experimentation.
-- The multi-dataset script intentionally spans satellite, medical, sentiment-text, scene, traffic, face, pet, food, and character domains instead of reusing ImageNet-1K itself.
-- `PCAM` uses an HDF5-backed dataset reader, so `h5py` is included in the project dependencies.
-- Only trainable adapter parameters are exchanged during federation; the frozen MAE backbone is never averaged.
-- The checkpoints written by `main.py` and `base.py` both store the dataset sequence so later evaluation can recover the correct default order.
+- Only trainable adapter parameters are exchanged during federation.
+- The pretrained MAE backbone remains frozen in all three entrypoints.
+- `main.py` and `base.py` both save the dataset sequence inside checkpoints so later evaluation can recover the correct default order.
+- If a CUDA runtime reports availability but cannot execute kernels, the repo now falls back earlier instead of failing deep inside the first convolution.
 
 ## License
 
-This project is released under the MIT License. See `LICENSE`.
+This project is released under the MIT License.

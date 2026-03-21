@@ -10,18 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Checkpoint Comparison Script** (`evaluate.py`): Added a standalone evaluation entrypoint that compares a saved adapter checkpoint against the original Hugging Face base model on one or more datasets.
-- **Single-Model Continual Baseline** (`base.py`): Added a reconstruction-only continual baseline that uses the same adapter-injected ViT-MAE model, trains on one dataset at a time, evaluates on non-train splits, and tracks forgetting.
+- **Dual-Checkpoint Evaluator** (`evaluate.py`): Added a standalone evaluation entrypoint that compares saved `main.py` and `base.py` checkpoints with frozen-feature linear probes, dataset-wise metrics, JSON output, and comparison plots.
 
 ### Changed
-- **Main Entrypoint Swap** (`main.py`): Promoted the sequential federated multi-dataset run into `main.py` and removed `new_main.py`.
-- **Balanced Dataset Timing** (`main.py`): The 2-client sequential federated run still uses deterministic per-dataset sample fitting so each client trains on an effective 10,000 images per stage.
-- **Sequential Preprocessing Policy** (`main.py`, `base.py`): The multi-dataset paths keep RGB conversion and resizing without ImageNet-style normalization.
-- **Separated Evaluation Flow** (`main.py`, `evaluate.py`): The federated trainer still skips in-training linear-probe evaluation, while `base.py` now owns the continual forgetting baseline and `evaluate.py` remains the checkpoint comparison entrypoint.
-- **Sequential Client Memory Persistence** (`src/client.py`, `main.py`): The federated sequential run keeps each client's local prototypes, novelty buffer, and optimizer state across dataset transitions to better match a real-world continual setting.
+- **Current Main Entrypoint** (`main.py`): `main.py` remains the federated 2-client, 6-dataset sequential benchmark with persistent local memory, adapter-only communication, and deterministic `10000`-sample train budgets.
+- **Current Baseline Entrypoint** (`base.py`): `base.py` is now the reconstruction-only continual baseline that uses the same adapter-injected model but trains a single model across the full train splits without federation or GPAD.
+- **Current Evaluation Policy** (`evaluate.py`): Linear probes now use the train split for fitting, use official held-out splits for reporting, cap oversized train splits at a deterministic `4000` samples, and skip datasets that do not have a real held-out split or have fewer than `1000` train samples.
+- **Documentation Refresh** (`README.md`, `CONTRIBUTING.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Repository documentation now reflects the current 2-client federated run, the current single-model baseline, and the current evaluation flow.
+- **Python Documentation Refresh** (`main.py`, `base.py`, `evaluate.py`, `src/*.py`): Module docstrings and key function docstrings were rewritten in a step-by-step style to match the current pipeline.
 
 ### Fixed
-- **Checkpoint-Aware Dataset Order** (`evaluate.py`, `main.py`, `base.py`): Evaluation now reads the saved dataset sequence from checkpoint metadata instead of assuming an outdated hardcoded schedule.
+- **CUDA Runtime Validation** (`main.py`, `evaluate.py`): The runtime now validates that CUDA can execute a small kernel before treating a GPU as usable, preventing deep training failures on incompatible CUDA environments.
+- **Base-Path Transfer Stability** (`base.py`): Removed the non-blocking input transfer path from the single-model baseline after compatibility issues on some CUDA environments.
+- **Checkpoint-Aware Dataset Order** (`evaluate.py`, `main.py`, `base.py`): Evaluation still reads the saved dataset sequence from checkpoint metadata instead of assuming an outdated hardcoded schedule.
 
 ## [0.6.0] - 2026-03-14
 

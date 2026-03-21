@@ -1,12 +1,12 @@
-"""Linear-probe comparison for the federated and single-model checkpoints.
+"""Compare the federated checkpoint and the baseline checkpoint with linear probes.
 
-This script evaluates the two trained checkpoints side by side:
-1. Load the federated checkpoint and the single-model baseline checkpoint.
-2. Freeze both models and use only the encoder path for feature extraction.
-3. Disable MAE masking so evaluation uses full images.
-4. Train one dataset-specific linear probe per model and dataset.
-5. Use the train split for probe fitting and the non-train split(s) for testing.
-6. Save per-dataset metrics plus summary plots.
+The evaluation path is intentionally separate from training:
+1. Load the saved federated model and the saved baseline model.
+2. Freeze both models and keep only the encoder path active.
+3. Disable MAE masking so full images pass through the encoder.
+4. Extract frozen features for one dataset at a time.
+5. Fit one dataset-specific linear probe per model.
+6. Evaluate on the official non-train split(s) and save comparison outputs.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ PROBE_MIN_TRAIN_SAMPLES = 1000
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments for the dual-checkpoint evaluator."""
+    """Parse the two checkpoint paths and the optional evaluation settings."""
     parser = argparse.ArgumentParser(
         description="Compare the federated checkpoint against the single-model baseline with linear probes.",
     )
@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def deserialize_config(serialized_config: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert serialized checkpoint config values back into runtime types."""
+    """Convert config values loaded from a checkpoint back into runtime objects."""
     config = dict(serialized_config)
     dtype_value = config.get("dtype")
     if isinstance(dtype_value, str) and dtype_value in TORCH_DTYPE_LOOKUP:
@@ -100,7 +100,7 @@ def deserialize_config(serialized_config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_runtime_config(checkpoint_path: Path) -> Dict[str, Any]:
-    """Build a runtime config from defaults plus checkpoint metadata."""
+    """Build a runtime config by combining defaults with checkpoint metadata."""
     config = dict(MULTI_DATASET_CONFIG)
     if checkpoint_path.is_file():
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -110,7 +110,7 @@ def build_runtime_config(checkpoint_path: Path) -> Dict[str, Any]:
 
 
 def default_dataset_order(*configs: Dict[str, Any]) -> List[str]:
-    """Recover the dataset order from checkpoint metadata when available."""
+    """Recover the saved stage order so evaluation follows the training sequence."""
     for config in configs:
         dataset_sequence = config.get("client_dataset_sequence")
         if isinstance(dataset_sequence, dict) and dataset_sequence:
@@ -119,7 +119,7 @@ def default_dataset_order(*configs: Dict[str, Any]) -> List[str]:
 
 
 def freeze_encoder_model(model: nn.Module) -> None:
-    """Freeze all parameters and disable masking for encoder-only evaluation."""
+    """Freeze every parameter and disable MAE masking for encoder-only evaluation."""
     for parameter in model.parameters():
         parameter.requires_grad = False
     if hasattr(model, "config") and hasattr(model.config, "mask_ratio"):
@@ -130,7 +130,7 @@ def freeze_encoder_model(model: nn.Module) -> None:
 
 
 def choose_devices(usable_gpu_count: int) -> Tuple[str, str]:
-    """Choose one device per model when possible."""
+    """Choose one device per model based on the usable-GPU count."""
     if usable_gpu_count >= 2:
         return "cuda:0", "cuda:1"
     if usable_gpu_count == 1:
@@ -139,7 +139,7 @@ def choose_devices(usable_gpu_count: int) -> Tuple[str, str]:
 
 
 def supports_official_eval_split(dataset_name: str) -> bool:
-    """Return whether a dataset has an official held-out split in this pipeline."""
+    """Return whether the dataset has an official held-out split in this repo."""
     return dataset_name not in GENERATED_EVAL_SPLIT_DATASETS
 
 
@@ -147,7 +147,13 @@ def load_probe_train_dataset(
     dataset_name: str,
     config: Dict[str, Any],
 ) -> torch.utils.data.Dataset | None:
-    """Load the train split used to fit the linear probe."""
+    """Load the train split used to fit the linear probe.
+
+    The probe-fit rule is:
+    1. Skip datasets with fewer than 1,000 train samples.
+    2. Use the full train split when it has 1,000 to 10,000 samples.
+    3. Use a deterministic 4,000-sample subset when the train split is larger.
+    """
     full_train_dataset = load_named_dataset(
         dataset_name=dataset_name,
         data_root=config["data_root"],
@@ -183,7 +189,7 @@ def load_probe_eval_dataset(
     dataset_name: str,
     config: Dict[str, Any],
 ) -> torch.utils.data.Dataset | None:
-    """Load the held-out eval/test split(s) for one dataset."""
+    """Load the official held-out split or split-combination for one dataset."""
     if not supports_official_eval_split(dataset_name):
         logger.warning(
             "Skipping %s because it does not have an official eval/test split in this pipeline.",
@@ -212,7 +218,7 @@ def load_checkpoint_model(
     config: Dict[str, Any],
     device: str,
 ) -> nn.Module:
-    """Load a checkpoint into the adapter-injected model and freeze it."""
+    """Load one checkpoint into the shared adapter-injected MAE architecture."""
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -242,7 +248,14 @@ def collect_encoder_features(
     device: str,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Collect frozen encoder features and labels for one dataset split."""
+    """Collect frozen encoder features and labels for one dataset split.
+
+    This helper is the feature-extraction stage:
+    1. Move images to the selected device.
+    2. Run the encoder with masking disabled.
+    3. Pool the last hidden state into one vector per image.
+    4. Return the features and labels on CPU for probe training.
+    """
     feature_batches: List[torch.Tensor] = []
     label_batches: List[torch.Tensor] = []
 
@@ -263,7 +276,7 @@ def remap_labels(
     train_labels: torch.Tensor,
     eval_labels: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Map dataset labels into a dense contiguous range for probing."""
+    """Map arbitrary dataset labels into ``0..num_classes-1`` for the probe."""
     unique_labels = torch.unique(torch.cat([train_labels, eval_labels], dim=0)).tolist()
     mapping = {original_label: new_label for new_label, original_label in enumerate(unique_labels)}
     remapped_train = train_labels.clone()
@@ -279,7 +292,7 @@ def compute_classification_metrics(
     labels: torch.Tensor,
     num_classes: int,
 ) -> Dict[str, float]:
-    """Compute accuracy, macro precision, macro recall, macro F1, and eval loss."""
+    """Compute the classification metrics saved for one dataset and one model."""
     loss = nn.CrossEntropyLoss()(logits, labels).item()
     predictions = logits.argmax(dim=1)
     accuracy = float((predictions == labels).float().mean().item())
@@ -309,7 +322,14 @@ def train_and_eval_linear_probe(
     config: Dict[str, Any],
     shuffle_seed: int,
 ) -> Dict[str, Any]:
-    """Fit a one-layer linear probe and evaluate it on the held-out split."""
+    """Fit one linear probe and evaluate it on the held-out split.
+
+    Both checkpoints follow the same probe recipe:
+    1. Build a dataset-specific linear head.
+    2. Train it on frozen encoder features from the train split.
+    3. Evaluate it on the official held-out split.
+    4. Return a compact metric dictionary for comparison plots and JSON logs.
+    """
     if train_features.numel() == 0 or eval_features.numel() == 0:
         return {
             "accuracy": 0.0,
@@ -431,7 +451,7 @@ def evaluate_single_model_on_dataset(
 
 
 def print_comparison_table(results: Dict[str, Dict[str, Dict[str, Any]]], dataset_names: Sequence[str]) -> None:
-    """Print a compact federated-vs-base comparison table."""
+    """Print a compact terminal table for the federated-vs-base comparison."""
     header = f"{'Dataset':<20} {'Fed Acc':>10} {'Base Acc':>10} {'Delta':>10} {'Fed F1':>10} {'Base F1':>10}"
     separator = "-" * len(header)
     print(separator)
@@ -458,7 +478,7 @@ def get_evaluated_dataset_names(
     results: Dict[str, Dict[str, Dict[str, Any]]],
     dataset_names: Sequence[str],
 ) -> List[str]:
-    """Return only datasets that produced valid held-out evaluation results."""
+    """Return only the datasets that produced valid held-out evaluation results."""
     return [
         dataset_name
         for dataset_name in dataset_names
@@ -468,7 +488,7 @@ def get_evaluated_dataset_names(
 
 
 def save_results(output_dir: Path, dataset_names: Sequence[str], results: Dict[str, Dict[str, Dict[str, Any]]]) -> Path:
-    """Write evaluation metrics to JSON."""
+    """Write the full evaluation payload and summary metrics to JSON."""
     output_dir.mkdir(parents=True, exist_ok=True)
     evaluated_dataset_names = get_evaluated_dataset_names(results, dataset_names)
     skipped_dataset_names = [
@@ -529,7 +549,7 @@ def plot_comparison_bars(
     title: str,
     filename: str,
 ) -> Path:
-    """Plot one dataset-wise bar chart for a comparison metric."""
+    """Plot one side-by-side comparison bar chart for a chosen metric."""
     output_dir.mkdir(parents=True, exist_ok=True)
     evaluated_dataset_names = get_evaluated_dataset_names(results, dataset_names)
     output_path = output_dir / filename
@@ -563,7 +583,7 @@ def plot_delta_bars(
     title: str,
     filename: str,
 ) -> Path:
-    """Plot federated-minus-base deltas for one metric."""
+    """Plot federated-minus-base deltas so gains and regressions are obvious."""
     output_dir.mkdir(parents=True, exist_ok=True)
     evaluated_dataset_names = get_evaluated_dataset_names(results, dataset_names)
     output_path = output_dir / filename
@@ -623,7 +643,7 @@ def plot_accuracy_heatmap(
 
 
 def main() -> None:
-    """Run the dual-checkpoint linear-probe comparison."""
+    """Run the full dual-checkpoint linear-probe comparison."""
     args = parse_args()
     federated_config = build_runtime_config(args.federated_checkpoint_path)
     base_config = build_runtime_config(args.base_checkpoint_path)
@@ -652,11 +672,13 @@ def main() -> None:
         base_device,
     )
 
+    # Both checkpoints are loaded into the same adapter-injected MAE shape.
     federated_model = load_checkpoint_model(args.federated_checkpoint_path, federated_config, federated_device)
     base_model = load_checkpoint_model(args.base_checkpoint_path, base_config, base_device)
 
     results: Dict[str, Dict[str, Dict[str, Any]]] = {"federated": {}, "base": {}}
     for dataset_name in dataset_names:
+        # The two probes see the same dataset order but train independently.
         if federated_device != base_device:
             with ThreadPoolExecutor(max_workers=2) as executor:
                 federated_future = executor.submit(

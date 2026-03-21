@@ -1,191 +1,124 @@
 # Contributing to PODFCSSV
 
-Thank you for considering contributing to **PODFCSSV**! This document provides guidelines for researchers and engineers looking to extend or improve the framework.
+Thank you for contributing to **PODFCSSV**. This guide reflects the current repository layout and the current training and evaluation flow.
 
----
+## Setup
 
-## Getting Started
-
-### 1. Clone the Repository
+Clone the repository:
 
 ```bash
 git clone https://github.com/sathishkumar67/PODFCSSV.git
 cd PODFCSSV
 ```
 
-### 2. Set Up the Development Environment
+Create and activate an environment:
 
 ```bash
-# Create a virtual environment
 python -m venv .venv
-
-# Activate it
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
-
-# Install dependencies (with dev extras)
-pip install -e ".[dev]"
 ```
 
-### 3. Verify the Installation
+```bash
+# Windows
+.venv\Scripts\activate
+
+# macOS / Linux
+source .venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Quick import check:
 
 ```bash
 python -c "from src import GPADLoss, ClientManager; print('Imports OK')"
 ```
 
-### 4. Run the Pipeline
+## Current Entry Points
+
+Run the current scripts like this:
 
 ```bash
 python main.py
-```
-
-This loads the pre-trained `facebook/vit-mae-base` checkpoint, injects IBA adapters, freezes the backbone, and runs the federated sequential multi-dataset learning loop.
-
-For the single-model continual baseline, use:
-
-```bash
-python main.py
-```
-
-For the single-model continual baseline, use:
-
-```bash
 python base.py
+python evaluate.py path\to\federated_final_model.pt path\to\base_final_model.pt
 ```
 
----
+Current intent of each entrypoint:
 
-## Architecture Overview
+- `main.py`: federated continual learning with 2 clients, 6 datasets, and GPAD
+- `base.py`: single-model continual learning with reconstruction loss only
+- `evaluate.py`: frozen-feature linear-probe comparison between saved checkpoints
 
-Understanding the codebase requires familiarity with its four main modules:
+## Shared Architecture
+
+The main shared modules are:
 
 | Module | Responsibility |
 |---|---|
-| `src/loss.py` | GPAD loss computation, adaptive thresholding, and anchor mask generation |
-| `src/client.py` | Local training, per-embedding routing (anchored / local / novel), novelty buffer, K-Means clustering |
-| `src/server.py` | Global prototype bank (merge-or-add with EMA), FedAvg weight aggregation |
-| `src/mae_with_adapter.py` | Information-Bottleneck Adapter injection into frozen ViT-MAE blocks; backbone freezing |
+| `src/mae_with_adapter.py` | freeze ViT-MAE and inject residual adapters |
+| `src/loss.py` | GPAD loss, adaptive thresholds, anchor masks |
+| `src/client.py` | client-side MAE training, routing, novelty buffering, local prototypes |
+| `src/server.py` | global prototype merging and adapter-weight averaging |
 
-### Key Data Flow
+## Documentation Style
 
-```
-Server broadcasts global prototypes + averaged weights
-    → Client trains with MAE + GPAD (per-embedding routing)
-        → Anchored embeddings: GPAD loss pulls toward global prototypes
-        → Non-anchored, locally similar: EMA-update local prototype
-        → Truly novel: Accumulate in novelty buffer → K-Means when full → Merge-or-Add
-    → Client uploads local prototypes + adapter weights
-→ Server merges prototypes (EMA merge-or-add) + averages weights (FedAvg)
-```
+Python files use a clear, step-by-step documentation style.
 
----
+When updating docstrings or comments:
 
-## Development Workflow
+- explain what stage of the pipeline the code belongs to
+- explain the order of the important steps
+- explain what state persists across rounds or dataset transitions
+- explain why a branch exists when the behavior is not obvious
+- prefer implementation clarity over dense research prose
 
-### Code Style
+Inline comments should be used sparingly and should explain the purpose of a block, not narrate each line.
 
-This project uses [Ruff](https://docs.astral.sh/ruff/) for linting and formatting. Configuration is in `ruff.toml`.
+## Development Guidelines
+
+### Linting and Formatting
 
 ```bash
-# Check for lint issues
 ruff check .
-
-# Auto-fix fixable issues
-ruff check --fix .
-
-# Format code
 ruff format .
 ```
 
-### Naming Conventions
+### Device and Dtype Handling
 
-Mathematical variable names (e.g., `K`, `N`, `D`, `X`, `Z`) follow standard research notation and are exempted from PEP 8 lowercase rules via `ruff.toml`. This is intentional — do not rename them.
+- respect the shared `dtype` and `device` settings
+- avoid hardcoded dtype casts unless they are genuinely required
+- keep tensor-device movement explicit
+- remember that the repo now validates that CUDA can execute a real kernel before using a GPU
 
-### Docstrings
+### Keeping the Entry Points Aligned
 
-The codebase now uses a **clear, step-by-step** documentation style. Public components should explain:
-- what stage of the pipeline they belong to
-- what data enters and leaves that stage
-- what state persists across rounds or dataset transitions
-- why a branch or reset exists when the behavior is non-obvious
+If you change one entrypoint, check the others:
 
-Prefer implementation-oriented explanations over dense research prose. Use notation only when it genuinely improves clarity.
-
-### Inline Comments
-
-Inline comments should explain the **"why"**, not the **"what"**:
-- Include tensor shape annotations: `# [B, K] similarity matrix`.
-- Reference algorithmic context: `# EMA blend is not a unit vector → re-normalize`.
-- Explain edge cases: `# Buffer may trigger with fewer samples than novelty_k`.
-- Every hyperparameter used in code should reference its CONFIG key in a nearby comment.
-
-### Dtype Consistency
-
-All tensor operations must respect the centralized `CONFIG["dtype"]` setting from `main.py`. **Never** use hardcoded `.float()`, `.double()`, or `.half()` casts. Instead:
-- Use `.to(tensor.dtype)` when converting boolean masks to the input tensor's dtype.
-- Use `self.dtype` (threaded from CONFIG) when casting inputs.
-- Use `ref_param.dtype` when matching a backbone parameter's precision.
-
-This ensures that switching between `float32` and `bfloat16` in CONFIG propagates correctly through every file.
-
-### Hyperparameter Range Comments
-
-All tunable hyperparameters in `CONFIG` (in `main.py`) include range comments for future tuning. When adding new hyperparameters:
-1. Add the parameter to `CONFIG` with a descriptive comment and `Range: X–Y` or `Options: A, B, C`.
-2. Wire it through the relevant component constructors.
-3. Document it in the README.md CONFIG reference tables.
-
----
-
-## Adding New Features
-
-### Adding a New Loss Component
-
-1. Implement the loss class in `src/loss.py`.
-2. Add any new hyperparameters to `CONFIG` in `main.py` with descriptive comments.
-3. Wire the loss into `FederatedClient.train_epoch()` in `src/client.py`.
-4. Update `src/__init__.py` for public import access.
-
-### Adding a New Routing Strategy
-
-1. The per-embedding routing logic lives in `FederatedClient.train_epoch()` and `_route_non_anchored()`.
-2. To add a new routing branch, modify the decision tree after the anchor mask check.
-3. Document the routing decision clearly in docstrings.
-
-### Adding a New Aggregation Strategy
-
-1. Server-side aggregation happens in `src/server.py`.
-2. `GlobalPrototypeBank` handles prototype merging; `FederatedModelServer` handles weight averaging.
-3. To change aggregation (e.g., weighted FedAvg), modify `aggregate_weights()`.
-
----
+- `main.py` and `base.py` should keep using the same adapter-injected MAE architecture
+- `evaluate.py` should stay compatible with the checkpoint layout written by `main.py` and `base.py`
+- README and the pipeline guide should be updated whenever the pipeline behavior changes
 
 ## Submitting Changes
 
-1. **Fork** the repository and create a feature branch from `main`.
-2. Make your changes with clear, descriptive commit messages.
-3. Ensure code passes `ruff check .` with no errors.
-4. Run the full pipeline `python main.py` and confirm `Pipeline Finished Successfully.`
-5. Open a **Pull Request** with a description of:
-   - What changed and why.
-   - Any new hyperparameters added to `CONFIG`.
-   - Any new dependencies added.
-   - How you tested the changes.
-
----
+1. Create a branch from `main`.
+2. Make focused changes with clear commit messages.
+3. Run at least the relevant syntax, lint, or smoke checks.
+4. Update documentation when pipeline behavior changes.
+5. Open a pull request that explains what changed, why it changed, and how it was tested.
 
 ## Reporting Issues
 
-Please use [GitHub Issues](https://github.com/sathishkumar67/PODFCSSV/issues) with:
+When reporting issues, include:
 
-- A clear title and description.
-- Steps to reproduce the problem.
-- Your environment (OS, Python version, PyTorch version, CUDA version).
-- Relevant log output.
-
----
+- a clear description of the problem
+- exact reproduction steps
+- Python, PyTorch, and CUDA versions
+- GPU type if CUDA is involved
+- relevant logs or stack traces
 
 ## License
 

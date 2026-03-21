@@ -1,17 +1,16 @@
-"""Client-side learning, routing, and local prototype maintenance.
+"""Run client-side training, routing, and local memory updates.
 
-Each client owns one isolated copy of the adapter-augmented MAE model and
-repeats the same local cycle:
-1. Receive the newest global adapter weights.
-2. Train locally with MAE reconstruction.
-3. Use GPAD only on samples anchored to the global prototype bank.
-4. Route the remaining samples to a local EMA update or the novelty buffer.
-5. Cluster the novelty buffer when it fills up.
-6. Return trainable weights plus local prototypes to the server.
+Each federated client follows the same sequence every round:
+1. Receive the newest global adapter weights from the server.
+2. Run MAE reconstruction on its local mini-batches.
+3. Apply GPAD only to samples that confidently match the global bank.
+4. Route non-anchored samples to local prototypes or the novelty buffer.
+5. Cluster the novelty buffer when it becomes full.
+6. Return trainable weights and local prototypes to the server.
 
-In sequential runs, the same local prototype bank, novelty buffer, and
-optimizer state continue across dataset transitions so each client carries its
-accumulated local memory forward into the next dataset.
+Across datasets in the sequential benchmark, local prototypes, novelty
+contents, and optimizer state are intentionally preserved so each client keeps
+its accumulated memory instead of resetting between tasks.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 def _empty_routing_stats() -> Dict[str, int]:
-    """Return a fresh routing-statistics dictionary."""
+    """Create one fresh routing-statistics container for a batch or round."""
     return {
         "local_matches": 0,
         "novel_samples": 0,
@@ -42,7 +41,7 @@ def _empty_routing_stats() -> Dict[str, int]:
 
 
 class FederatedClient:
-    """Represent one isolated federated participant."""
+    """Represent one isolated federated participant and its persistent local memory."""
 
     def __init__(
         self,
@@ -91,20 +90,21 @@ class FederatedClient:
         )
 
     def sync_trainable_weights(self, global_weights: Dict[str, torch.Tensor]) -> None:
-        """Load the latest server weights into the local model.
+        """Load the latest server adapter weights into the local model copy.
 
-        Only trainable adapter weights are expected here, so ``strict=False`` is
-        the correct loading mode.
+        Only trainable adapter parameters are exchanged, so ``strict=False`` is
+        the correct behavior and keeps the frozen MAE backbone untouched.
         """
         if not global_weights:
             return
         self.model.load_state_dict(global_weights, strict=False)
 
     def get_trainable_state(self) -> Dict[str, torch.Tensor]:
-        """Return a CPU copy of all trainable parameters.
+        """Return a CPU copy of only the trainable adapter parameters.
 
-        Sending only the adapter parameters matches the communication-efficient
-        design described in the paper.
+        This is the exact payload that gets uploaded to the server after a
+        local round, which keeps communication focused on the small adapter
+        subset rather than the full MAE backbone.
         """
         trainable_state: Dict[str, torch.Tensor] = {}
         for name, parameter in self.model.named_parameters():
@@ -113,12 +113,12 @@ class FederatedClient:
         return trainable_state
 
     def _pool_encoder_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Convert the final encoder tokens into one embedding per image.
+        """Convert the last encoder tokens into one embedding per image.
 
-        The code uses the same pooling rule everywhere in the repository:
-        1. Drop the CLS token when it is present.
+        The pooling rule is shared across the whole repo:
+        1. Drop the CLS token when it exists.
         2. Average only the patch tokens.
-        3. Return the pooled embedding before normalization.
+        3. Return that pooled vector for routing, clustering, and probing.
         """
         if hidden_states.dim() != 3:
             raise ValueError("Expected hidden states with shape [batch, tokens, dim].")
@@ -133,7 +133,7 @@ class FederatedClient:
         self,
         inputs: torch.Tensor,
     ) -> tuple[Any, torch.Tensor]:
-        """Run the model once and return the raw model outputs plus embeddings."""
+        """Run one MAE forward pass and return both outputs and pooled embeddings."""
         outputs = self.model(inputs, output_hidden_states=True)
         if not hasattr(outputs, "hidden_states") or outputs.hidden_states is None:
             raise RuntimeError(
@@ -151,10 +151,15 @@ class FederatedClient:
         global_prototypes: Optional[torch.Tensor] = None,
         gpad_loss_fn: Optional[nn.Module] = None,
     ) -> Dict[str, float]:
-        """Train for one local epoch and return detailed metrics.
+        """Train one full local epoch and return flat logging metrics.
 
-        The returned dictionary is intentionally flat and JSON-friendly so the
-        training scripts can serialize it directly into experiment logs.
+        Each batch follows the same path:
+        1. Run MAE reconstruction.
+        2. Decide which samples are anchored to the global bank.
+        3. Apply GPAD to the anchored subset only.
+        4. Route the remaining samples through local memory handling.
+        5. Step the optimizer once on the combined loss.
+        6. Accumulate metrics in a JSON-friendly dictionary.
         """
         self.model.train()
 
@@ -259,15 +264,14 @@ class FederatedClient:
 
     @torch.no_grad()
     def _route_non_anchored(self, embeddings: torch.Tensor) -> Dict[str, int]:
-        """Process embeddings that did not match the global prototype bank.
+        """Route embeddings that were not anchored to the global bank.
 
-        The routing logic mirrors the paper:
-        1. Compare each embedding with local prototypes.
-        2. If the best local match is above the local threshold, update that
-           prototype with an EMA step.
-        3. Otherwise push the embedding into the novelty buffer.
-        4. If the buffer reaches its size limit, cluster it and merge or add the
-           resulting centroids.
+        The routing decision is step-by-step:
+        1. Normalize the incoming embeddings.
+        2. If no local bank exists yet, send everything to the novelty buffer.
+        3. Otherwise compare each embedding with the local prototype bank.
+        4. EMA-update the best local prototype when the match is strong enough.
+        5. Send the rest into the novelty buffer for later clustering.
         """
         stats = _empty_routing_stats()
         if embeddings.size(0) == 0:
@@ -318,14 +322,22 @@ class FederatedClient:
         return stats
 
     def _maybe_cluster_buffer(self) -> Dict[str, int]:
-        """Cluster the novelty buffer when it reaches the configured size."""
+        """Trigger novelty-buffer clustering only when the configured size is reached."""
         if len(self.novelty_buffer) < self.novelty_buffer_size:
             return _empty_routing_stats()
         return self._cluster_novelty_buffer()
 
     @torch.no_grad()
     def _cluster_novelty_buffer(self) -> Dict[str, int]:
-        """Cluster the novelty buffer and merge or add the discovered centroids."""
+        """Cluster the novelty buffer and merge or append the discovered centroids.
+
+        This is the local memory growth step:
+        1. Stack and normalize the buffered embeddings.
+        2. Run spherical K-means to form candidate centroids.
+        3. Merge centroids into similar local prototypes with EMA.
+        4. Append truly new centroids as brand-new local prototypes.
+        5. Clear the buffer after the update completes.
+        """
         stats = _empty_routing_stats()
         if len(self.novelty_buffer) == 0:
             return stats
@@ -378,7 +390,7 @@ class FederatedClient:
         return stats
 
     def get_local_prototypes(self) -> Optional[torch.Tensor]:
-        """Return a detached copy of the current local prototype matrix."""
+        """Return a detached copy of the current local prototype bank."""
         if self.local_prototypes is None:
             return None
         return self.local_prototypes.detach().clone()
@@ -389,7 +401,14 @@ class FederatedClient:
         dataloader: DataLoader,
         K_init: int = 10,
     ) -> torch.Tensor:
-        """Build the initial local prototype bank from the current dataset."""
+        """Build the initial local prototype bank for a newly seen dataset.
+
+        The bootstrap path is:
+        1. Extract embeddings for the whole current dataset.
+        2. Normalize them on the unit sphere.
+        3. Run spherical K-means.
+        4. Store the resulting centroids as the starting local bank.
+        """
         self.model.eval()
         feature_batches: List[torch.Tensor] = []
 
@@ -410,7 +429,7 @@ class FederatedClient:
         return self.local_prototypes
 
     def _kmeans(self, features: torch.Tensor, K: int) -> torch.Tensor:
-        """Run spherical K-means on unit-normalized features."""
+        """Run spherical K-means on unit-normalized feature vectors."""
         num_samples, feature_dim = features.shape
         if num_samples == 0:
             return torch.empty(0, feature_dim, device=features.device, dtype=features.dtype)
@@ -449,7 +468,7 @@ class FederatedClient:
 
 
 class ClientManager:
-    """Manage the collection of federated clients."""
+    """Own the collection of client objects and orchestrate per-round training."""
 
     def __init__(
         self,
@@ -490,11 +509,13 @@ class ClientManager:
         global_prototypes: Optional[torch.Tensor],
         gpad_loss_fn: Optional[nn.Module],
     ) -> Dict[str, float]:
-        """Train one client for the configured number of local epochs.
+        """Train one client for the configured local-epoch budget.
 
-        Each epoch returns a flat metric dictionary. This helper averages the
-        per-epoch values so the caller still receives one summary per client and
-        per communication round.
+        The helper keeps the round interface simple:
+        1. Call ``train_epoch`` the requested number of times.
+        2. Average metrics that should be averaged across epochs.
+        3. Sum counters that represent events or sample totals.
+        4. Keep last-value metrics for state-like quantities.
         """
         epoch_results = [
             client.train_epoch(
@@ -548,7 +569,7 @@ class ClientManager:
         return aggregated_result
 
     def _initialize_clients(self, base_model: nn.Module) -> None:
-        """Create the local client objects and assign devices."""
+        """Create each client object and assign one device per client when possible."""
         if self.gpu_count > 0 and self.num_clients != self.gpu_count:
             raise ValueError(
                 "When GPUs are used, the code expects one GPU per client "
@@ -578,7 +599,7 @@ class ClientManager:
             self.clients.append(client)
 
     def sync_clients(self, global_weights: Dict[str, torch.Tensor]) -> None:
-        """Broadcast the latest global adapter weights to every client."""
+        """Broadcast the latest global adapter weights to every client copy."""
         for client in self.clients:
             client.sync_trainable_weights(global_weights)
 
@@ -588,7 +609,12 @@ class ClientManager:
         global_prototypes: Optional[torch.Tensor] = None,
         gpad_loss_fn: Optional[nn.Module] = None,
     ) -> List[Dict[str, float]]:
-        """Run one training round across all clients."""
+        """Run one full communication round across all clients.
+
+        If GPUs are available, client rounds run in parallel with one GPU per
+        client. On CPU, the same logic runs sequentially to keep the behavior
+        correct even when no usable GPU kernels are available.
+        """
         if len(dataloaders) != self.num_clients:
             raise ValueError(
                 f"Received {len(dataloaders)} dataloaders for {self.num_clients} clients."

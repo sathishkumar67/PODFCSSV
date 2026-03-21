@@ -1,14 +1,10 @@
-"""Server-side aggregation for adapters and prototypes.
+"""Run the server-side aggregation steps for the federated pipeline.
 
-The server logic is split into two simple pieces:
-1. Maintain one global prototype bank that merges or appends incoming local
-   prototypes.
-2. Average trainable adapter weights across clients and optionally smooth the
-   update with server-side EMA.
+The server has two jobs after every communication round:
+1. Merge the local prototype banks into one normalized global bank.
+2. Average the trainable adapter weights into one new global adapter state.
 
-The code stays strict about tensor normalization and device placement so the
-same aggregation path works for both the Tiny ImageNet baseline and the
-multi-dataset sequential run.
+Those two outputs are then sent back to the clients for the next round.
 """
 
 from __future__ import annotations
@@ -23,7 +19,14 @@ logger = logging.getLogger(__name__)
 
 
 class GlobalPrototypeBank:
-    """Store and update the global prototype matrix."""
+    """Store the shared prototype memory used by all federated clients.
+
+    Each round updates the bank in the same order:
+    1. Normalize every incoming local prototype.
+    2. If the bank is empty, bootstrap it directly from the first round.
+    3. Otherwise merge similar prototypes with EMA.
+    4. Append genuinely new prototypes when capacity allows.
+    """
 
     def __init__(
         self,
@@ -45,12 +48,14 @@ class GlobalPrototypeBank:
         self,
         local_protos_list: List[torch.Tensor],
     ) -> torch.Tensor:
-        """Update the global bank with the clients' local prototypes.
+        """Merge one round of client prototypes into the shared global bank.
 
-        Round 1 is treated as the initialization step described in the paper:
-        all incoming prototypes are concatenated directly. Starting from the
-        next round, each incoming prototype is processed sequentially with the
-        merge-or-add rule.
+        The update rule is step-by-step:
+        1. Discard empty payloads.
+        2. Normalize and concatenate the remaining local prototypes.
+        3. Bootstrap directly if this is the first non-empty round.
+        4. For later rounds, compare each incoming prototype against the bank.
+        5. EMA-merge close matches and append truly novel ones.
         """
         valid_prototypes = [
             prototypes.to(self.device)
@@ -97,12 +102,12 @@ class GlobalPrototypeBank:
         return self.prototypes
 
     def get_prototypes(self) -> torch.Tensor:
-        """Return the current prototype matrix."""
+        """Return the current prototype matrix without modifying it."""
         return self.prototypes
 
 
 class FederatedModelServer:
-    """Aggregate trainable client weights with FedAvg."""
+    """Average the trainable adapter weights submitted by the clients."""
 
     @torch.no_grad()
     def aggregate_weights(
@@ -110,12 +115,13 @@ class FederatedModelServer:
         client_weights_map: Dict[str, Dict[str, torch.Tensor]],
         current_global_weights: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Return the arithmetic mean of the submitted client weights.
+        """Return one averaged adapter state dict for the next global round.
 
-        The function aggregates the union of keys that appear in at least one
-        client payload. If a client is missing a key but the current global
-        state contains it, the global tensor is used as a fallback for that
-        client. This preserves tensor shapes and keeps partial state dicts safe.
+        The aggregation path is intentionally defensive:
+        1. Build the union of parameter names across all client payloads.
+        2. Gather the corresponding tensor from each client when it exists.
+        3. Fall back to the current global tensor if a client omitted a key.
+        4. Average everything in a common dtype and on a common device.
         """
         if not client_weights_map:
             logger.warning("No client weights were submitted for aggregation.")
@@ -178,7 +184,14 @@ def run_server_round(
     round_idx: int = 1,
     server_model_ema_alpha: float = 0.1,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Aggregate prototypes and model weights for one communication round."""
+    """Run the full server update for one communication round.
+
+    This helper keeps the round logic in one place:
+    1. Merge local prototype banks.
+    2. Average client adapter weights.
+    3. Optionally smooth the new global weights with server-side EMA.
+    4. Return both the updated global prototypes and the updated weights.
+    """
     if not client_payloads:
         return torch.empty(0, 0), {}
 
@@ -218,7 +231,7 @@ def run_server_round(
 
 
 class GlobalModel:
-    """Lightweight wrapper that owns the server's MAE model instance."""
+    """Own the server-side MAE model instance used for checkpoint loading and sync."""
 
     def __init__(
         self,
@@ -249,7 +262,7 @@ class GlobalModel:
             self.model = torch.nn.Linear(10, 10).to(self.device)
 
     def update_model_weights(self, aggregated_weights: Dict[str, torch.Tensor]) -> None:
-        """Load the provided adapter weights into the stored model."""
+        """Load the latest aggregated adapter weights into the stored model."""
         if not aggregated_weights:
             logger.warning("Received an empty aggregated state dict.")
             return

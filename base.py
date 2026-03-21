@@ -1,14 +1,15 @@
-"""Single-model continual baseline for the multi-dataset sequence.
+"""Run the single-model continual baseline used beside the federated system.
 
-This entrypoint keeps the same adapter-injected ViT-MAE model used by
-``main.py`` but removes federation and GPAD entirely:
-1. Build one frozen ViT-MAE backbone with the same injected adapters.
-2. Train that single model on one dataset at a time using reconstruction loss.
-3. Carry the same model and optimizer state across dataset transitions.
-4. Save checkpoints, JSON histories, and training-only summary plots.
+This entrypoint keeps the same adapter-injected ViT-MAE backbone as
+``main.py`` but removes everything federated:
+1. Build one MAE model with the same adapter placement.
+2. Train that one model on the datasets one after another.
+3. Use only reconstruction loss, with no GPAD and no prototype exchange.
+4. Carry model weights and optimizer state across dataset transitions.
+5. Save checkpoints, round histories, and training-only plots.
 
-Evaluation is intentionally left out of this file so it can stay focused on
-the continual training path alone.
+Evaluation is intentionally left to ``evaluate.py`` so this file stays focused
+on continual training alone.
 """
 
 from __future__ import annotations
@@ -55,7 +56,7 @@ BASE_CONFIG: Dict[str, Any] = {
 
 
 def initialize_base_history() -> Dict[str, Any]:
-    """Create the baseline history containers."""
+    """Create the history structure written by the baseline trainer."""
     return {
         "round_ids": [],
         "dataset_names": [],
@@ -75,7 +76,15 @@ def train_reconstruction_round(
     device: str,
     dtype: torch.dtype,
 ) -> Dict[str, float]:
-    """Train the single model for one round with reconstruction loss only."""
+    """Train the single model for one round with reconstruction loss only.
+
+    Each call performs the same sequence:
+    1. Iterate over the current dataset's dataloader.
+    2. Run the MAE reconstruction forward pass.
+    3. Backpropagate only the reconstruction loss.
+    4. Step the optimizer once per batch.
+    5. Return averaged loss and throughput statistics for logging.
+    """
     model.train()
     total_loss = 0.0
     total_batches = 0
@@ -111,7 +120,7 @@ def create_base_dataloader(
     dataset: torch.utils.data.Dataset,
     config: Dict[str, Any],
 ) -> DataLoader:
-    """Create a base-only dataloader with more aggressive throughput settings."""
+    """Create the baseline dataloader with the throughput settings used in base.py."""
     loader_kwargs: Dict[str, Any] = {
         "dataset": dataset,
         "batch_size": config["batch_size"],
@@ -127,7 +136,7 @@ def create_base_dataloader(
 
 
 def plot_base_training_history(history: Dict[str, Any], plots_dir: Path) -> Path:
-    """Plot baseline reconstruction loss and round time."""
+    """Plot the baseline's round-wise reconstruction loss and round time."""
     figure_path = plots_dir / "base_training_summary.png"
     rounds = history.get("round_ids", [])
     if not rounds:
@@ -151,7 +160,7 @@ def plot_base_training_history(history: Dict[str, Any], plots_dir: Path) -> Path
 
 
 def main() -> None:
-    """Run the single-model continual baseline."""
+    """Run the full single-model continual baseline from start to finish."""
     config = dict(BASE_CONFIG)
     resolve_runtime_config(config)
     max_worker_count = max(1, (os.cpu_count() or 1) - 1)
@@ -169,6 +178,7 @@ def main() -> None:
     set_random_seed(config["seed"])
     output_dirs = prepare_output_dirs(config["save_dir"])
 
+    # Build one adapter-injected model and keep it alive across every dataset.
     model = build_base_model(config)
     optimizer = optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
@@ -198,6 +208,7 @@ def main() -> None:
         )
         stage_losses = []
 
+        # The baseline always uses the full train split for the current dataset.
         dataset = load_named_dataset(
             dataset_name=dataset_name,
             data_root=config["data_root"],
@@ -209,6 +220,7 @@ def main() -> None:
         )
         dataloader = create_base_dataloader(dataset=dataset, config=config)
 
+        # Each stage keeps training the same model state; nothing is reset here.
         for dataset_round in range(1, config["rounds_per_dataset"] + 1):
             global_round_idx += 1
             round_start = time.time()

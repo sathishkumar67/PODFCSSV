@@ -1,530 +1,172 @@
-# COMPLETE FEDERATED CONTINUAL SELF-SUPERVISED VISION PIPELINE
-## Federated Continual Self-Supervised Vision via Gated Prototype Anchored Distillation
-### Full Implementation Guide with All Enhancements
-
-> Update note:
-> The executable source of truth is now `main.py`, `base.py`, and the
-> files under `src/`. This guide is retained as a broad research note, but the
-> current implementation uses the corrected GPAD gradient flow, server-to-client
-> weight broadcast, unified embedding extraction, non-dropping sample
-> allocation, and the 2-client sequential benchmark described in the README.
-> Sections in this document that discuss optional confidence-scoring
-> enhancements should be read as historical research notes rather than
-> executable features in the current codebase.
-
----
-
-## TABLE OF CONTENTS
-
-1. Problem Formulation & Motivation
-2. System Architecture Overview
-3. Complete Step-by-Step Pipeline (0-8)
-4. Enhanced Components (6 Enhancements)
-5. Mathematical Formulations
-6. Implementation Details
-7. Experimental Setup
-8. Evaluation Metrics
-9. Timeline & Deliverables
-10. Publication Strategy
-
----
-
-# 1. PROBLEM FORMULATION & MOTIVATION
-
-## The Challenge
-
-You have a distributed federated learning environment where:
-- **Multiple clients** have decentralized, unlabeled, non-IID vision data
-- **Privacy constraints** prevent sharing raw data
-- **Continual learning requirement**: New tasks arrive sequentially; models must learn without forgetting old tasks
-- **Resource constraints**: Edge devices have limited communication and compute
-
-Traditional solutions fail:
-- ❌ Centralized learning: violates privacy
-- ❌ Standard FedAvg: doesn't handle sequential tasks (catastrophic forgetting)
-- ❌ Centralized continual learning: requires labeled data
-- ❌ Individual client training: loses collaborative knowledge
-
-## Your Solution
-
-A novel framework combining:
-1. **Self-Supervised Pretraining** (MAE): Learn from unlabeled data
-2. **Federated Aggregation**: Share knowledge without exposing data
-3. **Prototype-Based Memory**: Compact semantic representation
-4. **Gated Distillation**: Adaptive knowledge transfer with confidence weighting
-5. **Continual Learning**: Evolving prototypes across tasks
-
----
-
-# 2. SYSTEM ARCHITECTURE OVERVIEW
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│   FEDERATED CONTINUAL SELF-SUPERVISED VISION SYSTEM          │
-├──────────────────────────────────────────────────────────────┤
-│                                                               │
-│  ┌─────────────────────────────────────────────────────┐     │
-│  │ LAYER 1: Self-Supervised Pretraining (SSL)          │     │
-│  │ - Masked Image Modeling (MAE) on unlabeled data      │     │
-│  │ - Federated aggregation of encoder weights           │     │
-│  │ - Output: Learned visual backbone                    │     │
-│  └─────────────────────────────────────────────────────┘     │
-│                          ↓                                    │
-│  ┌─────────────────────────────────────────────────────┐     │
-│  │ LAYER 2: Parameter-Efficient Fine-Tuning            │     │
-│  │ - Vision Transformer (ViT) backbone (FROZEN)         │     │
-│  │ - Task-specific adapters or LoRA modules             │     │
-│  │ - Only 2-5% of parameters trainable                  │     │
-│  └─────────────────────────────────────────────────────┘     │
-│                          ↓                                    │
-│  ┌─────────────────────────────────────────────────────┐     │
-│  │ LAYER 3: Prototype-Based Knowledge Distillation      │     │
-│  │ - Local prototype extraction (k-means clustering)     │     │
-│  │ - Global prototype aggregation (weighted merging)     │     │
-│  │ - Gated confidence-weighted distillation loss         │     │
-│  └─────────────────────────────────────────────────────┘     │
-│                          ↓                                    │
-│  ┌─────────────────────────────────────────────────────┐     │
-│  │ LAYER 4: Continual Learning Memory                   │     │
-│  │ - Experience replay with uncertainty sampling         │     │
-│  │ - Novelty detection and dynamic prototype expansion   │     │
-│  │ - Catastrophic forgetting prevention                 │     │
-│  └─────────────────────────────────────────────────────┘     │
-│                          ↓                                    │
-│  ┌─────────────────────────────────────────────────────┐     │
-│  │ LAYER 5: Evaluation & Analysis                       │     │
-│  │ - Per-task accuracy tracking                         │     │
-│  │ - Forgetting and backward transfer metrics           │     │
-│  │ - Communication efficiency analysis                  │     │
-│  └─────────────────────────────────────────────────────┘     │
-│                                                               │
-└──────────────────────────────────────────────────────────────┘
-
-```python
-```
-# 5. MATHEMATICAL FORMULATIONS
-
-## 5.1 Local Prototype Computation (STEP 1)
-
-```
-Given: Local embeddings Z = {z_1, ..., z_N} ∈ R^(N×d)
-Output: Local prototypes P = {μ_1, ..., μ_K}
-
-1. Normalize: Z_norm = Z / ||Z||_2
-2. K-means clustering: C_1, ..., C_K = KMeans(Z_norm, k=K)
-3. Prototype computation: μ_k = mean(Z_norm[C_k])
-4. Normalize: μ_k = μ_k / ||μ_k||_2
-5. Store counts: n_k = |C_k|
-```
-
-## 5.2 Global Prototype Aggregation (STEP 2)
-
-```
-Given: Client prototypes {P^(i) : i=1..M}, {C^(i) : counts}
-Output: Global prototypes G
-
-Bootstrap (Round 1):
-1. Concatenate: P_all = ∪_i P^(i)
-2. Similarity matrix: S[i,j] = cos(P_all[i], P_all[j])
-3. Redundancy removal:
-   For each prototype p:
-     Find similar: {q : cos(p,q) > τ_merge}
-     Merge: μ_merged = (Σ n_q · q) / Σ n_q
-     Replace cluster with single prototype
-4. Result: G = merged prototypes
-```
-
-## 5.3 Gated Prototype Distillation Loss (STEP 5.3)
-
-```
-Given: Embedding z, global prototypes G, similarity s = cos(z, G[k*])
-       where k* = argmax_k cos(z, G[k])
-
-Soft Gating Loss (RECOMMENDED):
-
-1. Normalize: z_norm = z / ||z||_2
-
-2. Compute confidence-weighted gate:
-   gate = sigmoid((s - τ_adaptive) / T)
-   where τ_adaptive = τ_base - λ·H(z)
-         H(z) = entropy of z over prototypes
-         T = temperature (0.07)
-
-3. Prototype loss:
-   L_proto = gate · ||z_norm - G[k*]_norm||_2
-
-4. Combined loss (curriculum scheduled):
-   L_total = L_CE + λ_proto(round) · L_proto
-   where λ_proto(round) = { 0.1·round/5 if round < 5}
-                           { 1.0         otherwise}
-```
-
-## 5.4 Confidence Score Computation (ENHANCEMENT 1)
-
-```
-For each prototype μ_k:
-
-Confidence_k = (count_k / Σ count_i) × (1 - var_k / max_var)
-
-where:
-  - count_k: number of samples contributing to μ_k
-  - var_k: variance of samples around μ_k (estimated as distance std)
-  - Normalized to [0, 1]
-
-Use in gating:
-  gate = proto_confidence[k*] × sigmoid(...)
-```
-
----
-
-# 6. IMPLEMENTATION DETAILS
-
-## 6.1 Configuration Template
-
-```python
-config = {
-    # Model
-    'vit_model': 'vit_base_patch16',
-    'embedding_dim': 768,
-    'num_adapters': 12,
-    'adapter_hidden_dim': 64,
-    
-    # Data
-    'num_clients': 10,
-    'num_tasks': 5,
-    'classes_per_task': 20,
-    'dirichlet_alpha': 0.5,  # Non-IID parameter (lower = more non-IID)
-    'batch_size': 32,
-    
-    # Prototypes
-    'K': 20,  # Number of local prototypes per client
-    'prototype_merge_threshold': 0.85,  # Redundancy removal threshold
-    'alpha_ema': 0.1,  # EMA update rate
-    'novelty_threshold': 0.4,  # Below this = novel
-    'novelty_buffer_size': 500,
-    
-    # Training
-    'local_epochs': 10,
-    'total_rounds': 100,  # Per task
-    'learning_rate': 0.001,
-    'temperature': 0.07,
-    
-    # Losses
-    'lambda_proto': 0.5,  # Prototype distillation weight (with curriculum)
-    'gating_type': 'soft_sigmoid',  # soft_sigmoid, confidence_weighted, soft_assignment
-    'tau_threshold': 0.5,
-    
-    # Communication
-    'client_fraction': 0.8,  # Fraction of clients per round
-    'use_compression': False,
-    
-    # Enhancements
-    'enable_confidence_scoring': True,  # Enhancement 1
-    'enable_denoising': True,  # Enhancement 2 (every 10 rounds)
-    'enable_task_aware_tags': True,  # Enhancement 3
-    'enable_adaptive_gating': True,  # Enhancement 4
-    'enable_differential_privacy': False,  # Enhancement 5 (optional)
-    'enable_optimal_transport': False,  # Enhancement 6 (optional, slower)
-}
-```
-
-## 6.2 Key Hyperparameters
-
-```
-Critical Hyperparameters (tune these):
-
-1. alpha_ema [0.05 - 0.2]
-   - Recommendation: 0.1 (medium stability)
-   - Lower: more stable but slow adaptation
-   - Higher: faster adaptation, more noise
-
-2. novelty_threshold [0.3 - 0.6]
-   - Recommendation: 0.4
-   - Affects how many samples are deemed "novel"
-   - Too high: miss real novelty
-   - Too low: false positives
-
-3. prototype_merge_threshold [0.80 - 0.95]
-   - Recommendation: 0.85
-   - How similar before merging in STEP 2
-   - Affects global prototype bank size
-
-4. lambda_proto_schedule
-   - Recommendation: 0.1 * round for first 5 rounds, then 1.0
-   - Prevents prototype noise from early learning
-
-5. temperature (gating) [0.05 - 0.15]
-   - Recommendation: 0.07
-   - Standard in contrastive learning
-   - Controls softness of gating
-
-6. tau_threshold [0.3 - 0.7]
-   - Recommendation: 0.5
-   - Adaptive gating: reduced by uncertainty
-   - Sets confidence bar for prototype matching
-```
-
----
-
-# 7. EXPERIMENTAL SETUP
-
-## 7.1 Datasets & Splits
-
-Current repository experiments:
-
-```python
-# Federated sequential experiment in main.py
-- 2 clients on 2 GPUs
-- 3 datasets per client, executed sequentially
-- Client 0: EuroSAT -> Oxford-IIIT Pet -> Flowers102
-- Client 1: GTSRB -> FGVC Aircraft -> DTD
-- Each training split is fitted to 10000 samples for balanced stage time
-- Larger datasets are subsampled and smaller datasets are repeated
-  deterministically to keep stage runtime aligned
-- Images are converted to RGB, resized to 224x224, and tensorized without
-  ImageNet normalization
-- Linear-probe evaluation is not run inside training; it is handled later by
-  evaluate.py
-
-# Continual baseline experiment in base.py
-- One adapter-injected ViT-MAE model
-- Dataset order follows the federated stage order:
-  EuroSAT -> GTSRB -> Oxford-IIIT Pet -> FGVC Aircraft -> Flowers102 -> DTD
-- Uses the full train split of each dataset
-- Evaluates on the non-train split(s) of every seen dataset after each stage
-- Saves forgetting metrics and forgetting plots
-```
-
-The older example block below is retained as a generic research note only.
-
-```python
-# Legacy example block: see the updated repository experiment summary above
-- This legacy note is not the current executable setup
-- The current baseline uses Tiny ImageNet across 2 clients
-- Tiny ImageNet is resized to 224x224 and normalized for ViT-MAE
-- The sequential 2-client run skips dataset normalization on purpose
-- See README.md for the maintained dataset list and output artifacts
-
-# Current baseline summary
-- Tiny ImageNet remains the baseline dataset in main.py
-- The baseline uses a Dirichlet non-IID split and round-wise class scheduling
-- The federated sequential benchmark is implemented in main.py
-
-# For current domain-shift experiments:
-- The repository now uses the 4-dataset sequence listed above
-- Each client completes one dataset before moving to the next
-- Client-local prototype memory, novelty buffering, and optimizer state persist across dataset boundaries
-```
-
-## 7.2 Evaluation Protocol
-
-```python
-# Current executable setup:
-1. main.py trains and logs round-level training metrics.
-2. main.py trains the 2-client sequential federated schedule and saves
-   checkpoints, communication metrics, and training plots only.
-3. base.py is the single-model continual baseline used to measure forgetting.
-4. evaluate.py is the post-training path for dataset-by-dataset linear-probe
-   comparison against the Hugging Face base model.
-
-# Communication tracking:
-1. Bytes sent per round (adapter weights + prototypes)
-2. Total communication cost across the full sequential run
-3. Prototype-bank growth across rounds
-
-# Computational cost:
-1. Training time per round
-2. Per-stage balance enforced by equal sample caps
-3. Memory usage per client / GPU
-```
-
-## 7.3 Baseline Comparisons
-
-```
-1. FedAvg (standard federated averaging)
-   - No prototypes, no continual handling
-   - Baseline: expect 45-55% accuracy
-
-2. FedAvg + Replay (experience replay only)
-   - No prototypes, simple replay buffer
-   - Expected: 55-65% accuracy
-
-3. FedProto (prototype-based FL)
-   - Class prototypes (needs labels)
-   - Expected: 65-70% accuracy
-
-4. FedGPD (global prototype distillation)
-   - Supervised prototype distillation
-   - Expected: 70-75% accuracy
-
-5. FedAli (optimal transport alignment)
-   - State-of-art prototype FL
-   - Expected: 72-75% accuracy
-
-6. V-LETO (vertical FCL with prototypes)
-   - Closest to yours (but vertical FL)
-   - Expected: 74-76% accuracy
-
-7. Your Method (Full)
-   - Expected: 75-78% accuracy
-   - With all 6 enhancements: 78-82%
-```
-
----
-
-# 8. EVALUATION METRICS
-
-## 8.1 Accuracy Metrics
-
-```python
-class AccuracyTracker:
-    def __init__(self, num_tasks):
-        self.task_accuracies = {}  # {task_id: [acc_after_task0, acc_after_task1, ...]}
-        self.num_tasks = num_tasks
-    
-    def compute_average_accuracy(self):
-        """Average accuracy across all tasks"""
-        flat = [acc for accs in self.task_accuracies.values() for acc in accs]
-        return np.mean(flat)
-    
-    def compute_forgetting(self):
-        """Backward forgetting: how much did old tasks degrade"""
-        forgetting_per_task = []
-        for task_id in range(self.num_tasks - 1):  # Exclude last task
-            # Accuracy on task_id immediately after learning
-            acc_after = self.task_accuracies[task_id][task_id]
-            # Best accuracy on task_id after all subsequent tasks
-            acc_best_later = max(self.task_accuracies[j][task_id] 
-                                for j in range(task_id + 1, self.num_tasks))
-            forgetting = acc_after - acc_best_later
-            forgetting_per_task.append(forgetting)
-        
-        return np.mean(forgetting_per_task)
-    
-    def compute_backward_transfer(self):
-        """Does learning new tasks help old tasks?"""
-        transfer = 0
-        for task_id in range(self.num_tasks - 1):
-            # Change in accuracy on old task after learning all subsequent tasks
-            change = (self.task_accuracies[self.num_tasks-1][task_id] -
-                     self.task_accuracies[task_id][task_id])
-            transfer += change
-        
-        return transfer / (self.num_tasks - 1)
-```
-
-## 8.2 Communication Efficiency
-
-```python
-# Bytes transmitted per round per client:
-# Adapters: 12 layers × 64×768 + 768×64 = ~600 KB (LoRA: ~100 KB)
-# Prototypes: 20 × 768 × 4 bytes = ~60 KB
-# Total: ~660 KB per round
-
-# Communication reduction vs baseline:
-# FedAvg (full ViT): 350 MB
-# Your method: 0.66 MB
-# Reduction: ~500x or 0.2% of full model communication
-
-# Track over all rounds:
-total_bytes = sum_over_all_rounds(adapter_bytes + prototype_bytes)
-reduction_factor = total_bytes / (full_model_bytes * num_rounds)
-```
-
----
-
----
-
-# 10. PUBLICATION STRATEGY
-
-## Paper Structure
-
-```
-1. Abstract (150 words)
-   - Problem: FCL with privacy + heterogeneity
-   - Solution: Gated prototype distillation
-   - Results: +30% over FedAvg, -80% forgetting
-
-2. Introduction
-   - Federated learning challenges
-   - Continual learning challenges
-   - State-of-art (mention FedProto, FedGPD, V-LETO)
-   - Your contribution: gated mechanism + MAE
-
-3. Related Work
-   - Federated Learning (FedAvg, FedProto, FedGPD)
-   - Continual Learning (EWC, replay, prototypes)
-   - Self-Supervised Learning (MAE, BEiT)
-   - Combined approaches
-
-4. Method
-   - Problem formulation & motivation
-   - Complete pipeline (Steps 0-8) with math
-   - 6 enhancements (as extensions)
-   - Loss functions and algorithms
-
-5. Experiments
-   - Dataset & setup
-   - Baselines & ablations
-   - Main results table
-   - Non-IID robustness
-   - Communication analysis
-
-6. Results & Analysis
-   - Accuracy trends
-   - Forgetting reduction
-   - Ablation study
-   - Communication efficiency
-   - Visualizations (t-SNE of prototypes)
-
-7. Discussion
-   - Why gated mechanism helps
-   - Comparison to baselines
-   - Limitations
-   - Future work
-
-8. Conclusion
-
-9. References (40-50 papers)
-
-10. Appendix
-    - Detailed algorithms
-    - Hyperparameter tuning
-    - Additional results
-    - Implementation details
-```
-
-## Key Differentiators for Reviewers
-
-1. **Novel gated mechanism** - soft sigmoid/confidence weighting never done before
-2. **Cluster prototypes** - no labels needed (unsupervised)
-3. **Comprehensive ablations** - proves each component matters
-4. **Strong baselines** - compare to FedProto, FedGPD, FedAli
-5. **6 enhancements** - shows depth of investigation
-6. **Communication analysis** - shows practical applicability
-
----
-
-# SUMMARY
-
-This complete pipeline represents a novel, publication-quality research contribution combining:
-
-- **MAE-based self-supervised pretraining** (STEP 0-1)
-- **Federated prototype aggregation** (STEP 2, 8)
-- **Gated confidence-weighted distillation** (STEP 5.3) - YOUR KEY INNOVATION
-- **Continual learning with dynamic prototypes** (STEP 6)
-- **6 research enhancements** (confidence scoring, denoising, task-awareness, adaptive gating, DP, optimal transport)
-
-**Expected Results:**
-- Base method: 74-75% accuracy
-- With all 6 enhancements: 78-82% accuracy
-- Forgetting reduction: -80% vs FedAvg
-- Communication efficiency: 500× reduction
-
-**Timeline:** 16 weeks (realistic for final-year project)
-
-**Publication Potential:** IJCAI/AAAI main or top workshop with proper experiments and ablations.
-
----
-
-This is your complete, industry-grade research project. Good luck! 🚀
+# Complete Pipeline Guide
+
+This guide summarizes the current executable pipeline in the repository. The source of truth is still the code in `main.py`, `base.py`, `evaluate.py`, and `src/`.
+
+## 1. Shared Model Setup
+
+All three entrypoints use the same backbone and adapter recipe:
+
+1. Load `facebook/vit-mae-base`.
+2. Freeze the pretrained MAE backbone.
+3. Inject residual adapters into the upper half of the encoder.
+4. Train only the adapter weights in downstream stages.
+
+The shared implementation lives in `src/mae_with_adapter.py`.
+
+## 2. Federated Continual Pipeline (`main.py`)
+
+`main.py` is the current main experiment.
+
+### Dataset schedule
+
+- Client 0: `EuroSAT` -> `Oxford-IIIT Pet` -> `Flowers102`
+- Client 1: `GTSRB` -> `FGVC Aircraft` -> `DTD`
+
+### Stage flow
+
+Each stage follows the same order:
+
+1. Load one dataset per client.
+2. Fit each training split to an effective budget of `10000` samples.
+3. Create one dataloader per client.
+4. Synchronize the latest global adapter weights into both clients.
+5. Run local MAE + GPAD training on both clients.
+6. Generate or reuse local prototypes.
+7. Merge client prototypes into the global prototype bank.
+8. Average adapter weights on the server.
+9. Save checkpoints, metrics, and plots.
+
+### Data-budget rule
+
+- if a train split is below `1000`, the run fails for that dataset
+- if it is above the target budget, it is deterministically subsampled
+- if it is below the target budget but above the minimum, it is deterministically repeated
+
+### Persistent state
+
+Across dataset transitions, the following state is intentionally preserved:
+
+- global adapter weights
+- global prototype bank
+- each client's local prototypes
+- each client's novelty buffer
+- each client's optimizer state
+
+### Saved artifacts
+
+`main.py` writes:
+
+- adapter-only checkpoints
+- JSON training history
+- training summary plots
+- communication statistics
+
+## 3. Single-Model Continual Baseline (`base.py`)
+
+`base.py` keeps the same adapter-injected MAE architecture but removes federation and GPAD.
+
+### Baseline flow
+
+1. Build one adapter-injected MAE model.
+2. Train it on one dataset at a time.
+3. Use only reconstruction loss.
+4. Carry the same model and optimizer state across datasets.
+5. Save checkpoints, JSON history, and training-only plots.
+
+### Dataset order
+
+- `EuroSAT`
+- `GTSRB`
+- `Oxford-IIIT Pet`
+- `FGVC Aircraft`
+- `Flowers102`
+- `DTD`
+
+### Data usage
+
+Unlike `main.py`, `base.py` uses the full train split of each dataset.
+
+## 4. Checkpoint Comparison (`evaluate.py`)
+
+`evaluate.py` compares saved checkpoints from `main.py` and `base.py`.
+
+### Evaluation flow
+
+1. Load the federated checkpoint and the baseline checkpoint.
+2. Freeze both models.
+3. Disable MAE masking by setting `mask_ratio = 0.0`.
+4. Use only the encoder path to extract features.
+5. Train one dataset-specific linear probe per model.
+6. Evaluate on the official held-out split.
+7. Save JSON metrics and plots.
+
+### Probe fitting policy
+
+- if train split `< 1000`: skip the dataset
+- if train split is `1000..10000`: use the full train split
+- if train split `> 10000`: use a deterministic `4000`-sample subset
+
+### Held-out evaluation policy
+
+- use `val + test` when both are explicitly supported by the loader
+- use the official non-train split when only one held-out split exists
+- skip datasets without an official held-out split in the current loader logic
+
+### Saved metrics
+
+- accuracy
+- macro precision
+- macro recall
+- macro F1
+- eval loss
+
+### Saved plots
+
+- side-by-side comparison bars
+- federated-minus-base delta bars
+- accuracy heatmap
+
+## 5. GPAD Summary
+
+GPAD is used only in `main.py`.
+
+The client-side GPAD path is:
+
+1. extract embeddings from the MAE encoder
+2. compare embeddings with the global prototype bank
+3. compute an adaptive anchor threshold from assignment entropy
+4. apply GPAD only to confidently anchored samples
+5. route non-anchored samples through local memory updates
+
+The implementation lives in `src/loss.py` and `src/client.py`.
+
+## 6. Server Summary
+
+Server-side aggregation lives in `src/server.py`.
+
+Each round:
+
+1. local prototypes are normalized and merged into the global bank
+2. trainable adapter weights are averaged across clients
+3. optional server-side EMA smooths the global adapter update
+
+## 7. Runtime Safety
+
+The runtime no longer trusts `torch.cuda.is_available()` alone.
+
+Before using CUDA, the code now runs a tiny kernel-execution smoke test. If CUDA is reported but cannot actually execute kernels, the runtime does not continue as if the GPU were valid.
+
+This behavior affects:
+
+- `main.py`
+- `base.py` through shared runtime resolution
+- `evaluate.py`
+
+## 8. Source of Truth
+
+If this guide and the code ever disagree, trust the code:
+
+- `main.py`
+- `base.py`
+- `evaluate.py`
+- `src/*.py`

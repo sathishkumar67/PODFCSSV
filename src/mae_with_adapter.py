@@ -1,13 +1,13 @@
-"""Residual adapter injection for the frozen ViT-MAE backbone.
+"""Inject residual adapters into the frozen ViT-MAE backbone.
 
-This module defines the parameter-efficient fine-tuning path shared across the
-project:
-1. Freeze the pre-trained MAE backbone.
-2. Wrap the upper encoder blocks with lightweight residual adapters.
-3. Leave only the adapter weights trainable during federation.
+The repository uses the same parameter-efficient recipe everywhere:
+1. Load the pretrained MAE model exactly once.
+2. Freeze the original backbone weights.
+3. Attach lightweight residual adapters to the upper encoder blocks.
+4. Train and exchange only those adapter weights during downstream runs.
 
-That setup preserves the original backbone behavior at initialization and
-keeps communication focused on a small trainable parameter subset.
+This keeps the starting representation stable while making communication and
+optimization much cheaper than full-model training.
 """
 
 from __future__ import annotations
@@ -23,17 +23,16 @@ logger = logging.getLogger(__name__)
 
 
 class IBA_Adapter(nn.Module):
-    """Residual information-bottleneck adapter.
+    """Apply a residual bottleneck update to one transformer hidden state.
 
-    The adapter applies a low-rank transformation to each token embedding:
-    1. Project from the backbone dimension ``D`` to a smaller bottleneck
-       dimension ``d``.
-    2. Apply a non-linearity.
-    3. Project back from ``d`` to ``D``.
-    4. Add the result back to the original hidden state.
+    Each forward pass follows the same four steps:
+    1. Compress the token representation into a smaller bottleneck space.
+    2. Apply the adapter non-linearity.
+    3. Project back to the backbone dimension.
+    4. Add the adapter output back to the original hidden state.
 
-    The up-projection is initialized to zero so the adapter starts as an
-    identity mapping.
+    The up-projection starts at zero, so the wrapped backbone behaves like the
+    untouched pretrained model at step zero.
     """
 
     def __init__(
@@ -53,7 +52,7 @@ class IBA_Adapter(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Initialize the adapter so it behaves like an identity at step zero."""
+        """Initialize the adapter so training starts from the pretrained backbone."""
         nn.init.kaiming_normal_(
             self.down_project.weight,
             mode="fan_out",
@@ -67,7 +66,7 @@ class IBA_Adapter(nn.Module):
             nn.init.zeros_(self.up_project.bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply the residual bottleneck transformation to the hidden states."""
+        """Run the bottleneck path and add it back as a residual update."""
         residual = hidden_states
         adapted = self.down_project(hidden_states)
         adapted = self.activation(adapted)
@@ -77,11 +76,12 @@ class IBA_Adapter(nn.Module):
 
 
 class ViTBlockWithAdapter(nn.Module):
-    """Wrap a transformer block and append an adapter to its output.
+    """Wrap one transformer block and append an adapter after the frozen block.
 
-    The wrapper preserves the original return type. That is important because
-    Hugging Face transformer blocks can return tuples or structured model output
-    objects depending on the caller's flags.
+    The wrapper exists so the rest of the model still sees the same interface:
+    1. Run the original transformer block untouched.
+    2. Adapt only its hidden-state output.
+    3. Return the same outer structure the caller expects.
     """
 
     def __init__(self, original_block: nn.Module, adapter: IBA_Adapter) -> None:
@@ -95,11 +95,11 @@ class ViTBlockWithAdapter(nn.Module):
         *args: Any,
         **kwargs: Any,
     ) -> Union[Tuple[torch.Tensor], Tuple[torch.Tensor, Any], Any]:
-        """Run the frozen block first, then apply the adapter to its output.
+        """Forward through the original block first, then through the adapter.
 
-        The wrapper forwards ``*args`` and ``**kwargs`` unchanged so features
-        such as head masks and attention-output flags continue to work exactly
-        as they do in the original transformer block.
+        ``*args`` and ``**kwargs`` are passed through unchanged so attention
+        masks, hidden-state flags, and any future Hugging Face options keep
+        working exactly as they did before adapter injection.
         """
         outputs = self.original_block(hidden_states, *args, **kwargs)
 
@@ -122,10 +122,13 @@ def inject_adapters(
     model: PreTrainedModel,
     bottleneck_dim: int = 64,
 ) -> PreTrainedModel:
-    """Freeze the backbone and inject adapters into the upper encoder layers.
+    """Freeze the backbone and inject adapters into the upper half of the encoder.
 
-    The function edits the provided model in place and returns the same model
-    reference for convenience.
+    The helper edits the given model in place:
+    1. Freeze every pretrained MAE parameter.
+    2. Find the ViT encoder stack.
+    3. Wrap the upper half of the blocks with residual adapters.
+    4. Leave only the new adapter weights trainable.
     """
     logger.info("Injecting adapters with bottleneck_dim=%s", bottleneck_dim)
 
@@ -170,7 +173,7 @@ def inject_adapters(
 
 
 def _log_param_stats(model: nn.Module) -> None:
-    """Log how many parameters remain trainable after adapter injection."""
+    """Log how much of the full MAE model remains trainable after injection."""
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
     trainable_parameters = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
