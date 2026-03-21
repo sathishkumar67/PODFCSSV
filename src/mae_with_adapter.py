@@ -1,14 +1,13 @@
-"""Adapter injection for a frozen ViT-MAE backbone.
+"""Residual adapter injection for the frozen ViT-MAE backbone.
 
-This file implements the parameter-efficient fine-tuning strategy used
-throughout the repository. The design is intentionally simple:
+This module defines the parameter-efficient fine-tuning path shared across the
+project:
 1. Freeze the pre-trained MAE backbone.
-2. Insert lightweight residual adapters into the upper half of the encoder.
-3. Train only the adapter parameters during federated rounds.
+2. Wrap the upper encoder blocks with lightweight residual adapters.
+3. Leave only the adapter weights trainable during federation.
 
-Keeping the adapters residual and zero-initialized makes the wrapped model
-start from the same function as the pre-trained backbone, then gradually learn
-task-specific corrections.
+That setup preserves the original backbone behavior at initialization and
+keeps communication focused on a small trainable parameter subset.
 """
 
 from __future__ import annotations
