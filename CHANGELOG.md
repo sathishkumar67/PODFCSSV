@@ -9,13 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- **Storage-First Sequential Artifacts** (`new_main.py`, `main.py`): The 10-dataset sequential entrypoint now saves only a final checkpoint after training, keeps metric/plot generation until the end of the run, and omits duplicate `training_history` payloads from its final checkpoint to reduce disk usage.
-- **Stage Dataset Cleanup** (`new_main.py`): Finished sequential datasets are now deleted from `data_root/multidataset/<dataset_name>` after stage evaluation, with retry logic to better handle transient Windows file locks.
-- **Balanced Sequential Pairing** (`new_main.py`): The 4-dataset benchmark now pairs `EuroSAT` with `Oxford-IIIT Pet` on one client and `GTSRB` with `FGVC Aircraft` on the other to keep stage workloads closer in size and reduce idle waiting between clients.
+### Added
+- **Checkpoint Comparison Script** (`evaluate.py`): Added a standalone evaluation entrypoint that compares a saved adapter checkpoint against the original Hugging Face base model on one or more datasets.
 
-### Documentation
-- **Sequential Experiment Docs** (`README.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Updated the repository documentation to match the current storage-saving `new_main.py` behavior, including current-stage-only evaluation and the removal of forgetting plots from the active workflow.
+### Changed
+- **8-Client Sequential Benchmark** (`new_main.py`): Replaced the old 2-client sequence with an 8-client, 24-dataset schedule that runs one client per GPU across three sequential stages.
+- **Balanced Dataset Timing** (`new_main.py`): Added deterministic per-dataset sample fitting so every client trains on an effective 10,000 images per stage and is less likely to idle waiting for slower datasets.
+- **Sequential Preprocessing Policy** (`new_main.py`): Removed ImageNet-style normalization from the multi-dataset path while keeping RGB conversion and resizing.
+- **Separated Evaluation Flow** (`new_main.py`, `evaluate.py`): Removed in-training linear-probe evaluation from the sequential trainer and moved comparison work fully into the standalone evaluation script.
+
+### Fixed
+- **Stage-Local Client Memory Reset** (`src/client.py`, `new_main.py`): Clients now clear their local prototype bank and novelty buffer when they switch to a new dataset, preventing stale local state from leaking across sequential stages.
+- **Checkpoint-Aware Dataset Order** (`evaluate.py`, `new_main.py`): Evaluation now reads the saved client dataset sequence from checkpoint metadata instead of assuming a hardcoded 2-client schedule.
 
 ## [0.6.0] - 2026-03-14
 
