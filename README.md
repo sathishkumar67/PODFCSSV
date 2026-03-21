@@ -9,7 +9,9 @@ This repository implements a federated continual self-supervised learning pipeli
 - `main.py`
   Runs the paper-aligned Tiny ImageNet baseline with a Dirichlet non-IID client split.
 - `new_main.py`
-  Runs a sequential continual-learning experiment with 4 diverse non-ImageNet datasets, 2 datasets per client, stage-wise linear evaluation, final-only artifact saving, dataset cleanup after each stage, saved plots, JSON metrics, and a final checkpoint.
+  Runs the 8-client sequential continual-learning experiment with 24 datasets, balanced sample caps, stage-wise dataset progression, training metrics, saved plots, JSON history, and checkpoints.
+- `evaluate.py`
+  Loads a saved checkpoint later and compares it against the base Hugging Face model with a separate linear-probe pass.
 - `src/mae_with_adapter.py`
   Freezes the backbone and injects adapters into the upper half of the transformer.
 - `src/loss.py`
@@ -27,8 +29,9 @@ This repository implements a federated continual self-supervised learning pipeli
 - Round-1 prototype extraction and later GPAD routing now use the same embedding definition.
 - The Dirichlet partition no longer drops leftover samples after integer rounding.
 - Configured local epochs are now honored during client-side training.
-- Dataset preprocessing now matches the expected normalization for `facebook/vit-mae-base`.
-- Training history, communication statistics, evaluation summaries, checkpoints, JSON metrics, and plots are written automatically.
+- Tiny ImageNet preprocessing matches the expected normalization for `facebook/vit-mae-base`.
+- The 8-client sequential run intentionally avoids ImageNet-style normalization and uses only RGB conversion, resize, and `ToTensor()`.
+- Training history, communication statistics, checkpoints, JSON metrics, and plots are written automatically.
 
 ## Installation
 
@@ -63,7 +66,7 @@ checkpoints/
   plots/
 ```
 
-## Run The 4-Dataset Sequential Experiment
+## Run The 8-Client Sequential Experiment
 
 ```bash
 python new_main.py
@@ -71,24 +74,26 @@ python new_main.py
 
 This script keeps the same federated-learning math but changes the data schedule:
 
-- Client 0 trains on `EuroSAT` and `Oxford-IIIT Pet`.
-- Client 1 trains on `GTSRB` and `FGVC Aircraft`.
-- Each client completes the configured number of rounds on its current dataset before moving to the next one.
-- The global model, global prototypes, local prototypes, and novelty state persist across dataset transitions.
-- The full sequence spans satellite imagery, traffic-sign recognition, pet-breed recognition, and fine-grained aircraft recognition.
+- Client 0: `EuroSAT` -> `GTSRB` -> `STL10`
+- Client 1: `PCAM` -> `SVHN` -> `LFW People`
+- Client 2: `FER2013` -> `Stanford Cars` -> `CIFAR10`
+- Client 3: `FGVC Aircraft` -> `Country211` -> `FashionMNIST`
+- Client 4: `DTD` -> `Caltech101` -> `Rendered SST2`
+- Client 5: `Oxford-IIIT Pet` -> `Caltech256` -> `USPS`
+- Client 6: `Flowers102` -> `SUN397` -> `EMNIST Letters`
+- Client 7: `Food101` -> `CIFAR100` -> `Omniglot`
+- Each stage runs on 8 GPUs with one client per GPU.
+- Every training split is deterministically fitted to `10000` samples so all clients run for the same number of local steps.
+- Larger datasets are subsampled and smaller datasets are repeated deterministically to hit the same effective stage budget.
+- The stage-local prototype memory is reset when a client switches to a new dataset, while the global model and global prototype bank continue across stages.
+- The preprocessing path does not use ImageNet mean/std normalization.
 
-Additional outputs from `new_main.py`:
-
-- Per-stage linear-probe evaluation on the current stage datasets
-- Final per-dataset accuracy
-- Accuracy heatmap
-- Final-accuracy bar chart
-- Automatic dataset cleanup after each stage
+Unlike earlier sequential variants, `new_main.py` does not run linear-probe evaluation during training. That comparison is now handled separately by `evaluate.py` after the checkpoint is saved.
 
 Outputs are written under:
 
 ```text
-multidataset_outputs/
+multidataset_outputs_8client/
   checkpoints/
   metrics/
   plots/
@@ -107,10 +112,17 @@ Both entrypoints save:
 
 `new_main.py` also saves:
 
-- Stage-by-stage evaluation history
-- Linear-probe accuracy heatmap
-- Final accuracy chart
-- A final adapter checkpoint without duplicate training-history payloads
+- Stage-by-stage training history
+- Communication tracking for the 8-client run
+- Training summary plots for loss, routing, prototype growth, and communication
+
+## Compare A Saved Checkpoint Later
+
+```bash
+python evaluate.py path\to\final_model.pt --datasets eurosat gtsrb svhn
+```
+
+This script rebuilds the checkpoint config, restores the saved dataset order by default, and compares the fine-tuned adapter model against the untouched Hugging Face base model with a separate linear-probe pass.
 
 ## Configuration
 
@@ -131,6 +143,9 @@ Important fields:
 `new_main.py` extends that config with:
 
 - `rounds_per_dataset`
+- `train_samples_per_dataset`
+- `min_train_samples_per_dataset`
+- `max_global_prototypes`
 - `linear_eval_batch_size`
 - `linear_eval_epochs`
 - `linear_eval_lr`
@@ -139,10 +154,10 @@ Important fields:
 ## Notes
 
 - `train.ipynb` is a lightweight notebook wrapper for manual experimentation.
-- The multi-dataset script intentionally uses datasets outside ImageNet-1K so it does not reuse the MAE pre-training dataset itself.
+- The multi-dataset script intentionally spans satellite, medical, sentiment-text, scene, traffic, face, pet, food, and character domains instead of reusing ImageNet-1K itself.
 - `PCAM` uses an HDF5-backed dataset reader, so `h5py` is included in the project dependencies.
 - Only trainable adapter parameters are exchanged during federation; the frozen MAE backbone is never averaged.
-- `new_main.py` saves its checkpoint, metric JSON, and plots only after training finishes, and deletes finished stage datasets to reduce local storage usage.
+- The checkpoint written by `new_main.py` stores the client dataset sequence so `evaluate.py` can recover the correct default evaluation order later.
 
 ## License
 
