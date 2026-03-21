@@ -1,4 +1,4 @@
-"""Sequential federated training entrypoint for the 8-client, 24-dataset run.
+"""Sequential federated training entrypoint for the 2-client, 4-dataset run.
 
 The baseline math from ``main.py`` stays the same:
 1. Build one shared ViT-MAE backbone with trainable adapters.
@@ -8,7 +8,7 @@ The baseline math from ``main.py`` stays the same:
 5. Aggregate adapter weights and local prototypes on the server.
 6. Save round-level checkpoints, metrics, and plots.
 
-This entrypoint changes the data schedule only. Each stage uses eight datasets
+This entrypoint changes the data schedule only. Each stage uses two datasets
 in parallel, one per client. Every training split is deterministically fitted
 to the same number of samples so all clients run for the same number of steps
 per round without ImageNet-style normalization.
@@ -55,7 +55,7 @@ logger = logging.getLogger("PODFCSSV_NewMain")
 
 MULTI_DATASET_CONFIG: Dict[str, Any] = {
     **CONFIG,
-    "num_clients": 8,
+    "num_clients": 2,
     "rounds_per_dataset": 3,
     "num_workers": 2,
     "linear_eval_batch_size": 256,
@@ -70,18 +70,12 @@ MULTI_DATASET_CONFIG: Dict[str, Any] = {
     "max_global_prototypes": 2000,
     "train_samples_per_dataset": 10000,
     "min_train_samples_per_dataset": 1000,
-    "save_dir": "multidataset_outputs_8client",
+    "save_dir": "multidataset_outputs_2client",
 }
 
 CLIENT_DATASET_SEQUENCE: Dict[int, List[str]] = {
-    0: ["eurosat", "gtsrb", "stl10"],
-    1: ["pcam", "svhn", "lfwpeople"],
-    2: ["fer2013", "stanfordcars", "cifar10"],
-    3: ["fgvcaircraft", "country211", "fashionmnist"],
-    4: ["dtd", "caltech101", "renderedsst2"],
-    5: ["oxfordiiitpet", "caltech256", "usps"],
-    6: ["flowers102", "sun397", "emnistletters"],
-    7: ["food101", "cifar100", "omniglot"],
+    0: ["eurosat", "oxfordiiitpet"],
+    1: ["gtsrb", "fgvcaircraft"],
 }
 
 DATASET_DISPLAY_NAMES: Dict[str, str] = {
@@ -135,10 +129,7 @@ def validate_dataset_schedule(config: Dict[str, Any]) -> None:
         if all_dataset_names.count(dataset_name) > 1
     )
     if duplicate_names:
-        raise ValueError(
-            "Each dataset should appear only once in the 8-client schedule. "
-            f"Duplicate entries: {duplicate_names}"
-        )
+        raise ValueError(f"Duplicate dataset entries found: {duplicate_names}")
 
     missing_display_names = sorted(
         dataset_name
@@ -708,15 +699,24 @@ def evaluate_seen_datasets(
 
 
 def main() -> None:
-    """Run the 8-client sequential continual-learning schedule end to end."""
+    """Run the 2-client sequential continual-learning schedule end to end."""
     config = dict(MULTI_DATASET_CONFIG)
     resolve_runtime_config(config)
     validate_dataset_schedule(config)
 
+    available_gpu_count = config["gpu_count"]
+    if available_gpu_count > config["num_clients"]:
+        logger.info(
+            "Detected %s GPUs and using the first %s for this run.",
+            available_gpu_count,
+            config["num_clients"],
+        )
+        config["gpu_count"] = config["num_clients"]
+
     if config["gpu_count"] not in (0, config["num_clients"]):
         raise ValueError(
-            "This entrypoint expects either CPU execution or exactly one GPU per client. "
-            f"Detected {config['gpu_count']} GPUs for {config['num_clients']} clients."
+            "This entrypoint expects either CPU execution or one selected GPU per client. "
+            f"Detected {config['gpu_count']} usable GPUs for {config['num_clients']} clients."
         )
 
     config["client_dataset_sequence"] = {
@@ -731,7 +731,7 @@ def main() -> None:
     output_dirs = prepare_output_dirs(config["save_dir"])
 
     logger.info(
-        "Starting 8-client sequential run | clients=%s | stages=%s | rounds_per_stage=%s | total_rounds=%s | train_budget=%s | device=%s | output=%s",
+        "Starting 2-client sequential run | clients=%s | stages=%s | rounds_per_stage=%s | total_rounds=%s | train_budget=%s | device=%s | output=%s",
         config["num_clients"],
         config["num_stages"],
         config["rounds_per_dataset"],
