@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 
 from main import (
     DATASET_DISPLAY_NAMES,
@@ -172,15 +172,16 @@ def load_probe_train_dataset(
         )
         return None
     if train_size > PROBE_TRAIN_CAP_THRESHOLD:
-        return load_named_dataset(
-            dataset_name=dataset_name,
-            data_root=config["data_root"],
-            image_size=config["image_size"],
-            train=True,
-            seed=config["seed"],
-            max_samples=PROBE_TRAIN_SAMPLE_BUDGET,
-            min_samples=PROBE_MIN_TRAIN_SAMPLES,
+        sample_seed = stable_int_from_parts(config["seed"], dataset_name, "train", "probe_fit")
+        generator = torch.Generator().manual_seed(sample_seed)
+        selected_indices = torch.randperm(train_size, generator=generator)[:PROBE_TRAIN_SAMPLE_BUDGET].tolist()
+        logger.info(
+            "Prepared %s probe-train split | original=%s | used=%s | mode=subsampled",
+            DATASET_DISPLAY_NAMES[dataset_name],
+            train_size,
+            PROBE_TRAIN_SAMPLE_BUDGET,
         )
+        return Subset(full_train_dataset, selected_indices)
     return full_train_dataset
 
 
@@ -379,31 +380,33 @@ def train_and_eval_linear_probe(
     return compute_classification_metrics(torch.cat(eval_logits, dim=0), eval_labels, num_classes)
 
 
+def build_skipped_metrics(skip_reason: str) -> Dict[str, Any]:
+    """Build the placeholder metric payload used when a dataset must be skipped."""
+    return {
+        "accuracy": 0.0,
+        "macro_precision": 0.0,
+        "macro_recall": 0.0,
+        "macro_f1": 0.0,
+        "eval_loss": 0.0,
+        "num_train_samples": 0,
+        "num_eval_samples": 0,
+        "train_split_used": 0,
+        "skipped": 1.0,
+        "skip_reason": skip_reason,
+    }
+
+
 def evaluate_single_model_on_dataset(
     model: nn.Module,
     model_name: str,
     dataset_name: str,
     device: str,
     config: Dict[str, Any],
+    train_dataset: torch.utils.data.Dataset,
+    eval_dataset: torch.utils.data.Dataset,
 ) -> Dict[str, Any]:
     """Evaluate one frozen encoder on one dataset with a fresh linear probe."""
     logger.info("%s | starting probe on %s (%s)", model_name, DATASET_DISPLAY_NAMES[dataset_name], device)
-    train_dataset = load_probe_train_dataset(dataset_name=dataset_name, config=config)
-    eval_dataset = load_probe_eval_dataset(dataset_name=dataset_name, config=config)
-    if train_dataset is None or eval_dataset is None:
-        skip_reason = "train_split_below_minimum" if train_dataset is None else "missing_or_empty_eval_split"
-        return {
-            "accuracy": 0.0,
-            "macro_precision": 0.0,
-            "macro_recall": 0.0,
-            "macro_f1": 0.0,
-            "eval_loss": 0.0,
-            "num_train_samples": 0,
-            "num_eval_samples": 0,
-            "train_split_used": 0,
-            "skipped": 1.0,
-            "skip_reason": skip_reason,
-        }
 
     train_loader = create_standard_dataloader(
         dataset=train_dataset,
@@ -677,6 +680,20 @@ def main() -> None:
 
     results: Dict[str, Dict[str, Dict[str, Any]]] = {"federated": {}, "base": {}}
     for dataset_name in dataset_names:
+        train_dataset = load_probe_train_dataset(dataset_name=dataset_name, config=eval_config)
+        eval_dataset = load_probe_eval_dataset(dataset_name=dataset_name, config=eval_config)
+        if train_dataset is None or eval_dataset is None:
+            skip_reason = "train_split_below_minimum" if train_dataset is None else "missing_or_empty_eval_split"
+            logger.warning(
+                "Skipping %s for both models because %s.",
+                DATASET_DISPLAY_NAMES[dataset_name],
+                skip_reason,
+            )
+            skipped_metrics = build_skipped_metrics(skip_reason)
+            results["federated"][dataset_name] = dict(skipped_metrics)
+            results["base"][dataset_name] = dict(skipped_metrics)
+            continue
+
         # The two probes see the same dataset order but train independently.
         if federated_device != base_device:
             with ThreadPoolExecutor(max_workers=2) as executor:
@@ -687,6 +704,8 @@ def main() -> None:
                     dataset_name,
                     federated_device,
                     eval_config,
+                    train_dataset,
+                    eval_dataset,
                 )
                 base_future = executor.submit(
                     evaluate_single_model_on_dataset,
@@ -695,6 +714,8 @@ def main() -> None:
                     dataset_name,
                     base_device,
                     eval_config,
+                    train_dataset,
+                    eval_dataset,
                 )
                 results["federated"][dataset_name] = federated_future.result()
                 results["base"][dataset_name] = base_future.result()
@@ -705,6 +726,8 @@ def main() -> None:
                 dataset_name,
                 federated_device,
                 eval_config,
+                train_dataset,
+                eval_dataset,
             )
             results["base"][dataset_name] = evaluate_single_model_on_dataset(
                 base_model,
@@ -712,6 +735,8 @@ def main() -> None:
                 dataset_name,
                 base_device,
                 eval_config,
+                train_dataset,
+                eval_dataset,
             )
 
     print_comparison_table(results, dataset_names)
