@@ -1,17 +1,16 @@
-"""Primary training entrypoint for the Tiny ImageNet experiment.
+"""Baseline Tiny ImageNet training entrypoint for the repository.
 
-This script implements the paper-aligned baseline pipeline:
-1. Load the pre-trained ViT-MAE backbone.
-2. Inject trainable adapters into the upper transformer blocks.
-3. Split Tiny ImageNet into non-IID client tasks with a Dirichlet scheduler.
-4. Train each client locally with MAE reconstruction and GPAD.
-5. Aggregate local prototypes and adapter weights on the server.
-6. Broadcast the updated global state back to every client.
-7. Save checkpoints, JSON metrics, and publication-ready plots.
+The baseline run is the shortest path through the project:
+1. Load the frozen `facebook/vit-mae-base` backbone.
+2. Inject residual adapters into the upper encoder blocks.
+3. Build a non-IID class schedule over Tiny ImageNet.
+4. Train each client locally with MAE reconstruction plus GPAD.
+5. Aggregate adapter weights and prototypes on the server.
+6. Write checkpoints, JSON history, and summary plots.
 
-The helper functions are intentionally written as reusable utilities so
-``new_main.py`` can reuse the same reporting and checkpointing logic while
-running a different continual-data schedule.
+The helper functions in this file are reused by `new_main.py` and `evaluate.py`
+so the baseline and the multi-dataset run share the same model-building,
+reporting, and serialization behavior.
 """
 
 from __future__ import annotations
