@@ -1,11 +1,10 @@
-"""Public exports for the PODFCSSV package.
+"""Convenience exports for the core PODFCSSV building blocks.
 
-The package is intentionally small, so the top-level namespace re-exports the
-main building blocks used by the training scripts:
-1. Adapter injection and adapter modules.
+The package surface is intentionally small:
+1. Adapter injection utilities.
 2. GPAD loss.
-3. Client-side training utilities.
-4. Server-side aggregation utilities.
+3. Client-side training orchestration.
+4. Server-side aggregation helpers.
 """
 
 from src.client import ClientManager, FederatedClient
