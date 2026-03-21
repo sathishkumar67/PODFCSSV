@@ -7,7 +7,7 @@
 > files under `src/`. This guide is retained as a broad research note, but the
 > current implementation uses the corrected GPAD gradient flow, server-to-client
 > weight broadcast, unified embedding extraction, non-dropping sample
-> allocation, and the 8-client sequential benchmark described in the README.
+> allocation, and the 2-client sequential benchmark described in the README.
 > Sections in this document that discuss optional confidence-scoring
 > enhancements should be read as historical research notes rather than
 > executable features in the current codebase.
@@ -281,16 +281,10 @@ Current repository experiments:
 - Round schedule: 5 rounds x 40 classes per round by default
 
 # Sequential experiment in new_main.py
-- 8 clients on 8 GPUs
-- 3 datasets per client, executed sequentially
-- Client 0: EuroSAT -> GTSRB -> STL10
-- Client 1: PCAM -> SVHN -> LFW People
-- Client 2: FER2013 -> Stanford Cars -> CIFAR10
-- Client 3: FGVC Aircraft -> Country211 -> FashionMNIST
-- Client 4: DTD -> Caltech101 -> Rendered SST2
-- Client 5: Oxford-IIIT Pet -> Caltech256 -> USPS
-- Client 6: Flowers102 -> SUN397 -> EMNIST Letters
-- Client 7: Food101 -> CIFAR100 -> Omniglot
+- 2 clients on 2 GPUs
+- 2 datasets per client, executed sequentially
+- Client 0: EuroSAT -> Oxford-IIIT Pet
+- Client 1: GTSRB -> FGVC Aircraft
 - Each training split is fitted to 10000 samples for balanced stage time
 - Larger datasets are subsampled and smaller datasets are repeated
   deterministically to keep stage runtime aligned
@@ -307,7 +301,7 @@ The older example block below is retained as a generic research note only.
 - This legacy note is not the current executable setup
 - The current baseline uses Tiny ImageNet across 2 clients
 - Tiny ImageNet is resized to 224x224 and normalized for ViT-MAE
-- The sequential 8-client run skips dataset normalization on purpose
+- The sequential 2-client run skips dataset normalization on purpose
 - See README.md for the maintained dataset list and output artifacts
 
 # Current baseline summary
@@ -316,7 +310,7 @@ The older example block below is retained as a generic research note only.
 - The sequential benchmark is implemented separately in new_main.py
 
 # For current domain-shift experiments:
-- The repository now uses the 24-dataset sequence listed above
+- The repository now uses the 4-dataset sequence listed above
 - Each client completes one dataset before moving to the next
 - Client-local prototype memory, novelty buffering, and optimizer state persist across dataset boundaries
 ```
@@ -326,7 +320,7 @@ The older example block below is retained as a generic research note only.
 ```python
 # Current executable setup:
 1. main.py trains and logs round-level training metrics.
-2. new_main.py trains the 8-client sequential schedule and saves
+2. new_main.py trains the 2-client sequential schedule and saves
    checkpoints, communication metrics, and training plots only.
 3. evaluate.py is the post-training path for dataset-by-dataset linear-probe
    comparison against the Hugging Face base model.
