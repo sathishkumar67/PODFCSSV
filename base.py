@@ -45,12 +45,11 @@ BASE_CONFIG: Dict[str, Any] = {
     "num_clients": 1,
     "save_dir": "base_outputs",
     "batch_size": 160,
-    "num_workers": 8,
+    "num_workers": 4,
     "train_samples_per_dataset": None,
     "pin_memory": True,
     "dataloader_persistent_workers": True,
     "dataloader_prefetch_factor": 4,
-    "non_blocking_transfer": True,
     "cudnn_benchmark": True,
 }
 
@@ -75,7 +74,6 @@ def train_reconstruction_round(
     local_epochs: int,
     device: str,
     dtype: torch.dtype,
-    non_blocking_transfer: bool,
 ) -> Dict[str, float]:
     """Train the single model for one round with reconstruction loss only."""
     model.train()
@@ -86,11 +84,7 @@ def train_reconstruction_round(
     for _ in range(local_epochs):
         for batch in dataloader:
             inputs = batch[0] if isinstance(batch, (list, tuple)) else batch
-            inputs = inputs.to(
-                device=device,
-                dtype=dtype,
-                non_blocking=non_blocking_transfer,
-            )
+            inputs = inputs.to(device=device, dtype=dtype)
             outputs = model(inputs)
             loss = getattr(outputs, "loss", None)
             if loss is None:
@@ -163,9 +157,6 @@ def main() -> None:
     max_worker_count = max(1, (os.cpu_count() or 1) - 1)
     config["num_workers"] = min(config["num_workers"], max_worker_count)
     config["pin_memory"] = bool(config["pin_memory"] and config["device"] == "cuda")
-    config["non_blocking_transfer"] = bool(
-        config["non_blocking_transfer"] and config["device"] == "cuda"
-    )
     if config["device"] == "cuda" and config["cudnn_benchmark"]:
         torch.backends.cudnn.benchmark = True
     if hasattr(torch, "set_float32_matmul_precision"):
@@ -228,7 +219,6 @@ def main() -> None:
                 local_epochs=config["local_epochs"],
                 device=config["device"],
                 dtype=config["dtype"],
-                non_blocking_transfer=config["non_blocking_transfer"],
             )
             round_time = time.time() - round_start
 
