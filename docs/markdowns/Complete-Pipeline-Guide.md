@@ -7,7 +7,7 @@
 > files under `src/`. This guide is retained as a broad research note, but the
 > current implementation uses the corrected GPAD gradient flow, server-to-client
 > weight broadcast, unified embedding extraction, non-dropping sample
-> allocation, and the 4-dataset sequential benchmark described in the README.
+> allocation, and the 8-client sequential benchmark described in the README.
 > Sections in this document that discuss optional confidence-scoring
 > enhancements should be read as historical research notes rather than
 > executable features in the current codebase.
@@ -281,12 +281,23 @@ Current repository experiments:
 - Round schedule: 5 rounds x 40 classes per round by default
 
 # Sequential experiment in new_main.py
-- Client 0: EuroSAT, Oxford-IIIT Pet
-- Client 1: GTSRB, FGVC Aircraft
-- Each client completes one dataset before moving to the next
-- The sequence intentionally spans satellite, traffic-sign, pet-recognition,
-  and fine-grained aircraft-recognition domains
-- Finished stage datasets are deleted after evaluation to reduce local storage
+- 8 clients on 8 GPUs
+- 3 datasets per client, executed sequentially
+- Client 0: EuroSAT -> GTSRB -> STL10
+- Client 1: PCAM -> SVHN -> LFW People
+- Client 2: FER2013 -> Stanford Cars -> CIFAR10
+- Client 3: FGVC Aircraft -> Country211 -> FashionMNIST
+- Client 4: DTD -> Caltech101 -> Rendered SST2
+- Client 5: Oxford-IIIT Pet -> Caltech256 -> USPS
+- Client 6: Flowers102 -> SUN397 -> EMNIST Letters
+- Client 7: Food101 -> CIFAR100 -> Omniglot
+- Each training split is fitted to 10000 samples for balanced stage time
+- Larger datasets are subsampled and smaller datasets are repeated
+  deterministically to keep stage runtime aligned
+- Images are converted to RGB, resized to 224x224, and tensorized without
+  ImageNet normalization
+- Linear-probe evaluation is not run inside training; it is handled later by
+  evaluate.py
 ```
 
 The older example block below is retained as a generic research note only.
@@ -295,7 +306,8 @@ The older example block below is retained as a generic research note only.
 # Legacy example block: see the updated repository experiment summary above
 - This legacy note is not the current executable setup
 - The current baseline uses Tiny ImageNet across 2 clients
-- All datasets are resized to 224x224 and normalized for ViT-MAE
+- Tiny ImageNet is resized to 224x224 and normalized for ViT-MAE
+- The sequential 8-client run skips dataset normalization on purpose
 - See README.md for the maintained dataset list and output artifacts
 
 # Current baseline summary
@@ -304,28 +316,30 @@ The older example block below is retained as a generic research note only.
 - The sequential benchmark is implemented separately in new_main.py
 
 # For current domain-shift experiments:
-- The repository now uses the 4-dataset sequence listed above
+- The repository now uses the 24-dataset sequence listed above
 - Each client completes one dataset before moving to the next
+- Client-local prototype memory is reset at stage boundaries
 ```
 
 ## 7.2 Evaluation Protocol
 
 ```python
-# Current new_main.py evaluation flow:
-1. Linear-probe accuracy on the current stage datasets
-2. Average stage accuracy across the active datasets
-3. Final per-dataset accuracy summary at the end of the run
-4. Forgetting is not computed in the storage-saving workflow because finished datasets are deleted after each stage
+# Current executable setup:
+1. main.py trains and logs round-level training metrics.
+2. new_main.py trains the 8-client sequential schedule and saves
+   checkpoints, communication metrics, and training plots only.
+3. evaluate.py is the post-training path for dataset-by-dataset linear-probe
+   comparison against the Hugging Face base model.
 
 # Communication tracking:
-1. Bytes sent per round (adapters + prototypes)
-2. Compression ratio (if applicable)
-3. Total communication cost vs baselines
+1. Bytes sent per round (adapter weights + prototypes)
+2. Total communication cost across the full sequential run
+3. Prototype-bank growth across rounds
 
 # Computational cost:
 1. Training time per round
-2. Inference latency
-3. Memory usage per client
+2. Per-stage balance enforced by equal sample caps
+3. Memory usage per client / GPU
 ```
 
 ## 7.3 Baseline Comparisons
