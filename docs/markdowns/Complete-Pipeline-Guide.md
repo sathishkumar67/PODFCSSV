@@ -318,7 +318,7 @@ The older example block below is retained as a generic research note only.
 # For current domain-shift experiments:
 - The repository now uses the 24-dataset sequence listed above
 - Each client completes one dataset before moving to the next
-- Client-local prototype memory is reset at stage boundaries
+- Client-local prototype memory, novelty buffering, and optimizer state persist across dataset boundaries
 ```
 
 ## 7.2 Evaluation Protocol

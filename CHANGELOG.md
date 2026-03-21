@@ -17,9 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Balanced Dataset Timing** (`new_main.py`): Added deterministic per-dataset sample fitting so every client trains on an effective 10,000 images per stage and is less likely to idle waiting for slower datasets.
 - **Sequential Preprocessing Policy** (`new_main.py`): Removed ImageNet-style normalization from the multi-dataset path while keeping RGB conversion and resizing.
 - **Separated Evaluation Flow** (`new_main.py`, `evaluate.py`): Removed in-training linear-probe evaluation from the sequential trainer and moved comparison work fully into the standalone evaluation script.
+- **Sequential Client Memory Persistence** (`src/client.py`, `new_main.py`): The 8-client sequential run now keeps each client's local prototypes, novelty buffer, and optimizer state across dataset transitions to better match a real-world continual setting.
 
 ### Fixed
-- **Stage-Local Client Memory Reset** (`src/client.py`, `new_main.py`): Clients now clear their local prototype bank and novelty buffer when they switch to a new dataset, preventing stale local state from leaking across sequential stages.
 - **Checkpoint-Aware Dataset Order** (`evaluate.py`, `new_main.py`): Evaluation now reads the saved client dataset sequence from checkpoint metadata instead of assuming a hardcoded 2-client schedule.
 
 ## [0.6.0] - 2026-03-14

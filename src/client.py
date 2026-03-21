@@ -9,8 +9,9 @@ repeats the same local cycle:
 5. Cluster the novelty buffer when it fills up.
 6. Return trainable weights plus local prototypes to the server.
 
-For sequential runs, the client also exposes a reset hook so stage-local
-prototype memory can be cleared cleanly when the dataset changes.
+In sequential runs, the same local prototype bank, novelty buffer, and
+optimizer state continue across dataset transitions so each client carries its
+accumulated local memory forward into the next dataset.
 """
 
 from __future__ import annotations
@@ -381,12 +382,6 @@ class FederatedClient:
         if self.local_prototypes is None:
             return None
         return self.local_prototypes.detach().clone()
-
-    def reset_local_memory(self) -> None:
-        """Clear stage-local state before a client switches datasets."""
-        self.local_prototypes = None
-        self.novelty_buffer.clear()
-        self.optimizer.state.clear()
 
     @torch.no_grad()
     def generate_prototypes(

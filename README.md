@@ -85,7 +85,7 @@ This script keeps the same federated-learning math but changes the data schedule
 - Each stage runs on 8 GPUs with one client per GPU.
 - Every training split is deterministically fitted to `10000` samples so all clients run for the same number of local steps.
 - Larger datasets are subsampled and smaller datasets are repeated deterministically to hit the same effective stage budget.
-- The stage-local prototype memory is reset when a client switches to a new dataset, while the global model and global prototype bank continue across stages.
+- Each client keeps its local prototypes, novelty buffer, and optimizer state when it switches to the next dataset, while the global model and global prototype bank also continue across stages.
 - The preprocessing path does not use ImageNet mean/std normalization.
 
 Unlike earlier sequential variants, `new_main.py` does not run linear-probe evaluation during training. That comparison is now handled separately by `evaluate.py` after the checkpoint is saved.

@@ -815,9 +815,6 @@ def main() -> None:
             for dataset in stage_datasets
         ]
 
-        for client in client_manager.clients:
-            client.reset_local_memory()
-
         for stage_round in range(1, config["rounds_per_dataset"] + 1):
             global_round_idx += 1
             logger.info(
