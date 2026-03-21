@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -22,13 +23,13 @@ from typing import Any, Dict
 import matplotlib.pyplot as plt
 import torch
 import torch.optim as optim
+from torch.utils.data import DataLoader
 
 from main import (
     DATASET_DISPLAY_NAMES,
     MULTI_DATASET_CONFIG,
     build_base_model,
     build_dataset_order_by_stage,
-    create_standard_dataloader,
     load_named_dataset,
     prepare_output_dirs,
     save_checkpoint,
@@ -43,7 +44,14 @@ BASE_CONFIG: Dict[str, Any] = {
     **MULTI_DATASET_CONFIG,
     "num_clients": 1,
     "save_dir": "base_outputs",
+    "batch_size": 160,
+    "num_workers": 8,
     "train_samples_per_dataset": None,
+    "pin_memory": True,
+    "dataloader_persistent_workers": True,
+    "dataloader_prefetch_factor": 4,
+    "non_blocking_transfer": True,
+    "cudnn_benchmark": True,
 }
 
 
@@ -62,11 +70,12 @@ def initialize_base_history() -> Dict[str, Any]:
 
 def train_reconstruction_round(
     model: torch.nn.Module,
-    dataloader: torch.utils.data.DataLoader,
+    dataloader: DataLoader,
     optimizer: optim.Optimizer,
     local_epochs: int,
     device: str,
     dtype: torch.dtype,
+    non_blocking_transfer: bool,
 ) -> Dict[str, float]:
     """Train the single model for one round with reconstruction loss only."""
     model.train()
@@ -77,7 +86,11 @@ def train_reconstruction_round(
     for _ in range(local_epochs):
         for batch in dataloader:
             inputs = batch[0] if isinstance(batch, (list, tuple)) else batch
-            inputs = inputs.to(device=device, dtype=dtype)
+            inputs = inputs.to(
+                device=device,
+                dtype=dtype,
+                non_blocking=non_blocking_transfer,
+            )
             outputs = model(inputs)
             loss = getattr(outputs, "loss", None)
             if loss is None:
@@ -98,6 +111,26 @@ def train_reconstruction_round(
         "num_batches": total_batches,
         "num_samples": total_samples,
     }
+
+
+def create_base_dataloader(
+    dataset: torch.utils.data.Dataset,
+    config: Dict[str, Any],
+) -> DataLoader:
+    """Create a base-only dataloader with more aggressive throughput settings."""
+    loader_kwargs: Dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": config["batch_size"],
+        "shuffle": config["dataloader_shuffle"],
+        "num_workers": config["num_workers"],
+        "pin_memory": config["pin_memory"],
+        "drop_last": False,
+    }
+    if config["num_workers"] > 0:
+        loader_kwargs["persistent_workers"] = config["dataloader_persistent_workers"]
+        loader_kwargs["prefetch_factor"] = config["dataloader_prefetch_factor"]
+    return DataLoader(**loader_kwargs)
+
 
 def plot_base_training_history(history: Dict[str, Any], plots_dir: Path) -> Path:
     """Plot baseline reconstruction loss and round time."""
@@ -127,6 +160,16 @@ def main() -> None:
     """Run the single-model continual baseline."""
     config = dict(BASE_CONFIG)
     resolve_runtime_config(config)
+    max_worker_count = max(1, (os.cpu_count() or 1) - 1)
+    config["num_workers"] = min(config["num_workers"], max_worker_count)
+    config["pin_memory"] = bool(config["pin_memory"] and config["device"] == "cuda")
+    config["non_blocking_transfer"] = bool(
+        config["non_blocking_transfer"] and config["device"] == "cuda"
+    )
+    if config["device"] == "cuda" and config["cudnn_benchmark"]:
+        torch.backends.cudnn.benchmark = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
     config["dataset_order_by_stage"] = build_dataset_order_by_stage()
     config["client_dataset_sequence"] = {"0": list(config["dataset_order_by_stage"])}
     config["num_stages"] = len(config["dataset_order_by_stage"])
@@ -145,9 +188,12 @@ def main() -> None:
     global_round_idx = 0
 
     logger.info(
-        "Starting single-model baseline | datasets=%s | rounds_per_dataset=%s | device=%s | output=%s",
+        "Starting single-model baseline | datasets=%s | rounds_per_dataset=%s | batch_size=%s | num_workers=%s | pin_memory=%s | device=%s | output=%s",
         len(config["dataset_order_by_stage"]),
         config["rounds_per_dataset"],
+        config["batch_size"],
+        config["num_workers"],
+        config["pin_memory"],
         config["device"],
         output_dirs["root"],
     )
@@ -170,13 +216,7 @@ def main() -> None:
             max_samples=config["train_samples_per_dataset"],
             min_samples=config["min_train_samples_per_dataset"],
         )
-        dataloader = create_standard_dataloader(
-            dataset=dataset,
-            batch_size=config["batch_size"],
-            num_workers=config["num_workers"],
-            pin_memory=config["pin_memory"],
-            shuffle=config["dataloader_shuffle"],
-        )
+        dataloader = create_base_dataloader(dataset=dataset, config=config)
 
         for dataset_round in range(1, config["rounds_per_dataset"] + 1):
             global_round_idx += 1
@@ -188,6 +228,7 @@ def main() -> None:
                 local_epochs=config["local_epochs"],
                 device=config["device"],
                 dtype=config["dtype"],
+                non_blocking_transfer=config["non_blocking_transfer"],
             )
             round_time = time.time() - round_start
 
