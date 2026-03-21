@@ -1,19 +1,12 @@
-"""Loss functions used by the federated continual learning pipeline.
+"""GPAD loss used by both training entrypoints.
 
-This module contains the implementation of Gated Prototype Anchored
-Distillation (GPAD). GPAD is the regularizer that keeps client embeddings close
-to the global prototype bank only when the match is confident enough.
-
-The implementation follows the paper's sequence exactly:
-1. L2-normalize the client embeddings and the global prototypes.
-2. Compute cosine similarities between every embedding and every prototype.
-3. Build a soft assignment distribution over the prototype bank.
-4. Convert the assignment entropy into an adaptive anchor threshold.
-5. Mark an embedding as anchored when its best similarity is greater than or
-   equal to that threshold.
-6. Apply a smooth sigmoid gate on top of the hard anchor decision.
-7. Penalize anchored embeddings with squared Euclidean distance on the unit
-   sphere, which simplifies to ``2 * (1 - cosine_similarity)``.
+The GPAD path is intentionally easy to follow:
+1. Normalize embeddings and global prototypes.
+2. Measure cosine similarity between every embedding and every prototype.
+3. Turn the similarity distribution into an entropy-aware anchor threshold.
+4. Mark confident samples as anchored.
+5. Apply a smooth gate around the hard anchor decision.
+6. Penalize anchored samples when they drift away from the prototype bank.
 """
 
 from __future__ import annotations
