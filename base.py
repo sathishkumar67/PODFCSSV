@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 
 from main import (
     DATASET_DISPLAY_NAMES,
+    MODEL_CONFIG,
     MULTI_DATASET_CONFIG,
     build_base_model,
     build_dataset_order_by_stage,
@@ -45,7 +46,7 @@ BASE_CONFIG: Dict[str, Any] = {
     **MULTI_DATASET_CONFIG,
     "num_clients": 1,
     "save_dir": "base_outputs",
-    "batch_size": 64,
+    "batch_size": MODEL_CONFIG["baseline_batch_size"],
     "num_workers": 4,
     "train_samples_per_dataset": None,
     "pin_memory": True,

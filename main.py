@@ -47,11 +47,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PODFCSSV_Main")
 
+MODEL_NAME = "facebook/vit-mae-huge"
+
+MODEL_VARIANTS: Dict[str, Dict[str, Any]] = {
+    "facebook/vit-mae-base": {
+        "embedding_dim": 768,
+        "federated_batch_size": 64,
+        "baseline_batch_size": 64,
+    },
+    "facebook/vit-mae-large": {
+        "embedding_dim": 1024,
+        "federated_batch_size": 64,
+        "baseline_batch_size": 64,
+    },
+    "facebook/vit-mae-huge": {
+        "embedding_dim": 1280,
+        "federated_batch_size": 64,
+        "baseline_batch_size": 64,
+    },
+}
+
+
+def get_model_variant_config(model_name: str) -> Dict[str, Any]:
+    """Return the model-specific defaults used by every training entrypoint."""
+    if model_name not in MODEL_VARIANTS:
+        available_models = ", ".join(sorted(MODEL_VARIANTS))
+        raise ValueError(
+            f"Unsupported pretrained model '{model_name}'. "
+            f"Choose one of: {available_models}."
+        )
+    return dict(MODEL_VARIANTS[model_name])
+
+
+MODEL_CONFIG = get_model_variant_config(MODEL_NAME)
+
 CONFIG: Dict[str, Any] = {
     "seed": 42,
     "num_clients": 2,
     "local_epochs": 1,
-    "batch_size": 64,
+    "batch_size": MODEL_CONFIG["federated_batch_size"],
     "client_lr": 1e-4,
     "client_weight_decay": 0.05,
     "gpu_count": 0,
@@ -60,8 +94,8 @@ CONFIG: Dict[str, Any] = {
     "num_workers": 2,
     "pin_memory": True,
     "dataloader_shuffle": True,
-    "pretrained_model_name": "facebook/vit-mae-huge",
-    "embedding_dim": 1280,
+    "pretrained_model_name": MODEL_NAME,
+    "embedding_dim": MODEL_CONFIG["embedding_dim"],
     "image_size": 224,
     "adapter_bottleneck_dim": 256,
     "merge_threshold": 0.85,
