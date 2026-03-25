@@ -45,7 +45,7 @@ BASE_CONFIG: Dict[str, Any] = {
     **MULTI_DATASET_CONFIG,
     "num_clients": 1,
     "save_dir": "base_outputs",
-    "batch_size": 128,
+    "batch_size": 64,
     "num_workers": 4,
     "train_samples_per_dataset": None,
     "pin_memory": True,
