@@ -51,7 +51,7 @@ CONFIG: Dict[str, Any] = {
     "seed": 42,
     "num_clients": 2,
     "local_epochs": 1,
-    "batch_size": 64,
+    "batch_size": 96,
     "client_lr": 1e-4,
     "client_weight_decay": 0.05,
     "gpu_count": 0,
