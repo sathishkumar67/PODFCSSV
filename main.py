@@ -8,7 +8,9 @@ both training modes and the built-in retention analysis:
    loss only while following the same benchmark-plus-stress dataset stream.
 3. After each stage, the current model is evaluated on all benchmark datasets
    seen so far by frozen-feature linear probing.
-4. Checkpoints, JSON histories, communication metrics, forgetting metrics, and
+4. After the linear probe, a fresh dataset-specific partial-finetuning transfer
+   evaluation is run from the same checkpoint on the same seen benchmark set.
+5. Checkpoints, JSON histories, communication metrics, forgetting metrics, and
    plots are all written from this same script.
 
 The default benchmark uses six auto-download-friendly datasets with held-out
@@ -73,8 +75,8 @@ MODEL_VARIANTS: Dict[str, Dict[str, Any]] = {
     },
     "facebook/vit-mae-huge": {
         "embedding_dim": 1280,
-        "federated_batch_size": 64,
-        "baseline_batch_size": 64,
+        "federated_batch_size": 32,
+        "baseline_batch_size": 32,
     },
 }
 
@@ -149,6 +151,15 @@ MULTI_DATASET_CONFIG: Dict[str, Any] = {
     "linear_eval_test_samples": None,
     "min_linear_eval_train_samples": 0,
     "min_linear_eval_test_samples": 0,
+    "partial_eval_batch_size": 64,
+    "partial_eval_epochs": 3,
+    "partial_eval_lr": 1e-4,
+    "partial_eval_weight_decay": 1e-4,
+    "partial_eval_num_workers": 2,
+    "partial_eval_train_samples": None,
+    "partial_eval_test_samples": None,
+    "min_partial_eval_train_samples": 0,
+    "min_partial_eval_test_samples": 0,
     "max_global_prototypes": 2000,
     "train_samples_per_dataset": 10000,
     "min_train_samples_per_dataset": 1000,
@@ -369,12 +380,13 @@ def build_base_model(config: Dict[str, Any]) -> nn.Module:
     trainable_parameters = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
-    logger.info(
-        "Model ready | total=%s | trainable=%s (%.2f%%)",
-        f"{total_parameters:,}",
-        f"{trainable_parameters:,}",
-        100.0 * trainable_parameters / total_parameters,
-    )
+    if config.get("log_model_ready", True):
+        logger.info(
+            "Model ready | total=%s | trainable=%s (%.2f%%)",
+            f"{total_parameters:,}",
+            f"{trainable_parameters:,}",
+            100.0 * trainable_parameters / total_parameters,
+        )
     return model
 
 
@@ -547,6 +559,7 @@ def initialize_history() -> Dict[str, Any]:
         "stage_kinds": [],
         "used_for_linear_probe": [],
         "stage_evaluations": [],
+        "partial_finetune_stage_evaluations": [],
         "client_results": [],
     }
 
@@ -1186,6 +1199,50 @@ def create_standard_dataloader(
     )
 
 
+def _iter_mask_ratio_holders(model: nn.Module) -> List[Any]:
+    """Collect every config object that can carry the MAE mask ratio."""
+    holders: List[Any] = []
+    candidate_holders = [
+        getattr(model, "config", None),
+        getattr(getattr(model, "vit", None), "config", None),
+        getattr(getattr(getattr(model, "vit", None), "embeddings", None), "config", None),
+    ]
+    for holder in candidate_holders:
+        if holder is not None and hasattr(holder, "mask_ratio") and holder not in holders:
+            holders.append(holder)
+    return holders
+
+
+def forward_encoder_without_mask(
+    model: nn.Module,
+    images: torch.Tensor,
+    output_hidden_states: bool = False,
+) -> Any:
+    """Run the MAE encoder on full images by temporarily disabling masking.
+
+    Both stage-wise evaluation paths use the encoder alone and set the MAE mask
+    ratio to zero for the duration of the forward pass so the representation is
+    measured on the complete image rather than on a masked view.
+    """
+    if not hasattr(model, "vit"):
+        raise AttributeError("Expected a ViT-MAE model with a 'vit' encoder module.")
+
+    mask_ratio_holders = _iter_mask_ratio_holders(model)
+    original_mask_ratios = [float(holder.mask_ratio) for holder in mask_ratio_holders]
+    for holder in mask_ratio_holders:
+        holder.mask_ratio = 0.0
+
+    try:
+        return model.vit(
+            pixel_values=images,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
+    finally:
+        for holder, original_mask_ratio in zip(mask_ratio_holders, original_mask_ratios):
+            holder.mask_ratio = original_mask_ratio
+
+
 def pool_model_hidden_states(hidden_states: torch.Tensor) -> torch.Tensor:
     """Pool the last encoder hidden state the same way training code does.
 
@@ -1218,8 +1275,12 @@ def collect_labeled_embeddings(
 
     for images, labels in dataloader:
         images = images.to(device=device, dtype=dtype)
-        outputs = model(images, output_hidden_states=True)
-        embeddings = pool_model_hidden_states(outputs.hidden_states[-1])
+        encoder_outputs = forward_encoder_without_mask(
+            model=model,
+            images=images,
+            output_hidden_states=True,
+        )
+        embeddings = pool_model_hidden_states(encoder_outputs.hidden_states[-1])
         embeddings = F.normalize(embeddings, p=2, dim=1)
         feature_batches.append(embeddings.cpu())
         label_batches.append(torch.as_tensor(labels, dtype=torch.long).cpu())
@@ -1247,6 +1308,146 @@ def remap_labels_to_contiguous(
         remapped_test[test_labels == original_label] = new_index
 
     return remapped_train, remapped_test, len(unique_labels)
+
+
+def extract_dataset_labels(dataset: torch.utils.data.Dataset) -> List[int]:
+    """Return labels from a dataset, subset, or concatenation in a uniform form."""
+    if isinstance(dataset, Subset):
+        base_labels = extract_dataset_labels(dataset.dataset)
+        return [int(base_labels[index]) for index in dataset.indices]
+
+    if isinstance(dataset, ConcatDataset):
+        labels: List[int] = []
+        for child_dataset in dataset.datasets:
+            labels.extend(extract_dataset_labels(child_dataset))
+        return labels
+
+    for attribute_name in ("targets", "labels", "_labels"):
+        if hasattr(dataset, attribute_name):
+            labels = getattr(dataset, attribute_name)
+            if isinstance(labels, torch.Tensor):
+                return [int(label) for label in labels.tolist()]
+            return [int(label) for label in list(labels)]
+
+    for attribute_name in ("samples", "_samples"):
+        if hasattr(dataset, attribute_name):
+            samples = getattr(dataset, attribute_name)
+            if samples:
+                return [int(sample[1]) for sample in samples]
+
+    labels = []
+    for dataset_index in range(len(dataset)):
+        sample = dataset[dataset_index]
+        if not isinstance(sample, (list, tuple)) or len(sample) < 2:
+            raise ValueError("Expected labeled datasets to return image-label tuples.")
+        labels.append(int(sample[1]))
+    return labels
+
+
+class LabelMappedDataset(torch.utils.data.Dataset):
+    """Wrap one labeled dataset and remap labels to a contiguous class range."""
+
+    def __init__(self, dataset: torch.utils.data.Dataset, label_mapping: Dict[int, int]) -> None:
+        self.dataset = dataset
+        self.label_mapping = label_mapping
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> Tuple[Any, int]:
+        sample = self.dataset[index]
+        if not isinstance(sample, (list, tuple)) or len(sample) < 2:
+            raise ValueError("Expected labeled datasets to return image-label tuples.")
+        image, label = sample[0], int(sample[1])
+        return image, self.label_mapping[label]
+
+
+def build_label_mapping(
+    train_dataset: torch.utils.data.Dataset,
+    test_dataset: torch.utils.data.Dataset,
+) -> Dict[int, int]:
+    """Create one stable label map shared by the train and held-out splits."""
+    train_labels = extract_dataset_labels(train_dataset)
+    test_labels = extract_dataset_labels(test_dataset)
+    unique_labels = sorted(set(train_labels) | set(test_labels))
+    return {
+        original_label: new_label
+        for new_label, original_label in enumerate(unique_labels)
+    }
+
+
+def configure_partial_finetune_encoder(model: nn.Module) -> None:
+    """Freeze lower blocks and adapters while reopening upper transformer blocks.
+
+    The transfer protocol follows the agreed evaluation rule:
+    1. Keep the lower half of the encoder frozen.
+    2. In the upper half, keep adapter weights frozen.
+    3. Unfreeze the original transformer-block weights in that upper half.
+    4. Keep the MAE decoder frozen because transfer uses encoder features only.
+    """
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    if not hasattr(model, "vit") or not hasattr(model.vit, "encoder"):
+        raise AttributeError("Expected a ViT-MAE encoder stack for partial fine-tuning.")
+
+    encoder_layers = model.vit.encoder.layer
+    inject_start_layer = len(encoder_layers) // 2
+
+    for layer_index, layer in enumerate(encoder_layers):
+        if layer_index < inject_start_layer:
+            continue
+
+        if hasattr(layer, "adapter") and hasattr(layer, "original_block"):
+            for parameter in layer.original_block.parameters():
+                parameter.requires_grad = True
+            for parameter in layer.adapter.parameters():
+                parameter.requires_grad = False
+        else:
+            for parameter in layer.parameters():
+                parameter.requires_grad = True
+
+    if hasattr(model.vit, "layernorm"):
+        for parameter in model.vit.layernorm.parameters():
+            parameter.requires_grad = True
+
+
+class PartialFinetuneClassifier(nn.Module):
+    """Couple one partially unfrozen MAE encoder with a dataset-specific head."""
+
+    def __init__(self, encoder_model: nn.Module, num_classes: int) -> None:
+        super().__init__()
+        self.encoder_model = encoder_model
+        hidden_size = int(getattr(encoder_model.config, "hidden_size"))
+        self.classifier = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        encoder_outputs = forward_encoder_without_mask(
+            model=self.encoder_model,
+            images=images,
+            output_hidden_states=False,
+        )
+        pooled_features = pool_model_hidden_states(encoder_outputs.last_hidden_state)
+        return self.classifier(pooled_features)
+
+
+def build_partial_finetune_model(
+    reference_model: nn.Module,
+    config: Dict[str, Any],
+) -> nn.Module:
+    """Build one fresh transfer-evaluation model from the current checkpoint."""
+    evaluation_config = dict(config)
+    evaluation_config["device"] = "cpu"
+    evaluation_config["dtype"] = torch.float32
+    evaluation_config["log_model_ready"] = False
+    evaluation_model = build_base_model(evaluation_config)
+    evaluation_model.load_state_dict(
+        extract_trainable_state_dict(reference_model),
+        strict=False,
+    )
+    configure_partial_finetune_encoder(evaluation_model)
+    evaluation_model = evaluation_model.to(device=config["device"], dtype=config["dtype"])
+    return evaluation_model
 
 
 def run_linear_probe(
@@ -1392,6 +1593,124 @@ def evaluate_datasets(
     return results
 
 
+def run_partial_finetune_probe(
+    reference_model: nn.Module,
+    train_dataset: torch.utils.data.Dataset,
+    test_dataset: torch.utils.data.Dataset,
+    config: Dict[str, Any],
+) -> float:
+    """Fine-tune a fresh dataset-specific transfer model and return accuracy.
+
+    This transfer stage is run independently for every dataset:
+    1. Build a fresh MAE encoder from the current checkpoint.
+    2. Freeze the lower encoder layers.
+    3. Freeze adapters in the upper encoder layers.
+    4. Fine-tune the remaining upper-layer transformer weights plus a new head.
+    5. Evaluate the adapted model on the held-out split.
+    """
+    label_mapping = build_label_mapping(train_dataset=train_dataset, test_dataset=test_dataset)
+    if not label_mapping:
+        return 0.0
+
+    mapped_train_dataset = LabelMappedDataset(train_dataset, label_mapping)
+    mapped_test_dataset = LabelMappedDataset(test_dataset, label_mapping)
+
+    train_loader = create_standard_dataloader(
+        dataset=mapped_train_dataset,
+        batch_size=config["partial_eval_batch_size"],
+        num_workers=config["partial_eval_num_workers"],
+        pin_memory=config["pin_memory"],
+        shuffle=True,
+    )
+    test_loader = create_standard_dataloader(
+        dataset=mapped_test_dataset,
+        batch_size=config["partial_eval_batch_size"],
+        num_workers=config["partial_eval_num_workers"],
+        pin_memory=config["pin_memory"],
+        shuffle=False,
+    )
+
+    transfer_encoder = build_partial_finetune_model(reference_model=reference_model, config=config)
+    transfer_model = PartialFinetuneClassifier(
+        encoder_model=transfer_encoder,
+        num_classes=len(label_mapping),
+    ).to(device=config["device"], dtype=config["dtype"])
+    optimizer = optim.AdamW(
+        [parameter for parameter in transfer_model.parameters() if parameter.requires_grad],
+        lr=config["partial_eval_lr"],
+        weight_decay=config["partial_eval_weight_decay"],
+    )
+    loss_fn = nn.CrossEntropyLoss()
+
+    for _ in range(config["partial_eval_epochs"]):
+        transfer_model.train()
+        for images, labels in train_loader:
+            images = images.to(device=config["device"], dtype=config["dtype"])
+            labels = labels.to(device=config["device"], dtype=torch.long)
+
+            logits = transfer_model(images)
+            loss = loss_fn(logits, labels)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+    transfer_model.eval()
+    correct = 0
+    total = 0
+    with torch.inference_mode():
+        for images, labels in test_loader:
+            images = images.to(device=config["device"], dtype=config["dtype"])
+            labels = labels.to(device=config["device"], dtype=torch.long)
+            predictions = transfer_model(images).argmax(dim=1)
+            correct += int((predictions == labels).sum().item())
+            total += int(labels.size(0))
+
+    del transfer_model
+    del transfer_encoder
+    del train_loader
+    del test_loader
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return correct / total if total > 0 else 0.0
+
+
+def evaluate_datasets_with_partial_finetune(
+    model: nn.Module,
+    dataset_names: Sequence[str],
+    config: Dict[str, Any],
+) -> Dict[str, float]:
+    """Evaluate checkpoint transfer quality with fresh partial fine-tuning."""
+    results: Dict[str, float] = {}
+    for dataset_name in dataset_names:
+        train_dataset = load_named_dataset(
+            dataset_name=dataset_name,
+            data_root=config["data_root"],
+            image_size=config["image_size"],
+            train=True,
+            seed=config["seed"],
+            max_samples=config.get("partial_eval_train_samples"),
+            min_samples=config.get("min_partial_eval_train_samples"),
+        )
+        test_dataset = load_named_evaluation_dataset(
+            dataset_name=dataset_name,
+            data_root=config["data_root"],
+            image_size=config["image_size"],
+            seed=config["seed"],
+            max_samples=config.get("partial_eval_test_samples"),
+            min_samples=config.get("min_partial_eval_test_samples"),
+        )
+        results[dataset_name] = run_partial_finetune_probe(
+            reference_model=model,
+            train_dataset=train_dataset,
+            test_dataset=test_dataset,
+            config=config,
+        )
+    return results
+
+
 def evaluate_seen_datasets(
     model: nn.Module,
     seen_dataset_names: List[str],
@@ -1401,12 +1720,26 @@ def evaluate_seen_datasets(
     return evaluate_datasets(model=model, dataset_names=seen_dataset_names, config=config)
 
 
+def evaluate_seen_datasets_with_partial_finetune(
+    model: nn.Module,
+    seen_dataset_names: List[str],
+    config: Dict[str, Any],
+) -> Dict[str, float]:
+    """Evaluate transfer quality on the benchmark datasets seen so far."""
+    return evaluate_datasets_with_partial_finetune(
+        model=model,
+        dataset_names=seen_dataset_names,
+        config=config,
+    )
+
+
 def summarize_stage_evaluation(
     history: Dict[str, Any],
     stage_number: int,
     stage_kind: str,
     evaluated_dataset_names: Sequence[str],
     accuracies: Dict[str, float],
+    history_key: str = "stage_evaluations",
 ) -> Dict[str, Any]:
     """Turn one stage's accuracies into retention-oriented metrics.
 
@@ -1417,7 +1750,7 @@ def summarize_stage_evaluation(
     4. Backward transfer relative to the first score observed for each dataset.
     5. Stage-level averages used for plots and tables.
     """
-    previous_stage_evaluations = history.get("stage_evaluations", [])
+    previous_stage_evaluations = history.get(history_key, [])
     forgetting: Dict[str, float] = {}
     retention_ratio: Dict[str, float] = {}
     backward_transfer: Dict[str, float] = {}
@@ -1463,7 +1796,7 @@ def summarize_stage_evaluation(
         "backward_transfer": backward_transfer,
         "average_backward_transfer": average_backward_transfer,
     }
-    history.setdefault("stage_evaluations", []).append(stage_summary)
+    history.setdefault(history_key, []).append(stage_summary)
     return stage_summary
 
 
@@ -1472,10 +1805,12 @@ def plot_stage_evaluation_heatmap(
     dataset_order: Sequence[str],
     plots_dir: Path,
     prefix: str,
+    history_key: str = "stage_evaluations",
+    title: str = "Stage-Wise Benchmark Accuracy",
 ) -> Path:
     """Plot stage-by-dataset benchmark accuracy so forgetting is easy to inspect."""
     output_path = plots_dir / f"{prefix}_stage_accuracy_heatmap.png"
-    stage_evaluations = history.get("stage_evaluations", [])
+    stage_evaluations = history.get(history_key, [])
     if not stage_evaluations or not dataset_order:
         return output_path
 
@@ -1496,7 +1831,7 @@ def plot_stage_evaluation_heatmap(
     axis.set_xticklabels([DATASET_DISPLAY_NAMES[name] for name in dataset_order], rotation=45, ha="right")
     axis.set_yticks(range(len(stage_labels)))
     axis.set_yticklabels(stage_labels)
-    axis.set_title("Stage-Wise Benchmark Accuracy")
+    axis.set_title(title)
     figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
     figure.tight_layout()
     figure.savefig(output_path, dpi=200, bbox_inches="tight")
@@ -1508,10 +1843,12 @@ def plot_stage_metric_curves(
     history: Dict[str, Any],
     plots_dir: Path,
     prefix: str,
+    history_key: str = "stage_evaluations",
+    title_prefix: str = "Linear Probe",
 ) -> Path:
     """Plot the stage-wise averages that summarize retention quality."""
     output_path = plots_dir / f"{prefix}_stage_metric_curves.png"
-    stage_evaluations = history.get("stage_evaluations", [])
+    stage_evaluations = history.get(history_key, [])
     if not stage_evaluations:
         return output_path
 
@@ -1523,24 +1860,24 @@ def plot_stage_metric_curves(
 
     figure, axes = plt.subplots(2, 2, figsize=(14, 10))
     axes[0, 0].plot(stage_indices, average_accuracy, marker="o")
-    axes[0, 0].set_title("Average Benchmark Accuracy")
+    axes[0, 0].set_title(f"{title_prefix} Average Benchmark Accuracy")
     axes[0, 0].set_xlabel("Stage")
     axes[0, 0].set_ylabel("Accuracy")
     axes[0, 0].set_ylim(0.0, 1.0)
 
     axes[0, 1].plot(stage_indices, average_forgetting, marker="o")
-    axes[0, 1].set_title("Average Forgetting")
+    axes[0, 1].set_title(f"{title_prefix} Average Forgetting")
     axes[0, 1].set_xlabel("Stage")
     axes[0, 1].set_ylabel("Forgetting")
 
     axes[1, 0].plot(stage_indices, average_retention, marker="o")
-    axes[1, 0].set_title("Average Retention Ratio")
+    axes[1, 0].set_title(f"{title_prefix} Average Retention Ratio")
     axes[1, 0].set_xlabel("Stage")
     axes[1, 0].set_ylabel("Retention")
     axes[1, 0].set_ylim(0.0, 1.05)
 
     axes[1, 1].plot(stage_indices, average_backward_transfer, marker="o")
-    axes[1, 1].set_title("Average Backward Transfer")
+    axes[1, 1].set_title(f"{title_prefix} Average Backward Transfer")
     axes[1, 1].set_xlabel("Stage")
     axes[1, 1].set_ylabel("BWT")
 
@@ -1555,10 +1892,12 @@ def plot_final_forgetting_bars(
     dataset_order: Sequence[str],
     plots_dir: Path,
     prefix: str,
+    history_key: str = "stage_evaluations",
+    title: str = "Final Forgetting by Dataset",
 ) -> Path:
     """Plot the final forgetting value for each benchmark dataset."""
     output_path = plots_dir / f"{prefix}_final_forgetting.png"
-    stage_evaluations = history.get("stage_evaluations", [])
+    stage_evaluations = history.get(history_key, [])
     if not stage_evaluations:
         return output_path
 
@@ -1581,12 +1920,67 @@ def plot_final_forgetting_bars(
     axis.bar(x_positions, forgetting_values, color="tab:orange")
     axis.set_xticks(x_positions)
     axis.set_xticklabels([DATASET_DISPLAY_NAMES[name] for name in plotted_dataset_names], rotation=45, ha="right")
-    axis.set_title("Final Forgetting by Dataset")
+    axis.set_title(title)
     axis.set_ylabel("Forgetting")
     figure.tight_layout()
     figure.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(figure)
     return output_path
+
+
+def render_all_stage_evaluation_plots(
+    history: Dict[str, Any],
+    dataset_order: Sequence[str],
+    plots_dir: Path,
+    prefix: str,
+) -> None:
+    """Write both linear-probe and partial-finetuning retention plots."""
+    plot_stage_evaluation_heatmap(
+        history,
+        dataset_order,
+        plots_dir,
+        prefix,
+        history_key="stage_evaluations",
+        title="Linear-Probe Stage Accuracy",
+    )
+    plot_stage_metric_curves(
+        history,
+        plots_dir,
+        prefix,
+        history_key="stage_evaluations",
+        title_prefix="Linear Probe",
+    )
+    plot_final_forgetting_bars(
+        history,
+        dataset_order,
+        plots_dir,
+        prefix,
+        history_key="stage_evaluations",
+        title="Linear-Probe Final Forgetting by Dataset",
+    )
+    plot_stage_evaluation_heatmap(
+        history,
+        dataset_order,
+        plots_dir,
+        f"{prefix}_partial",
+        history_key="partial_finetune_stage_evaluations",
+        title="Partial-Finetuning Transfer Accuracy",
+    )
+    plot_stage_metric_curves(
+        history,
+        plots_dir,
+        f"{prefix}_partial",
+        history_key="partial_finetune_stage_evaluations",
+        title_prefix="Partial Fine-Tune",
+    )
+    plot_final_forgetting_bars(
+        history,
+        dataset_order,
+        plots_dir,
+        f"{prefix}_partial",
+        history_key="partial_finetune_stage_evaluations",
+        title="Partial-Finetuning Transfer Forgetting by Dataset",
+    )
 
 
 def initialize_baseline_history() -> Dict[str, Any]:
@@ -1605,6 +1999,7 @@ def initialize_baseline_history() -> Dict[str, Any]:
         "avg_mae_loss": [],
         "stage_summaries": [],
         "stage_evaluations": [],
+        "partial_finetune_stage_evaluations": [],
     }
 
 
@@ -1705,8 +2100,9 @@ def run_baseline_experiment() -> None:
     1. Build the shared adapter-injected MAE model.
     2. Walk through the benchmark and retention-stress datasets sequentially.
     3. Train with MAE reconstruction only.
-    4. Evaluate only on benchmark datasets seen so far after each stage.
-    5. Save checkpoints, JSON histories, and retention plots.
+    4. Run linear-probe retention evaluation after each stage.
+    5. Run fresh partial-finetuning transfer evaluation on the same datasets.
+    6. Save checkpoints, JSON histories, and retention plots.
     """
     config = dict(BASELINE_CONFIG)
     config["run_mode"] = "baseline"
@@ -1765,12 +2161,14 @@ def run_baseline_experiment() -> None:
     seen_benchmark_dataset_names: List[str] = []
 
     baseline_logger.info(
-        "Starting unified baseline | stages=%s | benchmark_datasets=%s | rounds_per_dataset=%s | batch_size=%s | train_budget=%s | device=%s | output=%s",
+        "Starting unified baseline | stages=%s | benchmark_datasets=%s | rounds_per_dataset=%s | batch_size=%s | train_budget=%s | linear_probe_epochs=%s | partial_eval_epochs=%s | device=%s | output=%s",
         len(config["dataset_order_by_stage"]),
         len(config["linear_probe_dataset_order"]),
         config["rounds_per_dataset"],
         config["batch_size"],
         config["train_samples_per_dataset"],
+        config["linear_eval_epochs"],
+        config["partial_eval_epochs"],
         config["device"],
         output_dirs["root"],
     )
@@ -1868,9 +2266,10 @@ def run_baseline_experiment() -> None:
             stage_kind=stage_kind,
             evaluated_dataset_names=seen_benchmark_dataset_names,
             accuracies=stage_accuracies,
+            history_key="stage_evaluations",
         )
         baseline_logger.info(
-            "Baseline stage %s evaluation | kind=%s | datasets=%s | avg_acc=%.4f | avg_forgetting=%.4f | avg_retention=%.4f | avg_bwt=%.4f",
+            "Baseline stage %s linear probe | kind=%s | datasets=%s | avg_acc=%.4f | avg_forgetting=%.4f | avg_retention=%.4f | avg_bwt=%.4f",
             stage_index,
             stage_kind,
             ", ".join(DATASET_DISPLAY_NAMES[name] for name in seen_benchmark_dataset_names),
@@ -1878,6 +2277,29 @@ def run_baseline_experiment() -> None:
             stage_evaluation["average_forgetting"],
             stage_evaluation["average_retention"],
             stage_evaluation["average_backward_transfer"],
+        )
+        partial_stage_accuracies = evaluate_seen_datasets_with_partial_finetune(
+            model=model,
+            seen_dataset_names=seen_benchmark_dataset_names,
+            config=config,
+        )
+        partial_stage_evaluation = summarize_stage_evaluation(
+            history=history,
+            stage_number=stage_index,
+            stage_kind=stage_kind,
+            evaluated_dataset_names=seen_benchmark_dataset_names,
+            accuracies=partial_stage_accuracies,
+            history_key="partial_finetune_stage_evaluations",
+        )
+        baseline_logger.info(
+            "Baseline stage %s partial fine-tune | kind=%s | datasets=%s | avg_acc=%.4f | avg_forgetting=%.4f | avg_retention=%.4f | avg_bwt=%.4f",
+            stage_index,
+            stage_kind,
+            ", ".join(DATASET_DISPLAY_NAMES[name] for name in seen_benchmark_dataset_names),
+            partial_stage_evaluation["average_accuracy"],
+            partial_stage_evaluation["average_forgetting"],
+            partial_stage_evaluation["average_retention"],
+            partial_stage_evaluation["average_backward_transfer"],
         )
 
         del dataloader
@@ -1888,9 +2310,12 @@ def run_baseline_experiment() -> None:
 
         save_history(history, output_dirs["metrics"], filename="baseline_training_history.json")
         plot_baseline_training_history(history, output_dirs["plots"])
-        plot_stage_evaluation_heatmap(history, config["linear_probe_dataset_order"], output_dirs["plots"], "baseline")
-        plot_stage_metric_curves(history, output_dirs["plots"], "baseline")
-        plot_final_forgetting_bars(history, config["linear_probe_dataset_order"], output_dirs["plots"], "baseline")
+        render_all_stage_evaluation_plots(
+            history,
+            config["linear_probe_dataset_order"],
+            output_dirs["plots"],
+            "baseline",
+        )
 
     save_checkpoint(
         checkpoint_dir=output_dirs["checkpoints"],
@@ -1903,9 +2328,12 @@ def run_baseline_experiment() -> None:
     )
     save_history(history, output_dirs["metrics"], filename="baseline_training_history.json")
     plot_baseline_training_history(history, output_dirs["plots"])
-    plot_stage_evaluation_heatmap(history, config["linear_probe_dataset_order"], output_dirs["plots"], "baseline")
-    plot_stage_metric_curves(history, output_dirs["plots"], "baseline")
-    plot_final_forgetting_bars(history, config["linear_probe_dataset_order"], output_dirs["plots"], "baseline")
+    render_all_stage_evaluation_plots(
+        history,
+        config["linear_probe_dataset_order"],
+        output_dirs["plots"],
+        "baseline",
+    )
     baseline_logger.info(
         "Baseline complete | rounds=%s | final_checkpoint=%s",
         global_round_idx,
@@ -1923,8 +2351,9 @@ def run_federated_experiment() -> None:
     4. Merge prototypes and aggregate adapter weights after each round.
     5. Preserve and enrich both global memory and client-local prototype memory
        across stage transitions.
-    6. Evaluate on all benchmark datasets seen so far after each stage.
-    7. Save checkpoints, communication metrics, retention summaries, and plots.
+    6. Run linear-probe retention evaluation on seen benchmark datasets.
+    7. Run fresh partial-finetuning transfer evaluation on the same datasets.
+    8. Save checkpoints, communication metrics, retention summaries, and plots.
     """
     config = dict(MULTI_DATASET_CONFIG)
     config["run_mode"] = "federated"
@@ -1986,13 +2415,15 @@ def run_federated_experiment() -> None:
     output_dirs = prepare_output_dirs(config["save_dir"])
 
     logger.info(
-        "Starting unified federated run | clients=%s | total_stages=%s | benchmark_stages=%s | rounds_per_stage=%s | total_rounds=%s | train_budget=%s | device=%s | output=%s",
+        "Starting unified federated run | clients=%s | total_stages=%s | benchmark_stages=%s | rounds_per_stage=%s | total_rounds=%s | train_budget=%s | linear_probe_epochs=%s | partial_eval_epochs=%s | device=%s | output=%s",
         config["num_clients"],
         config["num_stages"],
         config["num_benchmark_stages"],
         config["rounds_per_dataset"],
         config["total_sequential_rounds"],
         config["train_samples_per_dataset"],
+        config["linear_eval_epochs"],
+        config["partial_eval_epochs"],
         config["device"],
         output_dirs["root"],
     )
@@ -2249,9 +2680,10 @@ def run_federated_experiment() -> None:
                 stage_kind=stage_kind,
                 evaluated_dataset_names=seen_benchmark_dataset_names,
                 accuracies=stage_accuracies,
+                history_key="stage_evaluations",
             )
             logger.info(
-                "Stage %s evaluation | kind=%s | datasets=%s | avg_acc=%.4f | avg_forgetting=%.4f | avg_retention=%.4f | avg_bwt=%.4f",
+                "Stage %s linear probe | kind=%s | datasets=%s | avg_acc=%.4f | avg_forgetting=%.4f | avg_retention=%.4f | avg_bwt=%.4f",
                 stage_number,
                 stage_kind,
                 ", ".join(DATASET_DISPLAY_NAMES[name] for name in seen_benchmark_dataset_names),
@@ -2259,6 +2691,29 @@ def run_federated_experiment() -> None:
                 stage_evaluation["average_forgetting"],
                 stage_evaluation["average_retention"],
                 stage_evaluation["average_backward_transfer"],
+            )
+            partial_stage_accuracies = evaluate_seen_datasets_with_partial_finetune(
+                model=base_model,
+                seen_dataset_names=seen_benchmark_dataset_names,
+                config=config,
+            )
+            partial_stage_evaluation = summarize_stage_evaluation(
+                history=training_history,
+                stage_number=stage_number,
+                stage_kind=stage_kind,
+                evaluated_dataset_names=seen_benchmark_dataset_names,
+                accuracies=partial_stage_accuracies,
+                history_key="partial_finetune_stage_evaluations",
+            )
+            logger.info(
+                "Stage %s partial fine-tune | kind=%s | datasets=%s | avg_acc=%.4f | avg_forgetting=%.4f | avg_retention=%.4f | avg_bwt=%.4f",
+                stage_number,
+                stage_kind,
+                ", ".join(DATASET_DISPLAY_NAMES[name] for name in seen_benchmark_dataset_names),
+                partial_stage_evaluation["average_accuracy"],
+                partial_stage_evaluation["average_forgetting"],
+                partial_stage_evaluation["average_retention"],
+                partial_stage_evaluation["average_backward_transfer"],
             )
 
         del stage_dataloaders
@@ -2273,14 +2728,7 @@ def run_federated_experiment() -> None:
             output_dirs["plots"],
             prefix="main",
         )
-        plot_stage_evaluation_heatmap(
-            training_history,
-            config["linear_probe_dataset_order"],
-            output_dirs["plots"],
-            "main",
-        )
-        plot_stage_metric_curves(training_history, output_dirs["plots"], "main")
-        plot_final_forgetting_bars(
+        render_all_stage_evaluation_plots(
             training_history,
             config["linear_probe_dataset_order"],
             output_dirs["plots"],
@@ -2296,6 +2744,18 @@ def run_federated_experiment() -> None:
         config=config,
         is_final=True,
         include_training_history=False,
+    )
+    save_history(training_history, output_dirs["metrics"])
+    plot_training_history(
+        training_history,
+        output_dirs["plots"],
+        prefix="main",
+    )
+    render_all_stage_evaluation_plots(
+        training_history,
+        config["linear_probe_dataset_order"],
+        output_dirs["plots"],
+        "main",
     )
     logger.info(
         "Training complete | rounds=%s | final_checkpoint=%s",
