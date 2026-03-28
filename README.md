@@ -2,179 +2,116 @@
 
 Prototype-Oriented Distillation for Federated Continual Self-Supervised Vision.
 
-This repository contains three aligned entrypoints built on the same pretrained `facebook/vit-mae-base` backbone with injected residual adapters:
+The current repository uses one executable pipeline file: `main.py`.
 
-- `main.py`: federated continual learning with 2 clients and GPAD
-- `base.py`: single-model continual learning without federation or GPAD
-- `evaluate.py`: frozen-feature linear-probe comparison between saved `main.py` and `base.py` checkpoints
+Set `RUN_MODE` in `main.py` to one of:
 
-## Current Pipeline
+- `federated`
+- `baseline`
 
-### `main.py`
+## Benchmark
 
-`main.py` is the main experiment entrypoint.
-
-It runs a 2-client sequential schedule over 6 datasets:
-
-- Client 0: `EuroSAT` -> `Oxford-IIIT Pet` -> `Flowers102`
-- Client 1: `GTSRB` -> `FGVC Aircraft` -> `DTD`
-
-Each stage trains one dataset per client in parallel, then moves to the next pair.
-
-The federated stage loop is:
-
-1. Load one dataset per client for the current stage.
-2. Fit each training split to an effective budget of `10000` samples.
-3. Run local MAE reconstruction and GPAD on both clients.
-4. Generate or reuse local prototypes.
-5. Merge prototypes and average adapter weights on the server.
-6. Broadcast the updated adapter weights to both clients.
-7. Preserve global prototypes, local prototypes, novelty buffers, and optimizer state across dataset transitions.
-8. Save checkpoints, JSON history, and plots.
-
-Important current behavior:
-
-- no ImageNet normalization in the multi-dataset path
-- RGB conversion + resize + `ToTensor()` only
-- `EuroSAT` uses a fixed deterministic split of `10000` train and `5000` eval samples
-- train splits smaller than `1000` samples are rejected
-- larger splits are deterministically subsampled to the configured budget
-- smaller valid splits are deterministically repeated up to the configured budget
-- CUDA is used only if a real kernel-execution smoke test passes
-
-Outputs:
-
-```text
-multidataset_outputs_2client/
-  checkpoints/
-  metrics/
-  plots/
-```
-
-### `base.py`
-
-`base.py` is the single-model continual baseline.
-
-It uses the same adapter-injected MAE model as `main.py`, but:
-
-- there is only one model
-- there is no federation
-- there is no GPAD
-- training uses only reconstruction loss
-- the full train split is used for each dataset
-- model weights and optimizer state persist across dataset transitions
-
-The dataset order follows the same stage order flattened into one sequence:
+Reported benchmark datasets:
 
 - `EuroSAT`
 - `GTSRB`
+- `Food101`
+- `Country211`
 - `Oxford-IIIT Pet`
 - `FGVC Aircraft`
-- `Flowers102`
-- `DTD`
 
-Outputs:
+Benchmark client schedule:
 
-```text
-base_outputs/
-  checkpoints/
-  metrics/
-  plots/
-```
+- Client 0: `EuroSAT -> Food101 -> Oxford-IIIT Pet`
+- Client 1: `GTSRB -> Country211 -> FGVC Aircraft`
 
-### `evaluate.py`
+Retention-stress datasets inserted into both modes:
 
-`evaluate.py` compares a saved federated checkpoint and a saved baseline checkpoint.
+- Client 0: `CIFAR10 -> STL10 -> Flowers102`
+- Client 1: `SVHN -> CIFAR100 -> DTD`
 
-The evaluation flow is:
+The stress datasets create harder distribution shifts during training, but they are never included in the reported benchmark evaluation set.
 
-1. Load both checkpoints into the same adapter-injected MAE architecture.
-2. Freeze both models.
-3. Use encoder-only inference with `mask_ratio = 0.0`.
-4. Extract frozen features from full images.
-5. Train one dataset-specific linear probe per checkpoint.
-6. Evaluate on the official held-out split for that dataset.
-7. Save JSON metrics and comparison plots.
+## Shared Model and Budget
 
-Probe-fit policy:
+Both modes use `facebook/vit-mae-base`, a frozen MAE backbone, residual adapters in the upper half of the encoder, and preprocessing of `RGB -> resize to 224 x 224 -> ToTensor()`. No ImageNet normalization is used.
 
-- if train split `< 1000`: skip the dataset
-- if train split is `1000..10000`: use the full train split
-- if train split `> 10000`: use a deterministic `4000`-sample subset
+Shared training defaults:
 
-Held-out evaluation policy:
+- `local_epochs = 1`
+- `rounds_per_dataset = 3`
+- `client_lr = 1e-4`
+- `client_weight_decay = 0.05`
+- federated batch size `64`
+- baseline batch size `64`
 
-- `EuroSAT` uses the repo-defined deterministic `10000`-train / `5000`-eval split
-- if both `val` and `test` exist in the repo loader, both are used
-- if only one official held-out split exists, that split is used
-- if the repo only has a generated split and no official held-out split, the dataset is skipped
+Training budget policy:
 
-Saved evaluation metrics:
+- `EuroSAT` uses a fixed split of `10000` train and `5000` held-out evaluation samples
+- every benchmark training split targets `10000` effective samples
+- splits below `1000` samples are rejected
+- larger splits are deterministically subsampled
+- smaller valid splits are deterministically repeated up to the target budget
 
-- accuracy
-- macro precision
-- macro recall
-- macro F1
-- eval loss
+The baseline uses the same budget policy as the federated benchmark.
 
-Saved evaluation artifacts:
+## Modes
 
-- side-by-side bar charts
-- federated-minus-base delta charts
-- accuracy heatmap
-- JSON summary with evaluated and skipped datasets
+`RUN_MODE = "federated"`:
 
-## Core Modules
+1. loads one dataset per client for the current stage
+2. alternates benchmark stages with retention-stress stages
+3. trains locally with MAE reconstruction and GPAD
+4. merges local prototypes and aggregates only the trainable adapter weights
+5. preserves global memory and carries client-local memory forward by enriching the existing local prototype banks instead of resetting them
+6. evaluates on all benchmark datasets seen so far after every stage
+7. saves checkpoints, histories, metrics, and plots
 
-- `src/mae_with_adapter.py`
-  Freezes ViT-MAE and injects residual adapters into the upper half of the encoder.
-- `src/loss.py`
-  Implements GPAD, including adaptive thresholds, anchor masks, and the gated prototype loss.
-- `src/client.py`
-  Handles local MAE training, GPAD routing, local prototype updates, novelty buffering, and local spherical K-means.
-- `src/server.py`
-  Handles prototype-bank updates, FedAvg-style adapter aggregation, and server-side EMA smoothing.
+`RUN_MODE = "baseline"`:
 
-## Installation
+1. builds one adapter-injected MAE model
+2. trains sequentially over both the benchmark datasets and the same stress datasets used by the federated run
+3. uses reconstruction loss only
+4. preserves the same model and optimizer state across stages
+5. runs the same stage-wise benchmark evaluation after every stage
+6. saves checkpoints, histories, metrics, and plots
+
+## Built-In Evaluation
+
+After each stage, `main.py` performs frozen-feature linear-probe evaluation on every benchmark dataset seen so far. The stage summaries track:
+
+- per-dataset accuracy
+- average benchmark accuracy
+- forgetting
+- retention ratio
+- backward transfer
+
+Saved plots include:
+
+- training summary
+- stage accuracy heatmap
+- stage metric curves
+- final forgetting bar chart
+
+## Download Safety
+
+The default publishable schedule avoids manual-setup datasets such as `FER2013`, `PCAM`, and `Stanford Cars`. The dependency metadata now includes `scipy` so the default `SVHN` and `Flowers102` paths install cleanly in a fresh environment.
+
+To smoke-test dataset downloads without running training, use:
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+python test.py
 ```
 
-## Run
+`test.py` downloads every benchmark and stress dataset one by one, touches the required splits, deletes that dataset folder, and then moves on to the next dataset.
 
-Federated continual run:
+## Run
 
 ```bash
 python main.py
 ```
 
-Single-model continual baseline:
-
-```bash
-python base.py
-```
-
-Checkpoint comparison:
-
-```bash
-python evaluate.py path\to\federated_final_model.pt path\to\base_final_model.pt
-```
-
-Optional dataset override:
-
-```bash
-python evaluate.py path\to\federated_final_model.pt path\to\base_final_model.pt --datasets gtsrb fgvcaircraft flowers102 dtd
-```
-
-## Notes
-
-- Only trainable adapter parameters are exchanged during federation.
-- The pretrained MAE backbone remains frozen in all three entrypoints.
-- `main.py` and `base.py` both save the dataset sequence inside checkpoints so later evaluation can recover the correct default order.
-- If a CUDA runtime reports availability but cannot execute kernels, the repo now falls back earlier instead of failing deep inside the first convolution.
+No separate `base.py` or `evaluate.py` entrypoint is required for the current retention-analysis workflow.
 
 ## License
 

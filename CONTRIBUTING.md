@@ -1,26 +1,23 @@
 # Contributing to PODFCSSV
 
-Thank you for contributing to **PODFCSSV**. This guide reflects the current repository layout and the current training and evaluation flow.
+This guide reflects the current single-file experiment setup.
 
 ## Setup
-
-Clone the repository:
 
 ```bash
 git clone https://github.com/sathishkumar67/PODFCSSV.git
 cd PODFCSSV
-```
-
-Create and activate an environment:
-
-```bash
 python -m venv .venv
 ```
+
+Activate the environment:
 
 ```bash
 # Windows
 .venv\Scripts\activate
+```
 
+```bash
 # macOS / Linux
 source .venv/bin/activate
 ```
@@ -31,95 +28,80 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Quick import check:
+## Current Entry Point
+
+The repository now uses:
+
+- `main.py`
+
+Set `RUN_MODE` in `main.py` to:
+
+- `federated`
+- `baseline`
+
+## Benchmark Design
+
+Benchmark datasets:
+
+- `EuroSAT`
+- `GTSRB`
+- `Food101`
+- `Country211`
+- `Oxford-IIIT Pet`
+- `FGVC Aircraft`
+
+Retention-stress datasets used by both modes:
+
+- `CIFAR10`
+- `SVHN`
+- `STL10`
+- `CIFAR100`
+- `Flowers102`
+- `DTD`
+
+The stress datasets are trained only to create stronger forgetting pressure and are excluded from the reported benchmark evaluation set.
+
+## Development Rules
+
+- keep `main.py` as the single source of truth for training and built-in forgetting evaluation
+- keep the benchmark dataset list download-friendly
+- keep the stress-dataset stream aligned between baseline and federated runs when making forgetting comparisons
+- do not reintroduce manual-setup datasets into the default publishable schedule
+- keep the baseline and federated training budgets aligned unless there is a strong experimental reason not to
+- update docs whenever the benchmark, stage schedule, or tracked metrics change
+- keep Python docstrings step-by-step and aligned with the current `main.py` execution flow
+
+## Validation
+
+Run at least:
 
 ```bash
-python -c "from src import GPADLoss, ClientManager; print('Imports OK')"
+python -m py_compile main.py src\__init__.py src\client.py src\server.py src\loss.py src\mae_with_adapter.py
 ```
 
-## Current Entry Points
-
-Run the current scripts like this:
+If you want to verify dataset download paths without running training:
 
 ```bash
-python main.py
-python base.py
-python evaluate.py path\to\federated_final_model.pt path\to\base_final_model.pt
+python test.py
 ```
 
-Current intent of each entrypoint:
-
-- `main.py`: federated continual learning with 2 clients, 6 datasets, and GPAD
-- `base.py`: single-model continual learning with reconstruction loss only
-- `evaluate.py`: frozen-feature linear-probe comparison between saved checkpoints
-
-## Shared Architecture
-
-The main shared modules are:
-
-| Module | Responsibility |
-|---|---|
-| `src/mae_with_adapter.py` | freeze ViT-MAE and inject residual adapters |
-| `src/loss.py` | GPAD loss, adaptive thresholds, anchor masks |
-| `src/client.py` | client-side MAE training, routing, novelty buffering, local prototypes |
-| `src/server.py` | global prototype merging and adapter-weight averaging |
-
-## Documentation Style
-
-Python files use a clear, step-by-step documentation style.
-
-When updating docstrings or comments:
-
-- explain what stage of the pipeline the code belongs to
-- explain the order of the important steps
-- explain what state persists across rounds or dataset transitions
-- explain why a branch exists when the behavior is not obvious
-- prefer implementation clarity over dense research prose
-
-Inline comments should be used sparingly and should explain the purpose of a block, not narrate each line.
-
-## Development Guidelines
-
-### Linting and Formatting
+If formatting tools are installed:
 
 ```bash
 ruff check .
 ruff format .
 ```
 
-### Device and Dtype Handling
+## Pull Requests
 
-- respect the shared `dtype` and `device` settings
-- avoid hardcoded dtype casts unless they are genuinely required
-- keep tensor-device movement explicit
-- remember that the repo now validates that CUDA can execute a real kernel before using a GPU
-
-### Keeping the Entry Points Aligned
-
-If you change one entrypoint, check the others:
-
-- `main.py` and `base.py` should keep using the same adapter-injected MAE architecture
-- `evaluate.py` should stay compatible with the checkpoint layout written by `main.py` and `base.py`
-- README and the pipeline guide should be updated whenever the pipeline behavior changes
-
-## Submitting Changes
-
-1. Create a branch from `main`.
-2. Make focused changes with clear commit messages.
-3. Run at least the relevant syntax, lint, or smoke checks.
-4. Update documentation when pipeline behavior changes.
-5. Open a pull request that explains what changed, why it changed, and how it was tested.
-
-## Reporting Issues
-
-When reporting issues, include:
-
-- a clear description of the problem
-- exact reproduction steps
-- Python, PyTorch, and CUDA versions
-- GPU type if CUDA is involved
-- relevant logs or stack traces
+1. Create a focused branch from `main`.
+2. Keep changes scoped to one pipeline change when possible.
+3. Explain the experiment impact clearly.
+4. Include the validation commands you ran.
+5. Update documentation if behavior changed.
 
 ## License
 
 By contributing, you agree that your contributions will be licensed under the [MIT License](LICENSE).
+
+

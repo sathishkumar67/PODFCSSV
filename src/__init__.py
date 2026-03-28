@@ -1,11 +1,17 @@
-"""Expose the core building blocks used by every entrypoint in the repo.
+"""Expose the small set of reusable modules that power the whole pipeline.
 
-The package is intentionally small so the high-level scripts can read almost
-like a pipeline description:
-1. Adapter wrappers define which MAE parameters remain trainable.
-2. GPAD defines the prototype-anchored loss used in the federated run.
-3. Client helpers run local training and maintain local prototype memory.
-4. Server helpers merge client updates back into one global state.
+The repository is organized so the top-level training script can read almost
+like an experiment checklist:
+1. ``src.mae_with_adapter`` builds the frozen MAE backbone plus trainable
+   residual adapters.
+2. ``src.loss`` defines GPAD, the prototype-anchored regularizer used only in
+   the federated mode.
+3. ``src.client`` owns client-side optimization, routing, and local-memory
+   maintenance.
+4. ``src.server`` owns server-side prototype merging and adapter aggregation.
+
+Importing from ``src`` gives the training entrypoint one compact place to
+collect those building blocks.
 """
 
 from src.client import ClientManager, FederatedClient

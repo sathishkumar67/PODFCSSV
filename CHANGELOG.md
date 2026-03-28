@@ -10,20 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Dual-Checkpoint Evaluator** (`evaluate.py`): Added a standalone evaluation entrypoint that compares saved `main.py` and `base.py` checkpoints with frozen-feature linear probes, dataset-wise metrics, JSON output, and comparison plots.
+- **Single Entrypoint Workflow** (`main.py`): The repository now supports both the federated experiment and the single-model baseline from one file via a `RUN_MODE` switch.
+- **Retention-Stress Stages** (`main.py`): Added interleaved stress datasets, including the later Flowers102 and DTD stress stage, so retention can be analyzed under stronger shifts without adding those datasets to the default benchmark evaluation set.
+- **Built-In Forgetting Analysis** (`main.py`): Stage-wise benchmark evaluation is now performed during training, with tracked accuracy, forgetting, retention ratio, backward transfer, and publication-ready plots.
+- **Step-by-Step Code Guides** (`main.py`, `src/*.py`): Active Python modules now use refreshed docstrings and comments that describe the current single-file training and retention-analysis workflow step by step.
+- **Dataset Download Smoke Test** (`test.py`): Added a standalone script that downloads every benchmark and stress dataset one by one, validates the requested splits, deletes the dataset folder, and continues to the next dataset.
 
 ### Changed
-- **Current Main Entrypoint** (`main.py`): `main.py` remains the federated 2-client, 6-dataset sequential benchmark with persistent local memory, adapter-only communication, and deterministic `10000`-sample train budgets.
-- **Current Baseline Entrypoint** (`base.py`): `base.py` is now the reconstruction-only continual baseline that uses the same adapter-injected model but trains a single model across the full train splits without federation or GPAD. The current baseline batch size is `192`.
-- **Current Evaluation Policy** (`evaluate.py`): Linear probes now use the train split for fitting, use supported held-out splits for reporting, cap oversized train splits at a deterministic `4000` samples, and skip datasets that do not have a supported held-out split or have fewer than `1000` train samples.
-- **EuroSAT Split Policy** (`main.py`, `evaluate.py`): `EuroSAT` now uses a fixed deterministic split of `10000` train samples and `5000` eval samples so it remains usable in the current training and evaluation flow.
-- **Documentation Refresh** (`README.md`, `CONTRIBUTING.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Repository documentation now reflects the current 2-client federated run, the current single-model baseline, and the current evaluation flow.
-- **Python Documentation Refresh** (`main.py`, `base.py`, `evaluate.py`, `src/*.py`): Module docstrings and key function docstrings were rewritten in a step-by-step style to match the current pipeline.
+- **Publishable Benchmark Refresh** (`main.py`): Replaced the earlier small mixed benchmark with `EuroSAT`, `GTSRB`, `Food101`, `Country211`, `Oxford-IIIT Pet`, and `FGVC Aircraft`, all chosen from the supported auto-downloadable paths with held-out evaluation splits.
+- **Baseline Fairness Policy** (`main.py`): The unified baseline now uses the same `10000`-sample effective train budget as the federated benchmark instead of consuming unrestricted full train splits.
+- **Stress-Stream Fairness** (`main.py`): The unified baseline now trains through the same stress-dataset stream as the federated mode, while benchmark reporting still excludes those stress datasets.
+- **Single-File Workflow** (`main.py`): Training-time forgetting evaluation now lives inside the same file as the training modes, and the standalone evaluation entrypoint has been removed from the active pipeline.
+- **Documentation Refresh** (`README.md`, `CONTRIBUTING.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Repository documentation now reflects the single-file workflow, the new benchmark datasets, and the built-in forgetting analysis.
 
 ### Fixed
-- **CUDA Runtime Validation** (`main.py`, `evaluate.py`): The runtime now validates that CUDA can execute a small kernel before treating a GPU as usable, preventing deep training failures on incompatible CUDA environments.
-- **Base-Path Transfer Stability** (`base.py`): Removed the non-blocking input transfer path from the single-model baseline after compatibility issues on some CUDA environments.
-- **Checkpoint-Aware Dataset Order** (`evaluate.py`, `main.py`, `base.py`): Evaluation still reads the saved dataset sequence from checkpoint metadata instead of assuming an outdated hardcoded schedule.
+- **CUDA Runtime Validation** (`main.py`): The runtime now validates that CUDA can execute a small kernel before treating a GPU as usable, preventing deep training failures on incompatible CUDA environments.
+- **Download-Friendly Default Schedule** (`main.py`): The default benchmark now rejects datasets with known manual-download caveats so the publishable setup stays reproducible.
+- **Stage-Start Local Prototype Preservation** (`src/client.py`, `main.py`): Stage-initial prototype extraction now enriches the existing client-local prototype bank instead of overwriting it, so local memory truly persists across dataset transitions.
+- **Runtime Dependencies** (`requirements.txt`, `pyproject.toml`): Added `scipy` so the default `SVHN` and `Flowers102` dataset paths install cleanly in a fresh environment.
 
 ## [0.6.0] - 2026-03-14
 
@@ -222,3 +226,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Adapter Injection** (`src/mae_with_adapter.py`): `IBA_Adapter` bottleneck module and `inject_adapters()` for parameter-efficient ViT-MAE fine-tuning.
 - **Main Orchestrator** (`main.py`): Full round-based federated pipeline with `MockViTMAE` for dependency-free testing.
 - **Documentation**: Comprehensive `README.md`, architecture diagrams, and `Complete-Pipeline-Guide.md`.
+

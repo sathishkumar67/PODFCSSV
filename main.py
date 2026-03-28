@@ -1,17 +1,24 @@
-"""Run the federated continual-learning experiment used as the main pipeline.
+"""Run the entire current experiment pipeline from one file.
 
-The current entrypoint is the 2-client, 6-dataset sequential benchmark:
-1. Build one pretrained ViT-MAE backbone with injected residual adapters.
-2. Place one client on each usable GPU when CUDA really works.
-3. Feed each client one dataset per stage across three sequential stages.
-4. Train locally with MAE reconstruction and GPAD.
-5. Merge trainable adapter weights and local prototypes on the server.
-6. Carry global and local memory forward into the next dataset stage.
-7. Save checkpoints, histories, communication statistics, and plots.
+This file is the single source of truth for the publishable setup. It contains
+both training modes and the built-in retention analysis:
+1. ``RUN_MODE = "federated"`` trains two clients with GPAD, prototype
+   exchange, and interleaved stress stages.
+2. ``RUN_MODE = "baseline"`` trains one sequential model with reconstruction
+   loss only while following the same benchmark-plus-stress dataset stream.
+3. After each stage, the current model is evaluated on all benchmark datasets
+   seen so far by frozen-feature linear probing.
+4. Checkpoints, JSON histories, communication metrics, forgetting metrics, and
+   plots are all written from this same script.
 
-Every training split is fitted to the same effective sample budget so both
-clients spend roughly the same number of steps on each stage, and the image
-pipeline intentionally avoids ImageNet-style normalization.
+The default benchmark uses six auto-download-friendly datasets with held-out
+evaluation splits:
+- EuroSAT
+- GTSRB
+- Food101
+- Country211
+- Oxford-IIIT Pet
+- FGVC Aircraft
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import gc
 import hashlib
 import json
 import logging
+import os
 import random
 import time
 from pathlib import Path
@@ -46,8 +54,11 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("PODFCSSV_Main")
+baseline_logger = logging.getLogger("PODFCSSV_Baseline")
 
-MODEL_NAME = "facebook/vit-mae-huge"
+RUN_MODE = "federated"
+
+MODEL_NAME = "facebook/vit-mae-base"
 
 MODEL_VARIANTS: Dict[str, Dict[str, Any]] = {
     "facebook/vit-mae-base": {
@@ -69,7 +80,12 @@ MODEL_VARIANTS: Dict[str, Dict[str, Any]] = {
 
 
 def get_model_variant_config(model_name: str) -> Dict[str, Any]:
-    """Return the model-specific defaults used by every training entrypoint."""
+    """Return the preset values tied to one pretrained MAE variant.
+
+    The preset controls the hidden size and the default batch sizes used by the
+    federated and baseline modes so a single model-name change updates the
+    rest of the runtime configuration consistently.
+    """
     if model_name not in MODEL_VARIANTS:
         available_models = ", ".join(sorted(MODEL_VARIANTS))
         raise ValueError(
@@ -139,12 +155,36 @@ MULTI_DATASET_CONFIG: Dict[str, Any] = {
     "save_dir": "multidataset_outputs_2client",
 }
 
+BASELINE_CONFIG: Dict[str, Any] = {
+    **MULTI_DATASET_CONFIG,
+    "num_clients": 1,
+    "save_dir": "baseline_outputs",
+    "batch_size": MODEL_CONFIG["baseline_batch_size"],
+    "num_workers": 4,
+    "train_samples_per_dataset": MULTI_DATASET_CONFIG["train_samples_per_dataset"],
+    "pin_memory": True,
+    "dataloader_persistent_workers": True,
+    "dataloader_prefetch_factor": 4,
+    "cudnn_benchmark": True,
+}
+
 EUROSAT_TRAIN_SPLIT_SAMPLES = 10000
 EUROSAT_EVAL_SPLIT_SAMPLES = 5000
 
-CLIENT_DATASET_SEQUENCE: Dict[int, List[str]] = {
-    0: ["eurosat", "oxfordiiitpet", "flowers102"],
-    1: ["gtsrb", "fgvcaircraft", "dtd"],
+BENCHMARK_CLIENT_DATASET_SEQUENCE: Dict[int, List[str]] = {
+    0: ["eurosat", "food101", "oxfordiiitpet"],
+    1: ["gtsrb", "country211", "fgvcaircraft"],
+}
+
+FEDERATED_RETENTION_NOISE_SEQUENCE: Dict[int, List[str]] = {
+    0: ["cifar10", "stl10", "flowers102"],
+    1: ["svhn", "cifar100", "dtd"],
+}
+
+MANUAL_SETUP_DATASETS = {
+    "fer2013",
+    "pcam",
+    "stanfordcars",
 }
 
 DATASET_DISPLAY_NAMES: Dict[str, str] = {
@@ -231,7 +271,12 @@ def get_usable_cuda_device_count() -> int:
 
 
 def resolve_runtime_config(config: Dict[str, Any]) -> None:
-    """Populate device information after checking whether CUDA kernels actually run."""
+    """Populate runtime device fields only after a real CUDA smoke test.
+
+    The training code does not trust ``torch.cuda.is_available()`` alone. It
+    first checks whether a tiny kernel can run, then records the usable GPU
+    count and chooses either CUDA or CPU for the rest of the run.
+    """
     usable_gpu_count = get_usable_cuda_device_count()
     if usable_gpu_count > 0:
         config["gpu_count"] = usable_gpu_count
@@ -242,14 +287,18 @@ def resolve_runtime_config(config: Dict[str, Any]) -> None:
 
 
 def convert_to_rgb(image: Any) -> Any:
-    """Convert input images to RGB before any resize or tensor conversion."""
+    """Convert images to RGB before resizing and tensor conversion."""
     if hasattr(image, "convert"):
         return image.convert("RGB")
     return image
 
 
 def serialize_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert config values into a JSON-safe representation for checkpoints."""
+    """Convert runtime config values into a checkpoint-safe dictionary.
+
+    Torch dtypes are converted to strings so the same config block can be
+    stored inside both JSON histories and PyTorch checkpoints.
+    """
     serialized: Dict[str, Any] = {}
     for key, value in config.items():
         serialized[key] = str(value) if isinstance(value, torch.dtype) else value
@@ -257,19 +306,23 @@ def serialize_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def tensor_num_bytes(tensor: Optional[torch.Tensor]) -> int:
-    """Return how many bytes one tensor would occupy on the wire."""
+    """Estimate the communication size of one tensor in bytes."""
     if tensor is None:
         return 0
     return int(tensor.numel() * tensor.element_size())
 
 
 def state_dict_num_bytes(state_dict: Dict[str, torch.Tensor]) -> int:
-    """Return the total communication cost of one state-dict payload."""
+    """Estimate the total communication size of a state-dict payload."""
     return sum(tensor_num_bytes(tensor) for tensor in state_dict.values())
 
 
 def extract_trainable_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
-    """Return a CPU copy of only the trainable parameters in the model."""
+    """Return a CPU copy of only the trainable model parameters.
+
+    In this project those parameters correspond to the injected adapters, so
+    the helper defines the exact weight payload exchanged or checkpointed.
+    """
     trainable_state: Dict[str, torch.Tensor] = {}
     for name, parameter in model.named_parameters():
         if parameter.requires_grad:
@@ -278,7 +331,13 @@ def extract_trainable_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
 
 
 def prepare_output_dirs(save_dir: str) -> Dict[str, Path]:
-    """Create the checkpoint, metric, and plot directories for one run."""
+    """Create the standard output directory structure for one run.
+
+    Every run writes into three stable locations:
+    1. ``checkpoints`` for model snapshots.
+    2. ``metrics`` for JSON histories.
+    3. ``plots`` for publication-oriented visualizations.
+    """
     root = Path(save_dir)
     checkpoints_dir = root / "checkpoints"
     metrics_dir = root / "metrics"
@@ -295,7 +354,14 @@ def prepare_output_dirs(save_dir: str) -> Dict[str, Path]:
 
 
 def build_base_model(config: Dict[str, Any]) -> nn.Module:
-    """Load pretrained ViT-MAE and inject adapters into the shared trainable layers."""
+    """Build the shared adapter-injected MAE backbone used by all modes.
+
+    The construction path is:
+    1. Load the selected pretrained ViT-MAE checkpoint.
+    2. Inject adapters into the upper half of the encoder.
+    3. Move the model to the configured device and dtype.
+    4. Log the full and trainable parameter counts.
+    """
     model = ViTMAEForPreTraining.from_pretrained(config["pretrained_model_name"])
     model = inject_adapters(model, bottleneck_dim=config["adapter_bottleneck_dim"])
     model = model.to(device=config["device"], dtype=config["dtype"])
@@ -324,7 +390,7 @@ def build_gpad_loss(config: Dict[str, Any]) -> GPADLoss:
 
 
 def average_client_metric(client_results: List[Dict[str, float]], key: str) -> float:
-    """Return the average of one logged client metric across the current round."""
+    """Average one logged client metric across the current round."""
     if not client_results:
         return 0.0
     return float(sum(result.get(key, 0.0) for result in client_results) / len(client_results))
@@ -352,7 +418,12 @@ def save_checkpoint(
     is_final: bool = False,
     include_training_history: bool = True,
 ) -> Path:
-    """Save one checkpoint with the trainable weights and optional run metadata."""
+    """Save one checkpoint with trainable weights and optional run metadata.
+
+    The checkpoint format is shared across the unified pipeline so later
+    analysis can always recover the selected model preset, the trainable state,
+    and the optional prototype bank from the same schema.
+    """
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "round": round_idx,
@@ -374,7 +445,14 @@ def plot_training_history(
     plots_dir: Path,
     prefix: str = "main",
 ) -> Path:
-    """Create the federated training summary figure used by the main run."""
+    """Create the federated training summary figure.
+
+    The figure summarizes four aspects of one run:
+    1. Losses.
+    2. Global prototype-bank growth.
+    3. Routing fractions.
+    4. Communication cost per round.
+    """
     plots_dir.mkdir(parents=True, exist_ok=True)
     rounds = history.get("round_ids", [])
     figure_path = plots_dir / f"{prefix}_training_summary.png"
@@ -426,7 +504,7 @@ def print_round_summary(
     upload_bytes: int,
     download_bytes: int,
 ) -> None:
-    """Print the key round metrics shown after each communication round."""
+    """Log the compact round summary shown after each communication round."""
     average_loss = average_client_metric(client_results, "loss")
     average_anchor_fraction = average_client_metric(client_results, "anchored_fraction")
     average_novel_fraction = average_client_metric(client_results, "novel_fraction")
@@ -446,7 +524,11 @@ def print_round_summary(
 
 
 def initialize_history() -> Dict[str, Any]:
-    """Create the round-history structure used by the federated trainer."""
+    """Create the federated history structure used across training and plotting.
+
+    The history keeps round-wise optimization metrics together with the later
+    stage-wise evaluation summaries so JSON files and plots stay synchronized.
+    """
     return {
         "round_ids": [],
         "round_times": [],
@@ -462,26 +544,52 @@ def initialize_history() -> Dict[str, Any]:
         "download_bytes": [],
         "total_communication_bytes": [],
         "task_classes": [],
+        "stage_kinds": [],
+        "used_for_linear_probe": [],
+        "stage_evaluations": [],
         "client_results": [],
     }
 
 
-def validate_dataset_schedule(config: Dict[str, Any]) -> None:
-    """Check that the hardcoded client schedule matches the requested run shape."""
-    if len(CLIENT_DATASET_SEQUENCE) != config["num_clients"]:
+def normalize_client_dataset_sequence(
+    dataset_sequence: Dict[Any, Sequence[str]],
+) -> Dict[int, List[str]]:
+    """Convert client keys to integers and dataset sequences to plain lists."""
+    return {
+        int(client_index): list(dataset_names)
+        for client_index, dataset_names in dataset_sequence.items()
+    }
+
+
+def validate_client_dataset_sequence(
+    dataset_sequence: Dict[Any, Sequence[str]],
+    expected_num_clients: int,
+    sequence_name: str,
+) -> Dict[int, List[str]]:
+    """Validate one client-to-datasets mapping before it is used.
+
+    The validation checks that:
+    1. The mapping matches the configured client count.
+    2. Every client has the same number of stages.
+    3. No dataset name is duplicated across clients.
+    4. Every dataset has a display-name entry.
+    5. The default publishable schedule avoids manual-setup datasets.
+    """
+    normalized_sequence = normalize_client_dataset_sequence(dataset_sequence)
+    if len(normalized_sequence) != expected_num_clients:
         raise ValueError(
-            "The client schedule does not match the configured client count. "
-            f"Expected {config['num_clients']} clients but found {len(CLIENT_DATASET_SEQUENCE)}."
+            f"{sequence_name} does not match the configured client count. "
+            f"Expected {expected_num_clients} clients but found {len(normalized_sequence)}."
         )
 
-    stage_counts = {len(dataset_names) for dataset_names in CLIENT_DATASET_SEQUENCE.values()}
+    stage_counts = {len(dataset_names) for dataset_names in normalized_sequence.values()}
     if len(stage_counts) != 1:
-        raise ValueError("Every client must receive the same number of sequential datasets.")
+        raise ValueError(f"Every client must receive the same number of datasets in {sequence_name}.")
 
     all_dataset_names = [
         dataset_name
-        for client_index in sorted(CLIENT_DATASET_SEQUENCE)
-        for dataset_name in CLIENT_DATASET_SEQUENCE[client_index]
+        for client_index in sorted(normalized_sequence)
+        for dataset_name in normalized_sequence[client_index]
     ]
     duplicate_names = sorted(
         dataset_name
@@ -489,7 +597,7 @@ def validate_dataset_schedule(config: Dict[str, Any]) -> None:
         if all_dataset_names.count(dataset_name) > 1
     )
     if duplicate_names:
-        raise ValueError(f"Duplicate dataset entries found: {duplicate_names}")
+        raise ValueError(f"Duplicate dataset entries found in {sequence_name}: {duplicate_names}")
 
     missing_display_names = sorted(
         dataset_name
@@ -498,32 +606,27 @@ def validate_dataset_schedule(config: Dict[str, Any]) -> None:
     )
     if missing_display_names:
         raise ValueError(
-            f"Missing display-name entries for datasets: {missing_display_names}"
+            f"Missing display-name entries for datasets in {sequence_name}: {missing_display_names}"
         )
 
-
-def get_num_stages() -> int:
-    """Return how many sequential stages exist in the current client schedule."""
-    return len(next(iter(CLIENT_DATASET_SEQUENCE.values())))
-
-
-def get_stage_dataset_names(stage_index: int) -> List[str]:
-    """Return the dataset names assigned to one stage in client order."""
-    return [
-        CLIENT_DATASET_SEQUENCE[client_index][stage_index]
-        for client_index in sorted(CLIENT_DATASET_SEQUENCE)
-    ]
+    manual_setup_datasets = sorted(
+        dataset_name
+        for dataset_name in all_dataset_names
+        if dataset_name in MANUAL_SETUP_DATASETS
+    )
+    if manual_setup_datasets:
+        raise ValueError(
+            f"{sequence_name} includes datasets with manual-download caveats: {manual_setup_datasets}"
+        )
+    return normalized_sequence
 
 
 def build_dataset_order_by_stage(
     dataset_sequence: Optional[Dict[Any, Sequence[str]]] = None,
 ) -> List[str]:
-    """Flatten the client schedule into the stage-by-stage order used for logs and eval."""
-    sequence = dataset_sequence or CLIENT_DATASET_SEQUENCE
-    normalized_sequence = {
-        int(client_index): list(dataset_names)
-        for client_index, dataset_names in sequence.items()
-    }
+    """Flatten one client schedule into the stage order used by evaluation."""
+    sequence = dataset_sequence or BENCHMARK_CLIENT_DATASET_SEQUENCE
+    normalized_sequence = normalize_client_dataset_sequence(sequence)
     stage_count = len(next(iter(normalized_sequence.values())))
 
     dataset_order: List[str] = []
@@ -531,6 +634,94 @@ def build_dataset_order_by_stage(
         for client_index in sorted(normalized_sequence):
             dataset_order.append(normalized_sequence[client_index][stage_index])
     return dataset_order
+
+
+def build_federated_stage_plan(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build the federated stage plan with benchmark and stress stages interleaved.
+
+    The resulting plan alternates between:
+    1. Benchmark stages that count toward the reported evaluation set.
+    2. Stress stages that exist only to create extra forgetting pressure.
+    3. An optional final stress stage after the last benchmark stage when the
+       noise schedule is as long as the benchmark schedule.
+    """
+    benchmark_sequence = validate_client_dataset_sequence(
+        BENCHMARK_CLIENT_DATASET_SEQUENCE,
+        expected_num_clients=config["num_clients"],
+        sequence_name="BENCHMARK_CLIENT_DATASET_SEQUENCE",
+    )
+    noise_sequence = validate_client_dataset_sequence(
+        FEDERATED_RETENTION_NOISE_SEQUENCE,
+        expected_num_clients=config["num_clients"],
+        sequence_name="FEDERATED_RETENTION_NOISE_SEQUENCE",
+    )
+
+    benchmark_stage_count = len(next(iter(benchmark_sequence.values())))
+    noise_stage_count = len(next(iter(noise_sequence.values())))
+    allowed_noise_stage_counts = {max(benchmark_stage_count - 1, 0), benchmark_stage_count}
+    if noise_stage_count not in allowed_noise_stage_counts:
+        raise ValueError(
+            "The retention-noise schedule must have either exactly one fewer "
+            "stage than the benchmark schedule or the same number of stages."
+        )
+
+    stage_plan: List[Dict[str, Any]] = []
+    for stage_index in range(benchmark_stage_count):
+        benchmark_datasets = {
+            client_index: benchmark_sequence[client_index][stage_index]
+            for client_index in sorted(benchmark_sequence)
+        }
+        stage_plan.append(
+            {
+                "stage_kind": "benchmark",
+                "use_for_linear_probe": True,
+                "datasets": benchmark_datasets,
+            }
+        )
+        if stage_index < noise_stage_count:
+            noise_datasets = {
+                client_index: noise_sequence[client_index][stage_index]
+                for client_index in sorted(noise_sequence)
+            }
+            stage_plan.append(
+                {
+                    "stage_kind": "retention_noise",
+                    "use_for_linear_probe": False,
+                    "datasets": noise_datasets,
+                }
+            )
+    return stage_plan
+
+
+def build_baseline_stage_plan() -> List[Dict[str, Any]]:
+    """Flatten the benchmark and stress schedule into one sequential baseline order.
+
+    The baseline sees the same dataset stream as the federated run, but because
+    it owns only one model, each client-stage dataset becomes its own sequential
+    training stage:
+    1. Reuse the validated federated stage plan.
+    2. Keep benchmark and stress ordering identical to the federated stream.
+    3. Flatten each multi-client stage into a one-model sequential list.
+    4. Preserve the ``use_for_linear_probe`` flag so only benchmark datasets
+       contribute to the reported evaluation set.
+    """
+    federated_stage_plan = build_federated_stage_plan(dict(MULTI_DATASET_CONFIG))
+    baseline_stage_plan: List[Dict[str, Any]] = []
+
+    for stage_spec in federated_stage_plan:
+        # The baseline sees the same dataset stream as the federated run, but
+        # one shared model forces that stream to be replayed sequentially.
+        for client_index in sorted(stage_spec["datasets"]):
+            baseline_stage_plan.append(
+                {
+                    "stage_kind": stage_spec["stage_kind"],
+                    "use_for_linear_probe": stage_spec["use_for_linear_probe"],
+                    "dataset_name": stage_spec["datasets"][client_index],
+                    "source_client": client_index,
+                }
+            )
+
+    return baseline_stage_plan
 
 
 def stable_int_from_parts(seed: int, *parts: str) -> int:
@@ -560,13 +751,14 @@ def fit_dataset_to_sample_budget(
     target_samples: Optional[int],
     min_samples: Optional[int],
 ) -> torch.utils.data.Dataset:
-    """Fit one split to the configured sample budget in a deterministic way.
+    """Fit one dataset split to the configured sample budget.
 
-    The sample-budget rule is:
+    The budget rule is enforced in a deterministic order:
     1. Fail early if the split is below the required minimum.
     2. Keep the full split when no target sample count is requested.
     3. Deterministically subsample when the split is larger than the target.
-    4. Deterministically repeat samples when the split is smaller than the target.
+    4. Deterministically repeat samples when the split is smaller than the
+       target.
     """
     dataset_size = len(dataset)
     split_name = "train" if train else "test"
@@ -621,7 +813,15 @@ def fit_dataset_to_sample_budget(
 
 
 def build_dataset_transform(image_size: int) -> transforms.Compose:
-    """Resize each image for ViT-MAE without applying dataset-specific normalization."""
+    """Build the shared image transform used by every dataset loader.
+
+    The transform deliberately stays simple:
+    1. Convert to RGB.
+    2. Resize to the ViT-MAE input size.
+    3. Convert to a tensor.
+
+    No ImageNet normalization is used in the current pipeline.
+    """
     return transforms.Compose(
         [
             transforms.Lambda(convert_to_rgb),
@@ -682,10 +882,11 @@ def load_named_dataset(
     max_samples: Optional[int] = None,
     min_samples: Optional[int] = None,
 ) -> torch.utils.data.Dataset:
-    """Load one named dataset and optionally fit it to a training or eval budget.
+    """Load one named dataset and optionally fit it to a budget.
 
-    This helper centralizes every dataset-specific split rule so the training
-    and evaluation entrypoints all go through the same loading logic.
+    This helper centralizes every dataset-specific rule so both training modes
+    and the built-in retention evaluation go through the same loader logic and
+    therefore use the same splits.
     """
     transform = build_dataset_transform(image_size)
     root = Path(data_root) / "multidataset" / dataset_name
@@ -896,7 +1097,11 @@ def load_named_evaluation_dataset(
     max_samples: Optional[int] = None,
     min_samples: Optional[int] = None,
 ) -> torch.utils.data.Dataset:
-    """Load the official held-out split or split-combination used for evaluation."""
+    """Load the held-out split used for built-in retention evaluation.
+
+    Most datasets expose a single official test split. A few require combining
+    multiple held-out splits, and this helper keeps those choices centralized.
+    """
     transform = build_dataset_transform(image_size)
     root = Path(data_root) / "multidataset" / dataset_name
 
@@ -970,7 +1175,7 @@ def create_standard_dataloader(
     pin_memory: bool,
     shuffle: bool,
 ) -> DataLoader:
-    """Create a dataloader with the shared project defaults."""
+    """Create a standard dataloader using the shared project defaults."""
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -982,7 +1187,11 @@ def create_standard_dataloader(
 
 
 def pool_model_hidden_states(hidden_states: torch.Tensor) -> torch.Tensor:
-    """Pool the last hidden state exactly the same way training code does."""
+    """Pool the last encoder hidden state the same way training code does.
+
+    The evaluation path intentionally mirrors the training path by dropping the
+    CLS token when present and averaging only the patch tokens.
+    """
     if hidden_states.size(1) > 1:
         hidden_states = hidden_states[:, 1:, :]
     return hidden_states.mean(dim=1)
@@ -997,11 +1206,11 @@ def collect_labeled_embeddings(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Extract normalized embeddings and labels from one labeled dataset split.
 
-    This is the frozen-feature stage used by linear probing:
-    1. Run the MAE encoder on full images.
+    This is the frozen-feature stage used during built-in retention analysis:
+    1. Run the current MAE encoder on full images.
     2. Pool the last hidden state into one embedding per image.
     3. L2-normalize the embedding.
-    4. Return features and labels on CPU.
+    4. Return features and labels on CPU for probing.
     """
     model.eval()
     feature_batches: List[torch.Tensor] = []
@@ -1047,7 +1256,14 @@ def run_linear_probe(
     test_labels: torch.Tensor,
     config: Dict[str, Any],
 ) -> float:
-    """Train one linear probe on frozen features and return held-out accuracy."""
+    """Train one linear probe on frozen features and return held-out accuracy.
+
+    The probe stage is:
+    1. Remap labels to a contiguous class index range.
+    2. Fit a single linear layer on the frozen training features.
+    3. Evaluate the learned probe on the held-out features.
+    4. Return accuracy for the current stage summary.
+    """
     if train_features.numel() == 0 or test_features.numel() == 0:
         return 0.0
 
@@ -1108,7 +1324,15 @@ def evaluate_datasets(
     dataset_names: Sequence[str],
     config: Dict[str, Any],
 ) -> Dict[str, float]:
-    """Evaluate frozen representations on one or more datasets with linear probing."""
+    """Evaluate frozen representations on one or more benchmark datasets.
+
+    For each dataset this helper:
+    1. Loads the train split used to fit the probe.
+    2. Loads the held-out split used for reporting.
+    3. Extracts frozen encoder features.
+    4. Fits a linear probe.
+    5. Stores the held-out accuracy.
+    """
     results: Dict[str, float] = {}
     for dataset_name in dataset_names:
         train_dataset = load_named_dataset(
@@ -1173,15 +1397,544 @@ def evaluate_seen_datasets(
     seen_dataset_names: List[str],
     config: Dict[str, Any],
 ) -> Dict[str, float]:
-    """Backward-compatible alias used by the standalone evaluation script."""
+    """Evaluate the benchmark datasets that have been seen so far."""
     return evaluate_datasets(model=model, dataset_names=seen_dataset_names, config=config)
 
 
-def main() -> None:
-    """Run the full 2-client sequential federated continual-learning benchmark."""
-    config = dict(MULTI_DATASET_CONFIG)
+def summarize_stage_evaluation(
+    history: Dict[str, Any],
+    stage_number: int,
+    stage_kind: str,
+    evaluated_dataset_names: Sequence[str],
+    accuracies: Dict[str, float],
+) -> Dict[str, Any]:
+    """Turn one stage's accuracies into retention-oriented metrics.
+
+    Each stage summary records:
+    1. Accuracy on every benchmark dataset seen so far.
+    2. Forgetting relative to the best historical accuracy.
+    3. Retention ratio relative to that same best score.
+    4. Backward transfer relative to the first score observed for each dataset.
+    5. Stage-level averages used for plots and tables.
+    """
+    previous_stage_evaluations = history.get("stage_evaluations", [])
+    forgetting: Dict[str, float] = {}
+    retention_ratio: Dict[str, float] = {}
+    backward_transfer: Dict[str, float] = {}
+
+    for dataset_name in evaluated_dataset_names:
+        current_accuracy = float(accuracies.get(dataset_name, 0.0))
+        previous_accuracies = [
+            float(stage_evaluation["accuracies"][dataset_name])
+            for stage_evaluation in previous_stage_evaluations
+            if dataset_name in stage_evaluation["accuracies"]
+        ]
+        best_accuracy = max(previous_accuracies + [current_accuracy]) if previous_accuracies else current_accuracy
+        first_accuracy = previous_accuracies[0] if previous_accuracies else current_accuracy
+
+        forgetting[dataset_name] = float(best_accuracy - current_accuracy)
+        retention_ratio[dataset_name] = float(current_accuracy / max(best_accuracy, 1e-8))
+        backward_transfer[dataset_name] = float(current_accuracy - first_accuracy)
+
+    average_accuracy = float(
+        sum(float(accuracies.get(dataset_name, 0.0)) for dataset_name in evaluated_dataset_names)
+        / max(len(evaluated_dataset_names), 1)
+    )
+    average_forgetting = float(
+        sum(forgetting.values()) / max(len(forgetting), 1)
+    )
+    average_retention = float(
+        sum(retention_ratio.values()) / max(len(retention_ratio), 1)
+    )
+    average_backward_transfer = float(
+        sum(backward_transfer.values()) / max(len(backward_transfer), 1)
+    )
+
+    stage_summary = {
+        "stage": stage_number,
+        "stage_kind": stage_kind,
+        "evaluated_datasets": list(evaluated_dataset_names),
+        "accuracies": {dataset_name: float(accuracies[dataset_name]) for dataset_name in evaluated_dataset_names},
+        "average_accuracy": average_accuracy,
+        "forgetting": forgetting,
+        "average_forgetting": average_forgetting,
+        "retention_ratio": retention_ratio,
+        "average_retention": average_retention,
+        "backward_transfer": backward_transfer,
+        "average_backward_transfer": average_backward_transfer,
+    }
+    history.setdefault("stage_evaluations", []).append(stage_summary)
+    return stage_summary
+
+
+def plot_stage_evaluation_heatmap(
+    history: Dict[str, Any],
+    dataset_order: Sequence[str],
+    plots_dir: Path,
+    prefix: str,
+) -> Path:
+    """Plot stage-by-dataset benchmark accuracy so forgetting is easy to inspect."""
+    output_path = plots_dir / f"{prefix}_stage_accuracy_heatmap.png"
+    stage_evaluations = history.get("stage_evaluations", [])
+    if not stage_evaluations or not dataset_order:
+        return output_path
+
+    accuracy_matrix = np.full((len(stage_evaluations), len(dataset_order)), np.nan, dtype=float)
+    stage_labels: List[str] = []
+    for row_index, stage_evaluation in enumerate(stage_evaluations):
+        stage_labels.append(
+            f"S{stage_evaluation['stage']} ({stage_evaluation['stage_kind']})"
+        )
+        for column_index, dataset_name in enumerate(dataset_order):
+            if dataset_name in stage_evaluation["accuracies"]:
+                accuracy_matrix[row_index, column_index] = stage_evaluation["accuracies"][dataset_name]
+
+    figure, axis = plt.subplots(figsize=(max(9, len(dataset_order) * 1.5), max(4, len(stage_evaluations) * 0.9)))
+    masked_matrix = np.ma.masked_invalid(accuracy_matrix)
+    image = axis.imshow(masked_matrix, aspect="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+    axis.set_xticks(range(len(dataset_order)))
+    axis.set_xticklabels([DATASET_DISPLAY_NAMES[name] for name in dataset_order], rotation=45, ha="right")
+    axis.set_yticks(range(len(stage_labels)))
+    axis.set_yticklabels(stage_labels)
+    axis.set_title("Stage-Wise Benchmark Accuracy")
+    figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(figure)
+    return output_path
+
+
+def plot_stage_metric_curves(
+    history: Dict[str, Any],
+    plots_dir: Path,
+    prefix: str,
+) -> Path:
+    """Plot the stage-wise averages that summarize retention quality."""
+    output_path = plots_dir / f"{prefix}_stage_metric_curves.png"
+    stage_evaluations = history.get("stage_evaluations", [])
+    if not stage_evaluations:
+        return output_path
+
+    stage_indices = [stage_evaluation["stage"] for stage_evaluation in stage_evaluations]
+    average_accuracy = [stage_evaluation["average_accuracy"] for stage_evaluation in stage_evaluations]
+    average_forgetting = [stage_evaluation["average_forgetting"] for stage_evaluation in stage_evaluations]
+    average_retention = [stage_evaluation["average_retention"] for stage_evaluation in stage_evaluations]
+    average_backward_transfer = [stage_evaluation["average_backward_transfer"] for stage_evaluation in stage_evaluations]
+
+    figure, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes[0, 0].plot(stage_indices, average_accuracy, marker="o")
+    axes[0, 0].set_title("Average Benchmark Accuracy")
+    axes[0, 0].set_xlabel("Stage")
+    axes[0, 0].set_ylabel("Accuracy")
+    axes[0, 0].set_ylim(0.0, 1.0)
+
+    axes[0, 1].plot(stage_indices, average_forgetting, marker="o")
+    axes[0, 1].set_title("Average Forgetting")
+    axes[0, 1].set_xlabel("Stage")
+    axes[0, 1].set_ylabel("Forgetting")
+
+    axes[1, 0].plot(stage_indices, average_retention, marker="o")
+    axes[1, 0].set_title("Average Retention Ratio")
+    axes[1, 0].set_xlabel("Stage")
+    axes[1, 0].set_ylabel("Retention")
+    axes[1, 0].set_ylim(0.0, 1.05)
+
+    axes[1, 1].plot(stage_indices, average_backward_transfer, marker="o")
+    axes[1, 1].set_title("Average Backward Transfer")
+    axes[1, 1].set_xlabel("Stage")
+    axes[1, 1].set_ylabel("BWT")
+
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(figure)
+    return output_path
+
+
+def plot_final_forgetting_bars(
+    history: Dict[str, Any],
+    dataset_order: Sequence[str],
+    plots_dir: Path,
+    prefix: str,
+) -> Path:
+    """Plot the final forgetting value for each benchmark dataset."""
+    output_path = plots_dir / f"{prefix}_final_forgetting.png"
+    stage_evaluations = history.get("stage_evaluations", [])
+    if not stage_evaluations:
+        return output_path
+
+    final_stage = stage_evaluations[-1]
+    forgetting_values = [
+        float(final_stage["forgetting"].get(dataset_name, 0.0))
+        for dataset_name in dataset_order
+        if dataset_name in final_stage["accuracies"]
+    ]
+    plotted_dataset_names = [
+        dataset_name
+        for dataset_name in dataset_order
+        if dataset_name in final_stage["accuracies"]
+    ]
+    if not plotted_dataset_names:
+        return output_path
+
+    figure, axis = plt.subplots(figsize=(max(8, len(plotted_dataset_names) * 1.3), 5))
+    x_positions = np.arange(len(plotted_dataset_names))
+    axis.bar(x_positions, forgetting_values, color="tab:orange")
+    axis.set_xticks(x_positions)
+    axis.set_xticklabels([DATASET_DISPLAY_NAMES[name] for name in plotted_dataset_names], rotation=45, ha="right")
+    axis.set_title("Final Forgetting by Dataset")
+    axis.set_ylabel("Forgetting")
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(figure)
+    return output_path
+
+
+def initialize_baseline_history() -> Dict[str, Any]:
+    """Create the history dictionary written by the baseline mode.
+
+    The baseline records only reconstruction-oriented training metrics plus the
+    same stage-wise evaluation summaries used for forgetting comparisons while
+    it trains through both benchmark and stress datasets.
+    """
+    return {
+        "round_ids": [],
+        "dataset_names": [],
+        "dataset_rounds": [],
+        "round_times": [],
+        "avg_total_loss": [],
+        "avg_mae_loss": [],
+        "stage_summaries": [],
+        "stage_evaluations": [],
+    }
+
+
+def train_reconstruction_round(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: optim.Optimizer,
+    local_epochs: int,
+    device: str,
+    dtype: torch.dtype,
+) -> Dict[str, float]:
+    """Train one baseline model for one round using reconstruction loss only.
+
+    The baseline path is intentionally simple:
+    1. Iterate over the dataloader for the configured local-epoch count.
+    2. Run MAE reconstruction.
+    3. Optimize only the trainable adapter parameters.
+    4. Return the aggregated loss and throughput counters for logging.
+    """
+    model.train()
+    total_loss = 0.0
+    total_batches = 0
+    total_samples = 0
+
+    for _ in range(local_epochs):
+        for batch in dataloader:
+            inputs = batch[0] if isinstance(batch, (list, tuple)) else batch
+            inputs = inputs.to(device=device, dtype=dtype)
+            outputs = model(inputs)
+            loss = getattr(outputs, "loss", None)
+            if loss is None:
+                raise RuntimeError("The MAE model did not return a reconstruction loss.")
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += float(loss.detach().item())
+            total_batches += 1
+            total_samples += int(inputs.size(0))
+
+    average_loss = total_loss / max(total_batches, 1)
+    return {
+        "loss": average_loss,
+        "mae_loss": average_loss,
+        "num_batches": total_batches,
+        "num_samples": total_samples,
+    }
+
+
+def create_baseline_dataloader(
+    dataset: torch.utils.data.Dataset,
+    config: Dict[str, Any],
+) -> DataLoader:
+    """Create the baseline dataloader with the throughput-oriented defaults."""
+    loader_kwargs: Dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": config["batch_size"],
+        "shuffle": config["dataloader_shuffle"],
+        "num_workers": config["num_workers"],
+        "pin_memory": config["pin_memory"],
+        "drop_last": False,
+    }
+    if config["num_workers"] > 0:
+        loader_kwargs["persistent_workers"] = config["dataloader_persistent_workers"]
+        loader_kwargs["prefetch_factor"] = config["dataloader_prefetch_factor"]
+    return DataLoader(**loader_kwargs)
+
+
+def plot_baseline_training_history(history: Dict[str, Any], plots_dir: Path) -> Path:
+    """Plot the baseline reconstruction-loss and round-time curves."""
+    figure_path = plots_dir / "baseline_training_summary.png"
+    rounds = history.get("round_ids", [])
+    if not rounds:
+        return figure_path
+
+    figure, axes = plt.subplots(1, 2, figsize=(12, 5))
+    axes[0].plot(rounds, history["avg_total_loss"], marker="o")
+    axes[0].set_title("Reconstruction Loss")
+    axes[0].set_xlabel("Round")
+    axes[0].set_ylabel("Loss")
+
+    axes[1].plot(rounds, history["round_times"], marker="o")
+    axes[1].set_title("Round Time")
+    axes[1].set_xlabel("Round")
+    axes[1].set_ylabel("Seconds")
+
+    figure.tight_layout()
+    figure.savefig(figure_path, dpi=200, bbox_inches="tight")
+    plt.close(figure)
+    return figure_path
+
+
+def run_baseline_experiment() -> None:
+    """Run the single-model continual baseline from the unified entrypoint.
+
+    The baseline mode follows this fixed order:
+    1. Build the shared adapter-injected MAE model.
+    2. Walk through the benchmark and retention-stress datasets sequentially.
+    3. Train with MAE reconstruction only.
+    4. Evaluate only on benchmark datasets seen so far after each stage.
+    5. Save checkpoints, JSON histories, and retention plots.
+    """
+    config = dict(BASELINE_CONFIG)
+    config["run_mode"] = "baseline"
     resolve_runtime_config(config)
-    validate_dataset_schedule(config)
+
+    max_worker_count = max(1, (os.cpu_count() or 1) - 1)
+    config["num_workers"] = min(config["num_workers"], max_worker_count)
+    config["pin_memory"] = bool(config["pin_memory"] and config["device"] == "cuda")
+    if config["device"] == "cuda" and config["cudnn_benchmark"]:
+        torch.backends.cudnn.benchmark = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+    benchmark_sequence = validate_client_dataset_sequence(
+        BENCHMARK_CLIENT_DATASET_SEQUENCE,
+        expected_num_clients=MULTI_DATASET_CONFIG["num_clients"],
+        sequence_name="BENCHMARK_CLIENT_DATASET_SEQUENCE",
+    )
+    noise_sequence = validate_client_dataset_sequence(
+        FEDERATED_RETENTION_NOISE_SEQUENCE,
+        expected_num_clients=MULTI_DATASET_CONFIG["num_clients"],
+        sequence_name="FEDERATED_RETENTION_NOISE_SEQUENCE",
+    )
+    baseline_stage_plan = build_baseline_stage_plan()
+    benchmark_dataset_order = build_dataset_order_by_stage(benchmark_sequence)
+    config["benchmark_client_dataset_sequence"] = {
+        str(client_index): list(dataset_names)
+        for client_index, dataset_names in benchmark_sequence.items()
+    }
+    config["retention_noise_client_sequence"] = {
+        str(client_index): list(dataset_names)
+        for client_index, dataset_names in noise_sequence.items()
+    }
+    config["client_dataset_sequence"] = {
+        "0": [stage_spec["dataset_name"] for stage_spec in baseline_stage_plan]
+    }
+    config["dataset_order_by_stage"] = [
+        stage_spec["dataset_name"] for stage_spec in baseline_stage_plan
+    ]
+    config["training_stage_plan"] = baseline_stage_plan
+    config["linear_probe_dataset_order"] = list(benchmark_dataset_order)
+    config["num_stages"] = len(baseline_stage_plan)
+    config["total_sequential_rounds"] = config["num_stages"] * config["rounds_per_dataset"]
+
+    set_random_seed(config["seed"])
+    output_dirs = prepare_output_dirs(config["save_dir"])
+
+    model = build_base_model(config)
+    optimizer = optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=config["client_lr"],
+        weight_decay=config["client_weight_decay"],
+    )
+    history = initialize_baseline_history()
+    global_round_idx = 0
+    seen_benchmark_dataset_names: List[str] = []
+
+    baseline_logger.info(
+        "Starting unified baseline | stages=%s | benchmark_datasets=%s | rounds_per_dataset=%s | batch_size=%s | train_budget=%s | device=%s | output=%s",
+        len(config["dataset_order_by_stage"]),
+        len(config["linear_probe_dataset_order"]),
+        config["rounds_per_dataset"],
+        config["batch_size"],
+        config["train_samples_per_dataset"],
+        config["device"],
+        output_dirs["root"],
+    )
+
+    for stage_index, stage_spec in enumerate(baseline_stage_plan, start=1):
+        dataset_name = stage_spec["dataset_name"]
+        stage_kind = stage_spec["stage_kind"]
+        baseline_logger.info(
+            "Starting baseline stage %s/%s | kind=%s | dataset=%s",
+            stage_index,
+            config["num_stages"],
+            stage_kind,
+            DATASET_DISPLAY_NAMES[dataset_name],
+        )
+        stage_losses: List[float] = []
+
+        dataset = load_named_dataset(
+            dataset_name=dataset_name,
+            data_root=config["data_root"],
+            image_size=config["image_size"],
+            train=True,
+            seed=config["seed"],
+            max_samples=config["train_samples_per_dataset"],
+            min_samples=config["min_train_samples_per_dataset"],
+        )
+        dataloader = create_baseline_dataloader(dataset=dataset, config=config)
+
+        for dataset_round in range(1, config["rounds_per_dataset"] + 1):
+            global_round_idx += 1
+            round_start = time.time()
+            round_result = train_reconstruction_round(
+                model=model,
+                dataloader=dataloader,
+                optimizer=optimizer,
+                local_epochs=config["local_epochs"],
+                device=config["device"],
+                dtype=config["dtype"],
+            )
+            round_time = time.time() - round_start
+            stage_losses.append(round_result["loss"])
+
+            history["round_ids"].append(global_round_idx)
+            history["dataset_names"].append(dataset_name)
+            history["dataset_rounds"].append(dataset_round)
+            history["round_times"].append(round_time)
+            history["avg_total_loss"].append(round_result["loss"])
+            history["avg_mae_loss"].append(round_result["mae_loss"])
+
+            baseline_logger.info(
+                "Baseline round %s/%s complete | kind=%s | dataset=%s | round=%s/%s | loss=%.4f | time=%.2fs",
+                global_round_idx,
+                config["total_sequential_rounds"],
+                stage_kind,
+                DATASET_DISPLAY_NAMES[dataset_name],
+                dataset_round,
+                config["rounds_per_dataset"],
+                round_result["loss"],
+                round_time,
+            )
+
+            save_checkpoint(
+                checkpoint_dir=output_dirs["checkpoints"],
+                round_idx=global_round_idx,
+                base_model=model,
+                config=config,
+                training_history=history,
+                is_final=False,
+                include_training_history=False,
+            )
+            save_history(history, output_dirs["metrics"], filename="baseline_training_history.json")
+            plot_baseline_training_history(history, output_dirs["plots"])
+
+        history["stage_summaries"].append(
+            {
+                "dataset_name": dataset_name,
+                "stage_kind": stage_kind,
+                "use_for_linear_probe": stage_spec["use_for_linear_probe"],
+                "train_sample_count": len(dataset),
+                "average_round_loss": float(sum(stage_losses) / max(len(stage_losses), 1)),
+                "last_round_loss": float(stage_losses[-1]),
+            }
+        )
+        # Only benchmark datasets contribute to the reported retention curves.
+        if stage_spec["use_for_linear_probe"] and dataset_name not in seen_benchmark_dataset_names:
+            seen_benchmark_dataset_names.append(dataset_name)
+
+        stage_accuracies = evaluate_seen_datasets(
+            model=model,
+            seen_dataset_names=seen_benchmark_dataset_names,
+            config=config,
+        )
+        stage_evaluation = summarize_stage_evaluation(
+            history=history,
+            stage_number=stage_index,
+            stage_kind=stage_kind,
+            evaluated_dataset_names=seen_benchmark_dataset_names,
+            accuracies=stage_accuracies,
+        )
+        baseline_logger.info(
+            "Baseline stage %s evaluation | kind=%s | datasets=%s | avg_acc=%.4f | avg_forgetting=%.4f | avg_retention=%.4f | avg_bwt=%.4f",
+            stage_index,
+            stage_kind,
+            ", ".join(DATASET_DISPLAY_NAMES[name] for name in seen_benchmark_dataset_names),
+            stage_evaluation["average_accuracy"],
+            stage_evaluation["average_forgetting"],
+            stage_evaluation["average_retention"],
+            stage_evaluation["average_backward_transfer"],
+        )
+
+        del dataloader
+        del dataset
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        save_history(history, output_dirs["metrics"], filename="baseline_training_history.json")
+        plot_baseline_training_history(history, output_dirs["plots"])
+        plot_stage_evaluation_heatmap(history, config["linear_probe_dataset_order"], output_dirs["plots"], "baseline")
+        plot_stage_metric_curves(history, output_dirs["plots"], "baseline")
+        plot_final_forgetting_bars(history, config["linear_probe_dataset_order"], output_dirs["plots"], "baseline")
+
+    save_checkpoint(
+        checkpoint_dir=output_dirs["checkpoints"],
+        round_idx=global_round_idx,
+        base_model=model,
+        config=config,
+        training_history=history,
+        is_final=True,
+        include_training_history=False,
+    )
+    save_history(history, output_dirs["metrics"], filename="baseline_training_history.json")
+    plot_baseline_training_history(history, output_dirs["plots"])
+    plot_stage_evaluation_heatmap(history, config["linear_probe_dataset_order"], output_dirs["plots"], "baseline")
+    plot_stage_metric_curves(history, output_dirs["plots"], "baseline")
+    plot_final_forgetting_bars(history, config["linear_probe_dataset_order"], output_dirs["plots"], "baseline")
+    baseline_logger.info(
+        "Baseline complete | rounds=%s | final_checkpoint=%s",
+        global_round_idx,
+        output_dirs["checkpoints"] / "final_model.pt",
+    )
+
+
+def run_federated_experiment() -> None:
+    """Run the full two-client federated continual-learning benchmark.
+
+    The federated mode follows this fixed order:
+    1. Build the shared adapter-injected MAE model and global prototype bank.
+    2. Alternate benchmark stages with retention-stress stages.
+    3. Train one dataset per client for the configured number of rounds.
+    4. Merge prototypes and aggregate adapter weights after each round.
+    5. Preserve and enrich both global memory and client-local prototype memory
+       across stage transitions.
+    6. Evaluate on all benchmark datasets seen so far after each stage.
+    7. Save checkpoints, communication metrics, retention summaries, and plots.
+    """
+    config = dict(MULTI_DATASET_CONFIG)
+    config["run_mode"] = "federated"
+    resolve_runtime_config(config)
+    benchmark_sequence = validate_client_dataset_sequence(
+        BENCHMARK_CLIENT_DATASET_SEQUENCE,
+        expected_num_clients=config["num_clients"],
+        sequence_name="BENCHMARK_CLIENT_DATASET_SEQUENCE",
+    )
+    stage_plan = build_federated_stage_plan(config)
 
     available_gpu_count = config["gpu_count"]
     if available_gpu_count > config["num_clients"]:
@@ -1198,22 +1951,45 @@ def main() -> None:
             f"Detected {config['gpu_count']} usable GPUs for {config['num_clients']} clients."
         )
 
+    config["benchmark_client_dataset_sequence"] = {
+        str(client_index): list(dataset_names)
+        for client_index, dataset_names in benchmark_sequence.items()
+    }
+    config["retention_noise_client_sequence"] = {
+        str(client_index): list(dataset_names)
+        for client_index, dataset_names in normalize_client_dataset_sequence(
+            FEDERATED_RETENTION_NOISE_SEQUENCE
+        ).items()
+    }
     config["client_dataset_sequence"] = {
         str(client_index): list(dataset_names)
-        for client_index, dataset_names in CLIENT_DATASET_SEQUENCE.items()
+        for client_index, dataset_names in benchmark_sequence.items()
     }
-    config["dataset_order_by_stage"] = build_dataset_order_by_stage()
-    config["num_stages"] = get_num_stages()
+    config["dataset_order_by_stage"] = build_dataset_order_by_stage(benchmark_sequence)
+    config["linear_probe_dataset_order"] = list(config["dataset_order_by_stage"])
+    config["training_stage_plan"] = [
+        {
+            "stage_kind": stage_spec["stage_kind"],
+            "use_for_linear_probe": stage_spec["use_for_linear_probe"],
+            "datasets": {
+                str(client_index): dataset_name
+                for client_index, dataset_name in stage_spec["datasets"].items()
+            },
+        }
+        for stage_spec in stage_plan
+    ]
+    config["num_stages"] = len(stage_plan)
+    config["num_benchmark_stages"] = len(next(iter(benchmark_sequence.values())))
     config["total_sequential_rounds"] = config["num_stages"] * config["rounds_per_dataset"]
 
     set_random_seed(config["seed"])
     output_dirs = prepare_output_dirs(config["save_dir"])
 
-    # Build the shared global objects once before the dataset stages begin.
     logger.info(
-        "Starting 2-client sequential run | clients=%s | stages=%s | rounds_per_stage=%s | total_rounds=%s | train_budget=%s | device=%s | output=%s",
+        "Starting unified federated run | clients=%s | total_stages=%s | benchmark_stages=%s | rounds_per_stage=%s | total_rounds=%s | train_budget=%s | device=%s | output=%s",
         config["num_clients"],
         config["num_stages"],
+        config["num_benchmark_stages"],
         config["rounds_per_dataset"],
         config["total_sequential_rounds"],
         config["train_samples_per_dataset"],
@@ -1254,17 +2030,27 @@ def main() -> None:
     current_global_weights = extract_trainable_state_dict(base_model)
     global_prototypes: Optional[torch.Tensor] = None
     global_round_idx = 0
+    seen_benchmark_dataset_names: List[str] = []
 
-    for stage_idx in range(config["num_stages"]):
+    for stage_idx, stage_spec in enumerate(stage_plan):
         stage_number = stage_idx + 1
-        stage_dataset_names = get_stage_dataset_names(stage_idx)
+        stage_kind = stage_spec["stage_kind"]
+        stage_dataset_names = [
+            stage_spec["datasets"][client_index]
+            for client_index in sorted(stage_spec["datasets"])
+        ]
         stage_label = ", ".join(
             f"client_{client_index}={DATASET_DISPLAY_NAMES[dataset_name]}"
             for client_index, dataset_name in enumerate(stage_dataset_names)
         )
-        logger.info("Starting stage %s/%s | %s", stage_number, config["num_stages"], stage_label)
+        logger.info(
+            "Starting stage %s/%s | kind=%s | %s",
+            stage_number,
+            config["num_stages"],
+            stage_kind,
+            stage_label,
+        )
 
-        # Load exactly one dataset per client for the current stage.
         stage_datasets: List[torch.utils.data.Dataset] = []
         for client_index, dataset_name in enumerate(stage_dataset_names):
             dataset = load_named_dataset(
@@ -1284,7 +2070,6 @@ def main() -> None:
                 len(dataset),
             )
 
-        # Build one dataloader per client after the stage datasets are ready.
         stage_dataloaders = [
             create_standard_dataloader(
                 dataset=dataset,
@@ -1296,7 +2081,6 @@ def main() -> None:
             for dataset in stage_datasets
         ]
 
-        # Run the configured number of communication rounds for this stage.
         for stage_round in range(1, config["rounds_per_dataset"] + 1):
             global_round_idx += 1
             logger.info(
@@ -1326,8 +2110,9 @@ def main() -> None:
             client_prototype_counts: List[int] = []
 
             for client_index, client in enumerate(client_manager.clients):
-                # Stage round 1 refreshes prototypes from the current dataset; later rounds reuse local memory.
                 if stage_round == 1:
+                    # The first round of each stage injects current-dataset
+                    # centroids into the client's existing local memory.
                     local_prototypes = client.generate_prototypes(
                         stage_dataloaders[client_index],
                         K_init=config["k_init_prototypes"],
@@ -1368,7 +2153,6 @@ def main() -> None:
             global_prototypes = aggregated_prototypes.detach().cpu()
             round_time = time.time() - round_start
 
-            # Store the full round state so plots, JSON logs, and later analysis stay in sync.
             training_history["round_ids"].append(global_round_idx)
             training_history["round_times"].append(round_time)
             training_history["avg_total_loss"].append(
@@ -1395,11 +2179,15 @@ def main() -> None:
             training_history["download_bytes"].append(download_bytes)
             training_history["total_communication_bytes"].append(upload_bytes + download_bytes)
             training_history["task_classes"].append(stage_dataset_names)
+            training_history["stage_kinds"].append(stage_kind)
+            training_history["used_for_linear_probe"].append(stage_spec["use_for_linear_probe"])
             training_history["client_results"].append(
                 {
                     "stage": stage_number,
+                    "stage_kind": stage_kind,
                     "stage_round": stage_round,
                     "dataset_names": stage_dataset_names,
+                    "use_for_linear_probe": stage_spec["use_for_linear_probe"],
                     "results": client_results,
                 }
             )
@@ -1414,8 +2202,9 @@ def main() -> None:
                 download_bytes=download_bytes,
             )
             logger.info(
-                "Round %s datasets complete | %s | client_prototypes=%s",
+                "Round %s datasets complete | kind=%s | %s | client_prototypes=%s",
                 global_round_idx,
+                stage_kind,
                 ", ".join(DATASET_DISPLAY_NAMES[name] for name in stage_dataset_names),
                 client_prototype_counts,
             )
@@ -1437,13 +2226,66 @@ def main() -> None:
                 prefix="main",
             )
 
-        # Release only the stage-local dataloaders and datasets before moving to the next pair.
-        logger.info("Stage %s complete | releasing stage dataloaders and cached tensors", stage_number)
+        logger.info(
+            "Stage %s complete | kind=%s | releasing stage dataloaders and cached tensors",
+            stage_number,
+            stage_kind,
+        )
+
+        if stage_spec["use_for_linear_probe"]:
+            for dataset_name in stage_dataset_names:
+                if dataset_name not in seen_benchmark_dataset_names:
+                    seen_benchmark_dataset_names.append(dataset_name)
+
+        if seen_benchmark_dataset_names:
+            stage_accuracies = evaluate_seen_datasets(
+                model=base_model,
+                seen_dataset_names=seen_benchmark_dataset_names,
+                config=config,
+            )
+            stage_evaluation = summarize_stage_evaluation(
+                history=training_history,
+                stage_number=stage_number,
+                stage_kind=stage_kind,
+                evaluated_dataset_names=seen_benchmark_dataset_names,
+                accuracies=stage_accuracies,
+            )
+            logger.info(
+                "Stage %s evaluation | kind=%s | datasets=%s | avg_acc=%.4f | avg_forgetting=%.4f | avg_retention=%.4f | avg_bwt=%.4f",
+                stage_number,
+                stage_kind,
+                ", ".join(DATASET_DISPLAY_NAMES[name] for name in seen_benchmark_dataset_names),
+                stage_evaluation["average_accuracy"],
+                stage_evaluation["average_forgetting"],
+                stage_evaluation["average_retention"],
+                stage_evaluation["average_backward_transfer"],
+            )
+
         del stage_dataloaders
         del stage_datasets
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        save_history(training_history, output_dirs["metrics"])
+        plot_training_history(
+            training_history,
+            output_dirs["plots"],
+            prefix="main",
+        )
+        plot_stage_evaluation_heatmap(
+            training_history,
+            config["linear_probe_dataset_order"],
+            output_dirs["plots"],
+            "main",
+        )
+        plot_stage_metric_curves(training_history, output_dirs["plots"], "main")
+        plot_final_forgetting_bars(
+            training_history,
+            config["linear_probe_dataset_order"],
+            output_dirs["plots"],
+            "main",
+        )
 
     save_checkpoint(
         checkpoint_dir=output_dirs["checkpoints"],
@@ -1460,6 +2302,17 @@ def main() -> None:
         global_round_idx,
         output_dirs["checkpoints"] / "final_model.pt",
     )
+
+
+def main() -> None:
+    """Dispatch the unified entrypoint to either the federated or baseline run."""
+    if RUN_MODE == "federated":
+        run_federated_experiment()
+        return
+    if RUN_MODE == "baseline":
+        run_baseline_experiment()
+        return
+    raise ValueError(f"Unsupported RUN_MODE '{RUN_MODE}'. Choose 'federated' or 'baseline'.")
 
 
 if __name__ == "__main__":

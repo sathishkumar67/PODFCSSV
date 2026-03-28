@@ -1,10 +1,10 @@
-"""Run the server-side aggregation steps for the federated pipeline.
+"""Run the server-side aggregation steps for the federated training mode.
 
-The server has two jobs after every communication round:
-1. Merge the local prototype banks into one normalized global bank.
-2. Average the trainable adapter weights into one new global adapter state.
+After every communication round, the server performs two synchronized tasks:
+1. Merge the client-local prototype banks into one shared global prototype bank.
+2. Aggregate the client adapter updates into one new global adapter state.
 
-Those two outputs are then sent back to the clients for the next round.
+Those two outputs are then broadcast back to the clients for the next round.
 """
 
 from __future__ import annotations
@@ -21,11 +21,12 @@ logger = logging.getLogger(__name__)
 class GlobalPrototypeBank:
     """Store the shared prototype memory used by all federated clients.
 
-    Each round updates the bank in the same order:
+    Each round updates the bank in a fixed order:
     1. Normalize every incoming local prototype.
-    2. If the bank is empty, bootstrap it directly from the first round.
-    3. Otherwise merge similar prototypes with EMA.
-    4. Append genuinely new prototypes when capacity allows.
+    2. Bootstrap directly from the first non-empty round if the bank is empty.
+    3. Compare each later prototype against the current bank.
+    4. EMA-merge close matches.
+    5. Append genuinely new prototypes while capacity remains.
     """
 
     def __init__(
@@ -50,12 +51,14 @@ class GlobalPrototypeBank:
     ) -> torch.Tensor:
         """Merge one round of client prototypes into the shared global bank.
 
-        The update rule is step-by-step:
+        The merge path is:
         1. Discard empty payloads.
         2. Normalize and concatenate the remaining local prototypes.
         3. Bootstrap directly if this is the first non-empty round.
-        4. For later rounds, compare each incoming prototype against the bank.
-        5. EMA-merge close matches and append truly novel ones.
+        4. Compare each incoming prototype against the current bank.
+        5. EMA-merge close matches.
+        6. Append only prototypes that are still novel and still fit within the
+           bank capacity.
         """
         valid_prototypes = [
             prototypes.to(self.device)
@@ -102,12 +105,16 @@ class GlobalPrototypeBank:
         return self.prototypes
 
     def get_prototypes(self) -> torch.Tensor:
-        """Return the current prototype matrix without modifying it."""
+        """Return the current prototype matrix without changing server state."""
         return self.prototypes
 
 
 class FederatedModelServer:
-    """Average the trainable adapter weights submitted by the clients."""
+    """Aggregate the trainable adapter weights submitted by the clients.
+
+    Only the trainable adapter subset is aggregated, which keeps the
+    communication budget small and avoids touching the frozen MAE backbone.
+    """
 
     @torch.no_grad()
     def aggregate_weights(
@@ -121,7 +128,8 @@ class FederatedModelServer:
         1. Build the union of parameter names across all client payloads.
         2. Gather the corresponding tensor from each client when it exists.
         3. Fall back to the current global tensor if a client omitted a key.
-        4. Average everything in a common dtype and on a common device.
+        4. Average everything in a common dtype on a common device.
+        5. Return the aggregated trainable state for the next broadcast.
         """
         if not client_weights_map:
             logger.warning("No client weights were submitted for aggregation.")
@@ -186,10 +194,10 @@ def run_server_round(
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Run the full server update for one communication round.
 
-    This helper keeps the round logic in one place:
-    1. Merge local prototype banks.
-    2. Average client adapter weights.
-    3. Optionally smooth the new global weights with server-side EMA.
+    This helper keeps the full round logic in one place:
+    1. Merge the local prototype banks.
+    2. Average the client adapter weights.
+    3. Smooth the aggregated weights with optional server-side EMA.
     4. Return both the updated global prototypes and the updated weights.
     """
     if not client_payloads:
@@ -231,7 +239,11 @@ def run_server_round(
 
 
 class GlobalModel:
-    """Own the server-side MAE model instance used for checkpoint loading and sync."""
+    """Own a server-side MAE model instance for checkpoint-oriented workflows.
+
+    The class is kept mostly for compatibility with older utilities. It loads
+    the same adapter-injected MAE backbone used everywhere else in the repo.
+    """
 
     def __init__(
         self,
