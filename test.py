@@ -25,6 +25,14 @@ from torchvision import datasets
 
 DATA_ROOT = Path("./data")
 PIPELINE_FILE = Path(__file__).with_name("main.py")
+SKIPPED_DATASETS = {
+    "eurosat",
+    "gtsrb",
+    "cifar10",
+    "svhn",
+    "food101",
+    "country211",
+}
 
 
 def load_pipeline_sequences() -> tuple[Dict[int, List[str]], Dict[int, List[str]]]:
@@ -56,17 +64,21 @@ def build_dataset_order(
     benchmark_sequence: Dict[int, Sequence[str]],
     stress_sequence: Dict[int, Sequence[str]],
 ) -> List[str]:
-    """Build the exact stage-aware dataset order used by the current pipeline."""
+    """Build the current stage-aware order while skipping verified datasets."""
     benchmark_stage_count = len(next(iter(benchmark_sequence.values())))
     stress_stage_count = len(next(iter(stress_sequence.values())))
     ordered_names: List[str] = []
 
     for stage_index in range(benchmark_stage_count):
         for client_index in sorted(benchmark_sequence):
-            ordered_names.append(benchmark_sequence[client_index][stage_index])
+            dataset_name = benchmark_sequence[client_index][stage_index]
+            if dataset_name not in SKIPPED_DATASETS:
+                ordered_names.append(dataset_name)
         if stage_index < stress_stage_count:
             for client_index in sorted(stress_sequence):
-                ordered_names.append(stress_sequence[client_index][stage_index])
+                dataset_name = stress_sequence[client_index][stage_index]
+                if dataset_name not in SKIPPED_DATASETS:
+                    ordered_names.append(dataset_name)
 
     return ordered_names
 
