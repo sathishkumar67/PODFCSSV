@@ -1,17 +1,11 @@
-"""Expose the small set of reusable modules that power the whole pipeline.
+"""Expose the reusable building blocks behind the current pipeline.
 
-The repository is organized so the top-level training script can read almost
-like an experiment checklist:
-1. ``src.mae_with_adapter`` builds the frozen MAE backbone plus trainable
-   residual adapters.
-2. ``src.loss`` defines GPAD, the prototype-anchored regularizer used only in
-   the federated mode.
-3. ``src.client`` owns client-side optimization, routing, and local-memory
-   maintenance.
-4. ``src.server`` owns server-side prototype merging and adapter aggregation.
-
-Importing from ``src`` gives the training entrypoint one compact place to
-collect those building blocks.
+The top-level training file imports from ``src`` so the experiment can read
+like a high-level checklist:
+1. ``src.mae_with_adapter`` builds the frozen MAE backbone plus trainable adapters.
+2. ``src.loss`` defines GPAD, the federated prototype-anchoring loss.
+3. ``src.client`` handles client-side optimization and persistent local memory.
+4. ``src.server`` handles prototype merging and adapter aggregation on the server.
 """
 
 from src.client import ClientManager, FederatedClient

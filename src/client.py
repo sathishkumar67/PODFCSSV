@@ -1,16 +1,18 @@
-"""Run client-side optimization, routing, and local-memory maintenance.
+"""Implement the full client-side training and memory-update logic.
 
-Each federated client follows the same round-level sequence:
-1. Receive the newest global adapter weights from the server.
-2. Run MAE reconstruction on local mini-batches.
-3. Apply GPAD only to samples that confidently match the global prototype bank.
-4. Route non-anchored samples to either local prototypes or the novelty buffer.
+This module is responsible for everything that happens on a federated client
+between two server synchronizations:
+1. Receive the newest global adapter weights.
+2. Run MAE reconstruction on the local mini-batches.
+3. Use GPAD only for samples that confidently match the global prototype bank.
+4. Route the remaining samples to either the persistent local bank or the
+   novelty buffer.
 5. Cluster the novelty buffer when it becomes large enough.
-6. Return trainable weights and local prototypes to the server.
+6. Return the trainable adapter state and the updated local prototypes.
 
-Across datasets in the continual benchmark, local prototypes, novelty-buffer
-contents, and optimizer state are deliberately preserved so each client keeps
-its accumulated memory instead of resetting between tasks.
+The key continual-learning detail is that the client does not reset its local
+prototype bank, novelty buffer, or optimizer state when the dataset changes.
+That persistent local memory is part of the current experiment design.
 """
 
 from __future__ import annotations
@@ -449,8 +451,8 @@ class FederatedClient:
             self.local_prototypes = centroids.detach().clone()
             return self.local_prototypes
 
-        # Stage-start centroids should extend the existing memory rather than
-        # resetting it, so the client keeps prototype knowledge from older tasks.
+        # New stage centroids are merged into the existing local bank so the
+        # client keeps prototype memory from older datasets instead of resetting it.
         working_prototypes = F.normalize(self.local_prototypes.to(self.device), p=2, dim=1)
         centroids = F.normalize(centroids, p=2, dim=1)
 

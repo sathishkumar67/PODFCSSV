@@ -1,41 +1,45 @@
 # Complete Pipeline Guide
 
-This guide summarizes the current executable pipeline. If this guide and the code disagree, trust:
+This guide summarizes the current executable workflow. When this guide and the
+code disagree, trust:
 
 - `main.py`
-- `src/*.py`
+- `src/client.py`
+- `src/server.py`
+- `src/loss.py`
+- `src/mae_with_adapter.py`
 
 ## 1. One Entry Point
 
-The repository now uses a single executable file:
+The repository now runs from a single file:
 
 - `main.py`
 
-Choose the behavior by setting `RUN_MODE`:
+Choose the behavior by setting `RUN_MODE` inside the file:
 
 - `federated`
 - `baseline`
 
 ## 2. Shared Model Recipe
 
-Both modes:
+Both modes follow the same backbone recipe:
 
 1. load `facebook/vit-mae-base`
-2. freeze the MAE backbone
+2. freeze the original MAE backbone
 3. inject residual adapters into the upper half of the encoder
-4. train only the adapter weights during continual training
+4. train through the current continual dataset stream
 
-Image preprocessing:
+Image preprocessing is:
 
 1. convert to RGB
 2. resize to `224 x 224`
 3. convert to tensor
 
-No ImageNet normalization is used in the current pipeline.
+No ImageNet normalization is used.
 
 ## 3. Benchmark Datasets
 
-The benchmark datasets are:
+The reported benchmark datasets are:
 
 - `EuroSAT`
 - `GTSRB`
@@ -51,89 +55,152 @@ Client benchmark schedule:
 
 ## 4. Retention-Stress Stages
 
-Both modes use the same extra stress stages between benchmark stages and after the last benchmark stage:
+Both modes use the same extra stress stages between benchmark stages and after
+the last benchmark stage:
 
 - Client 0: `CIFAR10 -> STL10 -> Flowers102`
 - Client 1: `SVHN -> CIFAR100 -> DTD`
 
-These datasets are used only to stress retention. They are not part of the benchmark evaluation set.
+The full stage order is:
 
-## 5. Budget Rule
+1. `EuroSAT` vs `GTSRB`
+2. `CIFAR10` vs `SVHN`
+3. `Food101` vs `Country211`
+4. `STL10` vs `CIFAR100`
+5. `Oxford-IIIT Pet` vs `FGVC Aircraft`
+6. `Flowers102` vs `DTD`
 
-- `EuroSAT` uses a fixed deterministic split of `10000` train and `5000` eval samples
-- every benchmark training split targets `10000` train samples
-- splits below `1000` samples are rejected
-- larger splits are deterministically subsampled
-- smaller valid splits are deterministically repeated up to the target budget
+These stress datasets are used only to create extra forgetting pressure. They
+are not part of the reported benchmark evaluation set.
 
-The baseline uses the same budget policy as the federated benchmark.
+## 5. Split Policy
 
-## 6. Federated Mode
+### Benchmark datasets
+
+Benchmark training uses full train-side splits, except for `EuroSAT`, which is
+fixed to a deterministic `22000`-sample train split and a `5000`-sample held-out
+evaluation split.
+
+### Stress datasets
+
+Stress datasets are merged into one self-supervised training pool:
+
+- `CIFAR10`: `train + test`
+- `STL10`: `train + test + unlabeled`
+- `Flowers102`: `train + val + test`
+- `SVHN`: `train + test + extra`
+- `CIFAR100`: `train + test`
+- `DTD`: `train + val + test`
+
+## 6. Training Configuration
+
+Current shared training defaults:
+
+- `local_epochs = 1`
+- `rounds_per_dataset = 3`
+- `batch_size = 96`
+- `client_lr = 1e-4`
+- `client_weight_decay = 0.05`
+
+## 7. Federated Mode
 
 In `RUN_MODE = "federated"`, `main.py`:
 
 1. builds one shared adapter-injected MAE model
-2. assigns one client per usable GPU
-3. trains through benchmark and stress stages
-4. applies MAE reconstruction and GPAD locally
-5. merges local prototypes and aggregates adapter weights
-6. preserves global memory and enriches the client-local prototype banks across stages instead of resetting them
-7. evaluates on seen benchmark datasets after every stage
-8. saves checkpoints, histories, metrics, and plots
+2. creates two client copies
+3. loads one dataset per client for the current stage
+4. optimizes MAE reconstruction plus GPAD
+5. keeps local prototypes and novelty buffers across dataset transitions
+6. uploads only trainable adapter weights and local prototypes
+7. merges global prototypes and aggregates adapter weights on the server
+8. broadcasts the updated global state back to the clients
 
-Tracked stage-wise benchmark metrics:
-
-- per-dataset accuracy
-- average accuracy
-- forgetting
-- retention ratio
-- backward transfer
-
-Saved stage-wise plots:
-
-- benchmark accuracy heatmap
-- stage metric curves
-- final forgetting bars
-
-## 7. Baseline Mode
+## 8. Baseline Mode
 
 In `RUN_MODE = "baseline"`, `main.py`:
 
 1. builds the same adapter-injected MAE model
-2. trains sequentially on both benchmark and stress datasets
-3. uses reconstruction loss without federation or GPAD
-4. keeps the same model and optimizer state across stages
-5. evaluates on seen benchmark datasets after every stage
-6. saves checkpoints, histories, metrics, and plots
+2. walks through the exact same benchmark-plus-stress stage stream sequentially
+3. optimizes MAE reconstruction only
+4. preserves model and optimizer state across dataset transitions
+5. does not use federation, GPAD, or prototype communication
 
-## 8. Download Safety
+## 9. Stage-Wise Evaluation
 
-The default publishable schedule intentionally avoids datasets with manual-download caveats, including:
+After every stage, both modes evaluate the benchmark datasets seen so far in two
+separate passes.
 
-- `FER2013`
-- `PCAM`
-- `Stanford Cars`
+### Linear probe
 
-`main.py` validates the schedule and rejects those datasets in the default benchmark or stress lists.
+1. freeze the encoder
+2. disable MAE masking so full images go through the encoder
+3. extract frozen features
+4. train one linear classifier per dataset
+5. evaluate on the held-out split
 
-## 9. Runtime Safety
+Current linear-probe settings:
 
-Before using CUDA, the runtime checks that a small CUDA kernel can actually execute. If CUDA is reported but unusable, the code falls back early instead of failing later inside training.
+- epochs: `5`
+- batch size: `256`
+- learning rate: `1e-2`
+- weight decay: `1e-4`
 
-## 10. Dataset Smoke Test
+### Partial fine-tuning
 
-Use `test.py` when you want to verify that every benchmark and stress dataset downloads correctly. The script downloads one dataset at a time, touches the required splits, deletes that dataset folder, and then continues to the next dataset.
+1. start from the current checkpoint state
+2. create a fresh dataset-specific model
+3. freeze the lower half of the encoder
+4. freeze adapters in the upper half
+5. unfreeze the original transformer weights in the upper half
+6. add a linear classification head
+7. train on the dataset train split
+8. evaluate on the held-out split
 
-## 11. Source of Truth
+Current partial-fine-tuning settings:
 
-The current source of truth lives in:
+- epochs: `3`
+- batch size: `64`
+- learning rate: `1e-4`
+- weight decay: `1e-4`
 
-- `main.py`
-- `src/client.py`
-- `src/server.py`
-- `src/loss.py`
-- `src/mae_with_adapter.py`
+## 10. Tracked Metrics
 
-The Python docstrings in those files are intended to be read as a step-by-step walkthrough of the current pipeline. When the code and any external note disagree, trust those files first.
+Both evaluation streams track:
 
+- per-dataset accuracy
+- average benchmark accuracy
+- per-dataset forgetting
+- average forgetting
+- per-dataset retention ratio
+- average retention ratio
+- per-dataset backward transfer
+- average backward transfer
 
+The federated training history also tracks:
+
+- total loss
+- MAE loss
+- GPAD loss
+- anchor, local-match, and novel fractions
+- global prototype count
+- client prototype counts
+- upload bytes
+- download bytes
+- total communication bytes
+
+## 11. Saved Outputs
+
+The run writes:
+
+- per-round checkpoints
+- final checkpoint
+- JSON training history
+- training summary plots
+- linear-probe retention plots
+- partial-fine-tuning retention plots
+
+## 12. Runtime Safety
+
+Before using CUDA, the runtime validates that a small CUDA kernel can actually
+execute. If CUDA is reported but unusable, the code falls back early instead of
+failing later inside training.

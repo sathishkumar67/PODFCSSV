@@ -1,10 +1,11 @@
-"""Run the server-side aggregation steps for the federated training mode.
+"""Implement the server-side synchronization step of the federated pipeline.
 
-After every communication round, the server performs two synchronized tasks:
-1. Merge the client-local prototype banks into one shared global prototype bank.
-2. Aggregate the client adapter updates into one new global adapter state.
+After every communication round the server has two jobs:
+1. Merge the client-local prototype payloads into the shared global prototype bank.
+2. Aggregate the client adapter updates into the next global adapter state.
 
-Those two outputs are then broadcast back to the clients for the next round.
+The merged prototypes and aggregated adapter weights are the only pieces of
+state broadcast back to the clients for the next round.
 """
 
 from __future__ import annotations

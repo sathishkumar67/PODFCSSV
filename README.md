@@ -2,116 +2,244 @@
 
 Prototype-Oriented Distillation for Federated Continual Self-Supervised Vision.
 
-The current repository uses one executable pipeline file: `main.py`.
+The repository now uses a single executable experiment file: `main.py`.
 
-Set `RUN_MODE` in `main.py` to one of:
+## Run Modes
+
+Set `RUN_MODE` near the top of `main.py` before launching the script:
 
 - `federated`
 - `baseline`
 
-## Benchmark
-
-Reported benchmark datasets:
-
-- `EuroSAT`
-- `GTSRB`
-- `Food101`
-- `Country211`
-- `Oxford-IIIT Pet`
-- `FGVC Aircraft`
-
-Benchmark client schedule:
-
-- Client 0: `EuroSAT -> Food101 -> Oxford-IIIT Pet`
-- Client 1: `GTSRB -> Country211 -> FGVC Aircraft`
-
-Retention-stress datasets inserted into both modes:
-
-- Client 0: `CIFAR10 -> STL10 -> Flowers102`
-- Client 1: `SVHN -> CIFAR100 -> DTD`
-
-The stress datasets create harder distribution shifts during training, but they are never included in the reported benchmark evaluation set.
-
-## Shared Model and Budget
-
-Both modes use `facebook/vit-mae-base`, a frozen MAE backbone, residual adapters in the upper half of the encoder, and preprocessing of `RGB -> resize to 224 x 224 -> ToTensor()`. No ImageNet normalization is used.
-
-Shared training defaults:
-
-- `local_epochs = 1`
-- `rounds_per_dataset = 3`
-- `client_lr = 1e-4`
-- `client_weight_decay = 0.05`
-- federated batch size `64`
-- baseline batch size `64`
-
-Training budget policy:
-
-- `EuroSAT` uses a fixed split of `10000` train and `5000` held-out evaluation samples
-- every benchmark training split targets `10000` effective samples
-- splits below `1000` samples are rejected
-- larger splits are deterministically subsampled
-- smaller valid splits are deterministically repeated up to the target budget
-
-The baseline uses the same budget policy as the federated benchmark.
-
-## Modes
-
-`RUN_MODE = "federated"`:
-
-1. loads one dataset per client for the current stage
-2. alternates benchmark stages with retention-stress stages
-3. trains locally with MAE reconstruction and GPAD
-4. merges local prototypes and aggregates only the trainable adapter weights
-5. preserves global memory and carries client-local memory forward by enriching the existing local prototype banks instead of resetting them
-6. evaluates on all benchmark datasets seen so far after every stage
-7. saves checkpoints, histories, metrics, and plots
-
-`RUN_MODE = "baseline"`:
-
-1. builds one adapter-injected MAE model
-2. trains sequentially over both the benchmark datasets and the same stress datasets used by the federated run
-3. uses reconstruction loss only
-4. preserves the same model and optimizer state across stages
-5. runs the same stage-wise benchmark evaluation after every stage
-6. saves checkpoints, histories, metrics, and plots
-
-## Built-In Evaluation
-
-After each stage, `main.py` performs frozen-feature linear-probe evaluation on every benchmark dataset seen so far. The stage summaries track:
-
-- per-dataset accuracy
-- average benchmark accuracy
-- forgetting
-- retention ratio
-- backward transfer
-
-Saved plots include:
-
-- training summary
-- stage accuracy heatmap
-- stage metric curves
-- final forgetting bar chart
-
-## Download Safety
-
-The default publishable schedule avoids manual-setup datasets such as `FER2013`, `PCAM`, and `Stanford Cars`. The dependency metadata now includes `scipy` so the default `SVHN` and `Flowers102` paths install cleanly in a fresh environment.
-
-To smoke-test dataset downloads without running training, use:
-
-```bash
-python test.py
-```
-
-`test.py` downloads every benchmark and stress dataset one by one, touches the required splits, deletes that dataset folder, and then moves on to the next dataset.
-
-## Run
+Run the pipeline with:
 
 ```bash
 python main.py
 ```
 
-No separate `base.py` or `evaluate.py` entrypoint is required for the current retention-analysis workflow.
+The script does not expect a command-line mode argument. The selected mode is
+read directly from the `RUN_MODE` constant.
+
+## Shared Model
+
+Both modes use the same representation backbone:
+
+- pretrained model: `facebook/vit-mae-base`
+- embedding dimension: `768`
+- adapter bottleneck dimension: `256`
+- input size: `224 x 224`
+- preprocessing: `RGB -> Resize(224, 224) -> ToTensor()`
+- normalization: no ImageNet normalization
+
+Adapters are injected only into the upper half of the ViT-MAE encoder. The MAE
+backbone stays frozen during continual training, and only the adapter weights
+are exchanged in the federated mode.
+
+## Dataset Flow
+
+### Benchmark Datasets
+
+These datasets define the reported continual-learning benchmark:
+
+- Client 0: `EuroSAT -> Food101 -> Oxford-IIIT Pet`
+- Client 1: `GTSRB -> Country211 -> FGVC Aircraft`
+
+### Retention-Stress Datasets
+
+These datasets are inserted between benchmark stages and again after the last
+benchmark stage to create additional distribution shift:
+
+- Client 0: `CIFAR10 -> STL10 -> Flowers102`
+- Client 1: `SVHN -> CIFAR100 -> DTD`
+
+The full stage order is:
+
+1. `EuroSAT` vs `GTSRB`
+2. `CIFAR10` vs `SVHN`
+3. `Food101` vs `Country211`
+4. `STL10` vs `CIFAR100`
+5. `Oxford-IIIT Pet` vs `FGVC Aircraft`
+6. `Flowers102` vs `DTD`
+
+The stress datasets are trained in both modes but are excluded from the
+reported benchmark evaluation curves.
+
+## Split Policy
+
+### Benchmark Training Splits
+
+The benchmark datasets use the full train-side splits in the current pipeline,
+except for `EuroSAT`, which uses a fixed deterministic split:
+
+- `EuroSAT`: `22000` train, `5000` eval
+- `Food101`: full `train`
+- `Oxford-IIIT Pet`: full `trainval`
+- `GTSRB`: full `train`
+- `Country211`: full `train`
+- `FGVC Aircraft`: full `trainval`
+
+### Stress Training Splits
+
+The stress datasets are treated as self-supervised training pools, so all
+available official splits are merged into one training dataset:
+
+- `CIFAR10`: `train + test`
+- `STL10`: `train + test + unlabeled`
+- `Flowers102`: `train + val + test`
+- `SVHN`: `train + test + extra`
+- `CIFAR100`: `train + test`
+- `DTD`: `train + val + test`
+
+### Evaluation Splits
+
+Benchmark evaluation always uses held-out data:
+
+- `EuroSAT`: fixed `5000`-sample held-out split
+- `Food101`: `test`
+- `Oxford-IIIT Pet`: `test`
+- `GTSRB`: `test`
+- `Country211`: `test`
+- `FGVC Aircraft`: `test`
+
+Stress datasets are not part of the reported benchmark evaluation set.
+
+## Training Configuration
+
+Current shared training defaults:
+
+- `local_epochs = 1`
+- `rounds_per_dataset = 3`
+- `batch_size = 96`
+- `client_lr = 1e-4`
+- `client_weight_decay = 0.05`
+
+The baseline and federated modes now use the same batch size and the same full
+split policy so the comparison stays aligned.
+
+## Federated Mode
+
+`RUN_MODE = "federated"` performs the proposed method:
+
+1. Build one adapter-injected ViT-MAE backbone.
+2. Create two clients, one per selected device when GPUs are available.
+3. Load one dataset per client for the current stage.
+4. Train with MAE reconstruction plus GPAD on globally anchored samples.
+5. Maintain client-local prototypes and novelty buffers across dataset changes.
+6. Upload only the trainable adapter weights and local prototype banks.
+7. Merge prototypes and aggregate adapter weights at the server.
+8. Broadcast the updated global adapter state and global prototypes back to the clients.
+
+Tracked federated communication includes:
+
+- uploaded bytes
+- downloaded bytes
+- total communication bytes
+- global prototype count
+- local prototype counts per client
+
+## Baseline Mode
+
+`RUN_MODE = "baseline"` performs the non-federated continual baseline:
+
+1. Build the same adapter-injected ViT-MAE backbone.
+2. Walk through the exact same benchmark-plus-stress stage stream sequentially.
+3. Optimize MAE reconstruction loss only.
+4. Preserve the same model state and optimizer state across dataset changes.
+
+No GPAD, no server aggregation, and no prototype communication are used in the
+baseline mode.
+
+## Stage-Wise Evaluation
+
+After every stage in both modes, `main.py` evaluates the benchmark datasets
+seen so far in two separate ways.
+
+### 1. Linear Probe
+
+This stage measures frozen representation quality:
+
+1. Freeze the encoder.
+2. Disable MAE masking so full images pass through the encoder.
+3. Extract benchmark features.
+4. Train one linear classifier per dataset.
+5. Evaluate on the held-out split.
+
+Current linear-probe settings:
+
+- epochs: `5`
+- batch size: `256`
+- learning rate: `1e-2`
+- weight decay: `1e-4`
+
+### 2. Partial Fine-Tuning
+
+This stage measures transfer quality from the current checkpoint:
+
+1. Start from the current checkpoint state.
+2. Create a fresh dataset-specific model.
+3. Freeze the lower half of the encoder.
+4. In the upper half, keep adapters frozen and unfreeze the original transformer weights.
+5. Add a dataset-specific linear classification head.
+6. Train that model on the dataset train split.
+7. Evaluate on the held-out split.
+
+Current partial-fine-tuning settings:
+
+- epochs: `3`
+- batch size: `64`
+- learning rate: `1e-4`
+- weight decay: `1e-4`
+
+## Retention Metrics
+
+Both evaluation streams track stage-wise continual-learning metrics on the
+benchmark datasets seen so far:
+
+- per-dataset accuracy
+- average benchmark accuracy
+- per-dataset forgetting
+- average forgetting
+- per-dataset retention ratio
+- average retention ratio
+- per-dataset backward transfer
+- average backward transfer
+
+## Saved Outputs
+
+The pipeline writes:
+
+- per-round checkpoints
+- final checkpoint
+- JSON training history
+- training summary plots
+- linear-probe retention plots
+- partial-fine-tuning retention plots
+
+The active output directories are:
+
+- federated: `multidataset_outputs_2client`
+- baseline: `baseline_outputs`
+
+## Safety and Reproducibility
+
+The default publishable schedule avoids manual-setup datasets such as:
+
+- `FER2013`
+- `PCAM`
+- `Stanford Cars`
+
+Before using CUDA, the runtime runs a small kernel smoke test to confirm that a
+GPU can actually execute the operations required by the training loop.
+
+## Active Source Files
+
+The current source of truth lives in:
+
+- `main.py`
+- `src/client.py`
+- `src/server.py`
+- `src/loss.py`
+- `src/mae_with_adapter.py`
 
 ## License
 

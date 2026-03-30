@@ -1,26 +1,19 @@
-"""Run the entire current experiment pipeline from one file.
+"""Run the complete current experiment pipeline from one file.
 
-This file is the single source of truth for the publishable setup. It contains
-both training modes and the built-in retention analysis:
-1. ``RUN_MODE = "federated"`` trains two clients with GPAD, prototype
-   exchange, and interleaved stress stages.
-2. ``RUN_MODE = "baseline"`` trains one sequential model with reconstruction
-   loss only while following the same benchmark-plus-stress dataset stream.
-3. After each stage, the current model is evaluated on all benchmark datasets
-   seen so far by frozen-feature linear probing.
-4. After the linear probe, a fresh dataset-specific partial-finetuning transfer
-   evaluation is run from the same checkpoint on the same seen benchmark set.
-5. Checkpoints, JSON histories, communication metrics, forgetting metrics, and
-   plots are all written from this same script.
-
-The default benchmark uses six auto-download-friendly datasets with held-out
-evaluation splits:
-- EuroSAT
-- GTSRB
-- Food101
-- Country211
-- Oxford-IIIT Pet
-- FGVC Aircraft
+This module is the active experiment entrypoint for the repository. It owns the
+entire paper-facing workflow:
+1. ``RUN_MODE = "federated"`` launches the proposed two-client GPAD training
+   loop with prototype exchange and server-side adapter aggregation.
+2. ``RUN_MODE = "baseline"`` launches the reconstruction-only continual
+   baseline over the same benchmark-plus-stress stage order.
+3. Benchmark stages use full train-side splits, with `EuroSAT` handled by a
+   fixed deterministic `22000/5000` train-eval split.
+4. Stress stages use merged self-supervised pools built from all official
+   splits of each stress dataset.
+5. After every stage, the benchmark datasets seen so far are evaluated twice:
+   first by frozen-feature linear probing and then by fresh partial fine-tuning.
+6. Round checkpoints, final checkpoints, JSON histories, communication stats,
+   forgetting summaries, and plots are all emitted from this file.
 """
 
 from __future__ import annotations
@@ -60,50 +53,11 @@ baseline_logger = logging.getLogger("PODFCSSV_Baseline")
 
 RUN_MODE = "federated"
 
-MODEL_NAME = "facebook/vit-mae-base"
-
-MODEL_VARIANTS: Dict[str, Dict[str, Any]] = {
-    "facebook/vit-mae-base": {
-        "embedding_dim": 768,
-        "federated_batch_size": 64,
-        "baseline_batch_size": 64,
-    },
-    "facebook/vit-mae-large": {
-        "embedding_dim": 1024,
-        "federated_batch_size": 64,
-        "baseline_batch_size": 64,
-    },
-    "facebook/vit-mae-huge": {
-        "embedding_dim": 1280,
-        "federated_batch_size": 32,
-        "baseline_batch_size": 32,
-    },
-}
-
-
-def get_model_variant_config(model_name: str) -> Dict[str, Any]:
-    """Return the preset values tied to one pretrained MAE variant.
-
-    The preset controls the hidden size and the default batch sizes used by the
-    federated and baseline modes so a single model-name change updates the
-    rest of the runtime configuration consistently.
-    """
-    if model_name not in MODEL_VARIANTS:
-        available_models = ", ".join(sorted(MODEL_VARIANTS))
-        raise ValueError(
-            f"Unsupported pretrained model '{model_name}'. "
-            f"Choose one of: {available_models}."
-        )
-    return dict(MODEL_VARIANTS[model_name])
-
-
-MODEL_CONFIG = get_model_variant_config(MODEL_NAME)
-
 CONFIG: Dict[str, Any] = {
     "seed": 42,
     "num_clients": 2,
     "local_epochs": 1,
-    "batch_size": MODEL_CONFIG["federated_batch_size"],
+    "batch_size": 96,
     "client_lr": 1e-4,
     "client_weight_decay": 0.05,
     "gpu_count": 0,
@@ -112,8 +66,8 @@ CONFIG: Dict[str, Any] = {
     "num_workers": 2,
     "pin_memory": True,
     "dataloader_shuffle": True,
-    "pretrained_model_name": MODEL_NAME,
-    "embedding_dim": MODEL_CONFIG["embedding_dim"],
+    "pretrained_model_name": "facebook/vit-mae-base",
+    "embedding_dim": 768,
     "image_size": 224,
     "adapter_bottleneck_dim": 256,
     "merge_threshold": 0.85,
@@ -161,8 +115,6 @@ MULTI_DATASET_CONFIG: Dict[str, Any] = {
     "min_partial_eval_train_samples": 0,
     "min_partial_eval_test_samples": 0,
     "max_global_prototypes": 2000,
-    "train_samples_per_dataset": 10000,
-    "min_train_samples_per_dataset": 1000,
     "save_dir": "multidataset_outputs_2client",
 }
 
@@ -170,16 +122,15 @@ BASELINE_CONFIG: Dict[str, Any] = {
     **MULTI_DATASET_CONFIG,
     "num_clients": 1,
     "save_dir": "baseline_outputs",
-    "batch_size": MODEL_CONFIG["baseline_batch_size"],
+    "batch_size": 96,
     "num_workers": 4,
-    "train_samples_per_dataset": MULTI_DATASET_CONFIG["train_samples_per_dataset"],
     "pin_memory": True,
     "dataloader_persistent_workers": True,
     "dataloader_prefetch_factor": 4,
     "cudnn_benchmark": True,
 }
 
-EUROSAT_TRAIN_SPLIT_SAMPLES = 10000
+EUROSAT_TRAIN_SPLIT_SAMPLES = 22000
 EUROSAT_EVAL_SPLIT_SAMPLES = 5000
 
 BENCHMARK_CLIENT_DATASET_SEQUENCE: Dict[int, List[str]] = {
@@ -722,8 +673,8 @@ def build_baseline_stage_plan() -> List[Dict[str, Any]]:
     baseline_stage_plan: List[Dict[str, Any]] = []
 
     for stage_spec in federated_stage_plan:
-        # The baseline sees the same dataset stream as the federated run, but
-        # one shared model forces that stream to be replayed sequentially.
+        # The baseline follows the identical stage stream, but one shared model
+        # means the per-client datasets must be replayed sequentially.
         for client_index in sorted(stage_spec["datasets"]):
             baseline_stage_plan.append(
                 {
@@ -764,14 +715,15 @@ def fit_dataset_to_sample_budget(
     target_samples: Optional[int],
     min_samples: Optional[int],
 ) -> torch.utils.data.Dataset:
-    """Fit one dataset split to the configured sample budget.
+    """Optionally reshape one split to a deterministic sample count.
 
-    The budget rule is enforced in a deterministic order:
-    1. Fail early if the split is below the required minimum.
-    2. Keep the full split when no target sample count is requested.
+    The current training path usually keeps full splits, but the helper remains
+    available because the evaluation code still supports optional caps. Its
+    logic is:
+    1. Reject a split that falls below the requested minimum.
+    2. Return the split unchanged when no target size is requested.
     3. Deterministically subsample when the split is larger than the target.
-    4. Deterministically repeat samples when the split is smaller than the
-       target.
+    4. Deterministically repeat samples when the split is smaller than the target.
     """
     dataset_size = len(dataset)
     split_name = "train" if train else "test"
@@ -894,17 +846,73 @@ def load_named_dataset(
     seed: int,
     max_samples: Optional[int] = None,
     min_samples: Optional[int] = None,
+    merge_all_training_splits: bool = False,
 ) -> torch.utils.data.Dataset:
-    """Load one named dataset and optionally fit it to a budget.
+    """Load one named dataset using the exact split rules of the active pipeline.
 
-    This helper centralizes every dataset-specific rule so both training modes
-    and the built-in retention evaluation go through the same loader logic and
-    therefore use the same splits.
+    This helper keeps all split decisions in one place so training and
+    evaluation cannot drift apart:
+    1. Benchmark datasets load their official train-side split in full.
+    2. `EuroSAT` uses the repository's deterministic `22000/5000` split.
+    3. Stress datasets can merge all official splits into one self-supervised
+       pool when ``merge_all_training_splits=True``.
+    4. Optional deterministic sample shaping is applied only when explicitly requested.
     """
     transform = build_dataset_transform(image_size)
     root = Path(data_root) / "multidataset" / dataset_name
 
-    if dataset_name == "eurosat":
+    if train and merge_all_training_splits:
+        if dataset_name == "cifar10":
+            dataset = ConcatDataset(
+                [
+                    datasets.CIFAR10(root=str(root), train=True, download=True, transform=transform),
+                    datasets.CIFAR10(root=str(root), train=False, download=True, transform=transform),
+                ]
+            )
+        elif dataset_name == "stl10":
+            dataset = ConcatDataset(
+                [
+                    datasets.STL10(root=str(root), split="train", download=True, transform=transform),
+                    datasets.STL10(root=str(root), split="test", download=True, transform=transform),
+                    datasets.STL10(root=str(root), split="unlabeled", download=True, transform=transform),
+                ]
+            )
+        elif dataset_name == "flowers102":
+            dataset = ConcatDataset(
+                [
+                    datasets.Flowers102(root=str(root), split="train", download=True, transform=transform),
+                    datasets.Flowers102(root=str(root), split="val", download=True, transform=transform),
+                    datasets.Flowers102(root=str(root), split="test", download=True, transform=transform),
+                ]
+            )
+        elif dataset_name == "svhn":
+            dataset = ConcatDataset(
+                [
+                    datasets.SVHN(root=str(root), split="train", download=True, transform=transform),
+                    datasets.SVHN(root=str(root), split="test", download=True, transform=transform),
+                    datasets.SVHN(root=str(root), split="extra", download=True, transform=transform),
+                ]
+            )
+        elif dataset_name == "cifar100":
+            dataset = ConcatDataset(
+                [
+                    datasets.CIFAR100(root=str(root), train=True, download=True, transform=transform),
+                    datasets.CIFAR100(root=str(root), train=False, download=True, transform=transform),
+                ]
+            )
+        elif dataset_name == "dtd":
+            dataset = ConcatDataset(
+                [
+                    datasets.DTD(root=str(root), split="train", download=True, transform=transform),
+                    datasets.DTD(root=str(root), split="val", download=True, transform=transform),
+                    datasets.DTD(root=str(root), split="test", download=True, transform=transform),
+                ]
+            )
+        else:
+            raise ValueError(
+                f"merge_all_training_splits=True is not supported for dataset '{dataset_name}'."
+            )
+    elif dataset_name == "eurosat":
         dataset = build_fixed_count_split_subset(
             datasets.EuroSAT(root=str(root), download=True, transform=transform),
             dataset_name=dataset_name,
@@ -1110,10 +1118,11 @@ def load_named_evaluation_dataset(
     max_samples: Optional[int] = None,
     min_samples: Optional[int] = None,
 ) -> torch.utils.data.Dataset:
-    """Load the held-out split used for built-in retention evaluation.
+    """Load the held-out split used by both stage-wise evaluation passes.
 
-    Most datasets expose a single official test split. A few require combining
-    multiple held-out splits, and this helper keeps those choices centralized.
+    Most benchmark datasets have one official test split. The remaining special
+    cases are handled here so linear probing and partial fine-tuning always
+    report against the same held-out data.
     """
     transform = build_dataset_transform(image_size)
     root = Path(data_root) / "multidataset" / dataset_name
@@ -1457,13 +1466,13 @@ def run_linear_probe(
     test_labels: torch.Tensor,
     config: Dict[str, Any],
 ) -> float:
-    """Train one linear probe on frozen features and return held-out accuracy.
+    """Train one linear probe on frozen encoder features.
 
-    The probe stage is:
-    1. Remap labels to a contiguous class index range.
-    2. Fit a single linear layer on the frozen training features.
-    3. Evaluate the learned probe on the held-out features.
-    4. Return accuracy for the current stage summary.
+    This function implements the first evaluation view used after every stage:
+    1. Remap labels onto a contiguous class range.
+    2. Train only a single linear layer on top of frozen features.
+    3. Evaluate that probe on the held-out split.
+    4. Return the held-out accuracy used in the retention summary.
     """
     if train_features.numel() == 0 or test_features.numel() == 0:
         return 0.0
@@ -1525,13 +1534,13 @@ def evaluate_datasets(
     dataset_names: Sequence[str],
     config: Dict[str, Any],
 ) -> Dict[str, float]:
-    """Evaluate frozen representations on one or more benchmark datasets.
+    """Evaluate the current checkpoint by frozen-feature linear probing.
 
-    For each dataset this helper:
+    For each benchmark dataset in the current seen set this helper:
     1. Loads the train split used to fit the probe.
     2. Loads the held-out split used for reporting.
-    3. Extracts frozen encoder features.
-    4. Fits a linear probe.
+    3. Extracts full-image encoder features with MAE masking disabled.
+    4. Fits a linear classifier on those frozen features.
     5. Stores the held-out accuracy.
     """
     results: Dict[str, float] = {}
@@ -1599,14 +1608,16 @@ def run_partial_finetune_probe(
     test_dataset: torch.utils.data.Dataset,
     config: Dict[str, Any],
 ) -> float:
-    """Fine-tune a fresh dataset-specific transfer model and return accuracy.
+    """Run one fresh dataset-specific partial-finetuning evaluation.
 
-    This transfer stage is run independently for every dataset:
-    1. Build a fresh MAE encoder from the current checkpoint.
-    2. Freeze the lower encoder layers.
-    3. Freeze adapters in the upper encoder layers.
-    4. Fine-tune the remaining upper-layer transformer weights plus a new head.
-    5. Evaluate the adapted model on the held-out split.
+    This function implements the second evaluation view used after every stage:
+    1. Start from the current checkpoint state.
+    2. Build a fresh model dedicated to one dataset.
+    3. Freeze the lower encoder half.
+    4. Keep adapters frozen in the upper half while reopening the original
+       transformer weights there.
+    5. Train a new dataset-specific classifier head.
+    6. Evaluate on the held-out split and return accuracy.
     """
     label_mapping = build_label_mapping(train_dataset=train_dataset, test_dataset=test_dataset)
     if not label_mapping:
@@ -1682,7 +1693,7 @@ def evaluate_datasets_with_partial_finetune(
     dataset_names: Sequence[str],
     config: Dict[str, Any],
 ) -> Dict[str, float]:
-    """Evaluate checkpoint transfer quality with fresh partial fine-tuning."""
+    """Evaluate checkpoint transfer quality on the current seen benchmark set."""
     results: Dict[str, float] = {}
     for dataset_name in dataset_names:
         train_dataset = load_named_dataset(
@@ -1984,11 +1995,13 @@ def render_all_stage_evaluation_plots(
 
 
 def initialize_baseline_history() -> Dict[str, Any]:
-    """Create the history dictionary written by the baseline mode.
+    """Create the history structure written by the baseline mode.
 
-    The baseline records only reconstruction-oriented training metrics plus the
-    same stage-wise evaluation summaries used for forgetting comparisons while
-    it trains through both benchmark and stress datasets.
+    The baseline records four groups of information:
+    1. Round-wise reconstruction metrics.
+    2. Per-stage dataset summaries.
+    3. Stage-wise linear-probe retention summaries.
+    4. Stage-wise partial-finetuning transfer summaries.
     """
     return {
         "round_ids": [],
@@ -2094,15 +2107,17 @@ def plot_baseline_training_history(history: Dict[str, Any], plots_dir: Path) -> 
 
 
 def run_baseline_experiment() -> None:
-    """Run the single-model continual baseline from the unified entrypoint.
+    """Run the sequential continual-learning baseline.
 
-    The baseline mode follows this fixed order:
-    1. Build the shared adapter-injected MAE model.
-    2. Walk through the benchmark and retention-stress datasets sequentially.
+    The baseline keeps the architecture fixed and changes only the training
+    topology:
+    1. Build one adapter-injected ViT-MAE model.
+    2. Walk through the same benchmark-plus-stress stage order used by the federated run.
     3. Train with MAE reconstruction only.
-    4. Run linear-probe retention evaluation after each stage.
-    5. Run fresh partial-finetuning transfer evaluation on the same datasets.
-    6. Save checkpoints, JSON histories, and retention plots.
+    4. Preserve model and optimizer state across every dataset transition.
+    5. After each stage, run linear probing and then partial fine-tuning on the
+       benchmark datasets seen so far.
+    6. Save checkpoints, histories, and both families of retention plots.
     """
     config = dict(BASELINE_CONFIG)
     config["run_mode"] = "baseline"
@@ -2161,12 +2176,11 @@ def run_baseline_experiment() -> None:
     seen_benchmark_dataset_names: List[str] = []
 
     baseline_logger.info(
-        "Starting unified baseline | stages=%s | benchmark_datasets=%s | rounds_per_dataset=%s | batch_size=%s | train_budget=%s | linear_probe_epochs=%s | partial_eval_epochs=%s | device=%s | output=%s",
+        "Starting unified baseline | stages=%s | benchmark_datasets=%s | rounds_per_dataset=%s | batch_size=%s | linear_probe_epochs=%s | partial_eval_epochs=%s | device=%s | output=%s",
         len(config["dataset_order_by_stage"]),
         len(config["linear_probe_dataset_order"]),
         config["rounds_per_dataset"],
         config["batch_size"],
-        config["train_samples_per_dataset"],
         config["linear_eval_epochs"],
         config["partial_eval_epochs"],
         config["device"],
@@ -2191,8 +2205,9 @@ def run_baseline_experiment() -> None:
             image_size=config["image_size"],
             train=True,
             seed=config["seed"],
-            max_samples=config["train_samples_per_dataset"],
-            min_samples=config["min_train_samples_per_dataset"],
+            max_samples=None,
+            min_samples=None,
+            merge_all_training_splits=(stage_kind == "retention_noise"),
         )
         dataloader = create_baseline_dataloader(dataset=dataset, config=config)
 
@@ -2251,7 +2266,8 @@ def run_baseline_experiment() -> None:
                 "last_round_loss": float(stage_losses[-1]),
             }
         )
-        # Only benchmark datasets contribute to the reported retention curves.
+        # Stress stages are trained to create forgetting pressure, but only
+        # benchmark datasets are allowed into the reported retention curves.
         if stage_spec["use_for_linear_probe"] and dataset_name not in seen_benchmark_dataset_names:
             seen_benchmark_dataset_names.append(dataset_name)
 
@@ -2344,16 +2360,17 @@ def run_baseline_experiment() -> None:
 def run_federated_experiment() -> None:
     """Run the full two-client federated continual-learning benchmark.
 
-    The federated mode follows this fixed order:
-    1. Build the shared adapter-injected MAE model and global prototype bank.
+    This path is the proposed method used by the paper:
+    1. Build the shared adapter-injected ViT-MAE backbone and the global prototype bank.
     2. Alternate benchmark stages with retention-stress stages.
     3. Train one dataset per client for the configured number of rounds.
-    4. Merge prototypes and aggregate adapter weights after each round.
-    5. Preserve and enrich both global memory and client-local prototype memory
-       across stage transitions.
-    6. Run linear-probe retention evaluation on seen benchmark datasets.
-    7. Run fresh partial-finetuning transfer evaluation on the same datasets.
-    8. Save checkpoints, communication metrics, retention summaries, and plots.
+    4. Upload only trainable adapter weights and local prototype banks.
+    5. Merge prototypes and aggregate adapter weights on the server.
+    6. Broadcast the updated global state back to the clients.
+    7. Preserve both global memory and client-local memory across dataset changes.
+    8. After each stage, run linear probing and then partial fine-tuning on the
+       benchmark datasets seen so far.
+    9. Save checkpoints, communication histories, and both evaluation plot families.
     """
     config = dict(MULTI_DATASET_CONFIG)
     config["run_mode"] = "federated"
@@ -2415,13 +2432,13 @@ def run_federated_experiment() -> None:
     output_dirs = prepare_output_dirs(config["save_dir"])
 
     logger.info(
-        "Starting unified federated run | clients=%s | total_stages=%s | benchmark_stages=%s | rounds_per_stage=%s | total_rounds=%s | train_budget=%s | linear_probe_epochs=%s | partial_eval_epochs=%s | device=%s | output=%s",
+        "Starting unified federated run | clients=%s | total_stages=%s | benchmark_stages=%s | rounds_per_stage=%s | total_rounds=%s | batch_size=%s | linear_probe_epochs=%s | partial_eval_epochs=%s | device=%s | output=%s",
         config["num_clients"],
         config["num_stages"],
         config["num_benchmark_stages"],
         config["rounds_per_dataset"],
         config["total_sequential_rounds"],
-        config["train_samples_per_dataset"],
+        config["batch_size"],
         config["linear_eval_epochs"],
         config["partial_eval_epochs"],
         config["device"],
@@ -2490,8 +2507,9 @@ def run_federated_experiment() -> None:
                 image_size=config["image_size"],
                 train=True,
                 seed=config["seed"],
-                max_samples=config["train_samples_per_dataset"],
-                min_samples=config["min_train_samples_per_dataset"],
+                max_samples=None,
+                min_samples=None,
+                merge_all_training_splits=(stage_kind == "retention_noise"),
             )
             stage_datasets.append(dataset)
             logger.info(
@@ -2542,8 +2560,9 @@ def run_federated_experiment() -> None:
 
             for client_index, client in enumerate(client_manager.clients):
                 if stage_round == 1:
-                    # The first round of each stage injects current-dataset
-                    # centroids into the client's existing local memory.
+                    # A new stage should enrich the existing local bank rather
+                    # than replace it, so the first round injects fresh stage
+                    # centroids into the accumulated prototype memory.
                     local_prototypes = client.generate_prototypes(
                         stage_dataloaders[client_index],
                         K_init=config["k_init_prototypes"],

@@ -1,13 +1,13 @@
-"""Attach residual adapters to a frozen ViT-MAE backbone.
+"""Attach residual adapters to the frozen ViT-MAE backbone.
 
-The repository uses the same parameter-efficient recipe in every mode:
-1. Load a pretrained MAE model.
-2. Freeze the original backbone parameters.
-3. Insert lightweight residual adapters into the upper encoder blocks.
-4. Train only those adapters during continual learning.
+The same parameter-efficient recipe is reused across the whole repository:
+1. load the pretrained MAE model,
+2. freeze the original backbone,
+3. insert lightweight residual adapters into the upper encoder blocks, and
+4. leave only those adapters trainable during continual learning.
 
-This keeps the pretrained representation stable while making optimization and
-communication much cheaper than full-model fine-tuning.
+This keeps the pretrained representation stable while dramatically reducing the
+number of parameters that must be optimized and communicated.
 """
 
 from __future__ import annotations

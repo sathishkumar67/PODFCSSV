@@ -12,16 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Single Entrypoint Workflow** (`main.py`): The repository now supports both the federated experiment and the single-model baseline from one file via a `RUN_MODE` switch.
 - **Retention-Stress Stages** (`main.py`): Added interleaved stress datasets, including the later Flowers102 and DTD stress stage, so retention can be analyzed under stronger shifts without adding those datasets to the default benchmark evaluation set.
-- **Built-In Forgetting Analysis** (`main.py`): Stage-wise benchmark evaluation is now performed during training, with tracked accuracy, forgetting, retention ratio, backward transfer, and publication-ready plots.
-- **Step-by-Step Code Guides** (`main.py`, `src/*.py`): Active Python modules now use refreshed docstrings and comments that describe the current single-file training and retention-analysis workflow step by step.
-- **Dataset Download Smoke Test** (`test.py`): Added a standalone script that downloads every benchmark and stress dataset one by one, validates the requested splits, deletes the dataset folder, and continues to the next dataset.
+- **Two Evaluation Views** (`main.py`): Stage-wise training now measures both frozen-feature linear-probe retention and dataset-wise partial-fine-tuning transfer quality after every stage.
+- **Step-by-Step Code Guides** (`main.py`, `src/*.py`): Active Python modules now use refreshed docstrings and comments that describe the current single-file training, communication, and evaluation workflow step by step.
 
 ### Changed
 - **Publishable Benchmark Refresh** (`main.py`): Replaced the earlier small mixed benchmark with `EuroSAT`, `GTSRB`, `Food101`, `Country211`, `Oxford-IIIT Pet`, and `FGVC Aircraft`, all chosen from the supported auto-downloadable paths with held-out evaluation splits.
-- **Baseline Fairness Policy** (`main.py`): The unified baseline now uses the same `10000`-sample effective train budget as the federated benchmark instead of consuming unrestricted full train splits.
+- **Full-Split Training Policy** (`main.py`): Benchmark datasets now use their full train-side splits, `EuroSAT` uses a fixed `22000/5000` train-eval split, and stress datasets merge all available official splits into one self-supervised training pool.
 - **Stress-Stream Fairness** (`main.py`): The unified baseline now trains through the same stress-dataset stream as the federated mode, while benchmark reporting still excludes those stress datasets.
 - **Single-File Workflow** (`main.py`): Training-time forgetting evaluation now lives inside the same file as the training modes, and the standalone evaluation entrypoint has been removed from the active pipeline.
-- **Documentation Refresh** (`README.md`, `CONTRIBUTING.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Repository documentation now reflects the single-file workflow, the new benchmark datasets, and the built-in forgetting analysis.
+- **Documentation Refresh** (`README.md`, `CONTRIBUTING.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Repository documentation now reflects the current full-split training policy, the benchmark-plus-stress stage order, and the dual evaluation pipeline.
 
 ### Fixed
 - **CUDA Runtime Validation** (`main.py`): The runtime now validates that CUDA can execute a small kernel before treating a GPU as usable, preventing deep training failures on incompatible CUDA environments.

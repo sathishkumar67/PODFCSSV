@@ -1,13 +1,13 @@
-"""Define the GPAD loss used to anchor client embeddings to the global bank.
+"""Define the GPAD loss used by the federated continual-learning path.
 
-GPAD is the only extra loss term added on top of MAE reconstruction in the
-federated mode. Every call follows the same pipeline:
-1. Normalize the current batch embeddings and the global prototypes.
-2. Build a cosine-similarity matrix between samples and prototypes.
-3. Convert prototype-assignment entropy into an adaptive confidence threshold.
-4. Decide which samples are safe to anchor to the global memory.
-5. Turn that decision into a smooth gate so optimization stays differentiable.
-6. Penalize anchored samples when they drift away from their best prototype.
+GPAD is the extra regularizer layered on top of MAE reconstruction in the
+proposed method. For every batch it:
+1. compares embeddings against the global prototype bank,
+2. estimates assignment uncertainty,
+3. decides which samples are safe to anchor globally,
+4. turns that decision into a differentiable gate, and
+5. penalizes globally anchored samples when they drift away from their closest
+   prototype.
 """
 
 from __future__ import annotations
