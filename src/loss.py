@@ -1,13 +1,17 @@
 """Define the GPAD loss used by the federated continual-learning path.
 
-GPAD is the extra regularizer layered on top of MAE reconstruction in the
-proposed method. For every batch it:
-1. compares embeddings against the global prototype bank,
-2. estimates assignment uncertainty,
-3. decides which samples are safe to anchor globally,
-4. turns that decision into a differentiable gate, and
-5. penalizes globally anchored samples when they drift away from their closest
+GPAD is the prototype-aware regularizer layered on top of MAE reconstruction in
+the proposed method. For every batch it:
+
+1. compares embeddings against the current global prototype bank,
+2. estimates how ambiguous each prototype assignment is,
+3. raises the anchoring threshold for uncertain samples,
+4. builds a differentiable gate around that threshold, and
+5. penalizes anchored samples when they drift away from their closest
    prototype.
+
+This module therefore contains the logic that decides when the global semantic
+memory should influence a local adapter update.
 """
 
 from __future__ import annotations
@@ -22,16 +26,15 @@ import torch.nn.functional as F
 class GPADLoss(nn.Module):
     """Compute gated prototype anchoring for one mini-batch of embeddings.
 
-    The constructor stores the small group of knobs that shape the routing
-    behavior:
-    1. ``base_tau`` sets the minimum similarity required before uncertainty is
-       considered.
-    2. ``temp_gate`` controls how soft or sharp the final sigmoid gate becomes.
-    3. ``lambda_entropy`` determines how strongly uncertain assignments raise
-       the anchor threshold.
-    4. ``soft_assign_temp`` shapes the prototype-assignment distribution used in
-       the entropy calculation.
-    5. ``epsilon`` keeps the entropy terms numerically stable.
+    The constructor stores the small set of hyperparameters that govern when a
+    sample should trust the global bank:
+    1. ``base_tau`` is the similarity floor before uncertainty adjustment,
+    2. ``temp_gate`` controls how soft or sharp the sigmoid gate becomes,
+    3. ``lambda_entropy`` determines how strongly assignment uncertainty raises
+       the threshold,
+    4. ``soft_assign_temp`` shapes the prototype-assignment distribution used
+       in the entropy calculation, and
+    5. ``epsilon`` keeps all logarithms numerically stable.
     """
 
     def __init__(

@@ -1,11 +1,22 @@
-"""Expose the reusable building blocks behind the current pipeline.
+"""Expose the reusable components behind the current experiment pipeline.
 
-The top-level training file imports from ``src`` so the experiment can read
-like a high-level checklist:
-1. ``src.mae_with_adapter`` builds the frozen MAE backbone plus trainable adapters.
-2. ``src.loss`` defines GPAD, the federated prototype-anchoring loss.
-3. ``src.client`` handles client-side optimization and persistent local memory.
-4. ``src.server`` handles prototype merging and adapter aggregation on the server.
+The active repository workflow is split deliberately between one orchestration
+file and a small set of reusable modules:
+
+1. ``main.py`` owns the executable experiment flow, dataset plan, stage-wise
+   evaluation, plotting, and final checkpoint export.
+2. ``src.mae_with_adapter`` builds the frozen ViT-MAE backbone and injects the
+   trainable adapters used by both run modes.
+3. ``src.loss`` defines GPAD, the prototype-aware regularizer used only in the
+   federated path.
+4. ``src.client`` contains the client-side continual state, including local
+   training, local prototypes, and novelty buffers.
+5. ``src.server`` contains the server-side global state, including prototype
+   merging and adapter-weight aggregation.
+
+Importing from ``src`` gives the rest of the codebase one stable place to fetch
+the active algorithmic building blocks without duplicating implementation
+details.
 """
 
 from src.client import ClientManager, FederatedClient

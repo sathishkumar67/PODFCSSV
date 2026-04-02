@@ -1,18 +1,20 @@
-"""Implement the full client-side training and memory-update logic.
+"""Implement the full client-side training and local-memory update logic.
 
-This module is responsible for everything that happens on a federated client
-between two server synchronizations:
-1. Receive the newest global adapter weights.
-2. Run MAE reconstruction on the local mini-batches.
-3. Use GPAD only for samples that confidently match the global prototype bank.
-4. Route the remaining samples to either the persistent local bank or the
-   novelty buffer.
-5. Cluster the novelty buffer when it becomes large enough.
-6. Return the trainable adapter state and the updated local prototypes.
+This module holds the client behavior that makes the federated method truly
+continual. Between two server synchronizations each client:
 
-The key continual-learning detail is that the client does not reset its local
-prototype bank, novelty buffer, or optimizer state when the dataset changes.
-That persistent local memory is part of the current experiment design.
+1. receives the newest global adapter weights,
+2. trains on its current dataset with MAE reconstruction loss,
+3. uses GPAD only for embeddings that confidently match the shared global
+   prototype bank,
+4. routes the remaining embeddings through a persistent local prototype bank or
+   into a novelty buffer,
+5. clusters buffered novel embeddings when enough evidence accumulates, and
+6. returns the updated adapter payload and local prototypes to the server.
+
+The most important design detail is persistence: when the dataset changes, the
+client keeps its optimizer state, local prototypes, and novelty buffer instead
+of resetting them.
 """
 
 from __future__ import annotations
@@ -34,8 +36,9 @@ logger = logging.getLogger(__name__)
 def _empty_routing_stats() -> Dict[str, int]:
     """Create one fresh routing-statistics container.
 
-    The same keys are reused at the batch, epoch, and round levels so logging
-    stays consistent across the whole client training path.
+    The same keys are reused at the batch, epoch, and round levels so every
+    training summary reports local matches, novel samples, clustering events,
+    and prototype-growth events in a consistent format.
     """
     return {
         "local_matches": 0,
@@ -47,13 +50,18 @@ def _empty_routing_stats() -> Dict[str, int]:
 
 
 class FederatedClient:
-    """Represent one federated participant and its persistent local memory.
+    """Represent one federated participant and its persistent local state.
 
-    Each client owns:
-    1. Its own adapter-injected MAE copy.
-    2. Its own optimizer state.
-    3. A persistent local prototype bank.
-    4. A novelty buffer for embeddings that do not fit known memories yet.
+    Each client owns four stateful objects that survive dataset transitions:
+    1. its own adapter-injected MAE copy,
+    2. its own optimizer state,
+    3. a persistent local prototype bank, and
+    4. a novelty buffer for embeddings that do not match either the global bank
+       or the current local bank strongly enough.
+
+    The class is responsible for both local optimization and local memory
+    maintenance, so it is the main place where continual-learning behavior is
+    expressed on the client side.
     """
 
     def __init__(
@@ -172,12 +180,13 @@ class FederatedClient:
         """Train one full local epoch and return flat logging metrics.
 
         Each batch follows the same path:
-        1. Run MAE reconstruction.
-        2. Decide which samples are anchored to the global bank.
-        3. Apply GPAD only to the anchored subset.
-        4. Route the remaining samples through local-memory handling.
-        5. Step the optimizer once on the combined loss.
-        6. Accumulate JSON-friendly metrics for later analysis.
+        1. run one MAE forward pass and get both reconstruction loss and pooled
+           embeddings,
+        2. determine which samples are globally anchored,
+        3. apply GPAD only to the anchored subset,
+        4. route the remaining embeddings through the local-memory logic,
+        5. step the optimizer on the combined objective, and
+        6. accumulate JSON-friendly metrics for later analysis and plotting.
         """
         self.model.train()
 
@@ -284,12 +293,16 @@ class FederatedClient:
     def _route_non_anchored(self, embeddings: torch.Tensor) -> Dict[str, int]:
         """Route embeddings that were not anchored to the global bank.
 
-        The routing decision is:
-        1. Normalize the incoming embeddings.
-        2. If no local bank exists yet, send everything to the novelty buffer.
-        3. Otherwise compare each embedding with the local prototype bank.
-        4. EMA-update the best local prototype when the match is strong enough.
-        5. Send the rest into the novelty buffer for later clustering.
+        This method handles the local-memory side of the federated algorithm:
+        1. normalize the incoming embeddings,
+        2. if no local bank exists yet, send everything to the novelty buffer,
+        3. otherwise compare each embedding with the local prototype bank,
+        4. EMA-update the best local prototype when the match is strong enough,
+           and
+        5. send the rest into the novelty buffer for later clustering.
+
+        The method therefore decides whether a sample should reinforce existing
+        local knowledge or become evidence for a new local concept.
         """
         stats = _empty_routing_stats()
         if embeddings.size(0) == 0:
@@ -350,11 +363,11 @@ class FederatedClient:
         """Cluster the novelty buffer and merge or append the discovered centroids.
 
         This is the local memory-growth step:
-        1. Stack and normalize the buffered embeddings.
-        2. Run spherical K-means to form candidate centroids.
-        3. Merge centroids into similar local prototypes with EMA.
-        4. Append truly new centroids as brand-new local prototypes.
-        5. Clear the buffer once the update completes.
+        1. stack and normalize the buffered embeddings,
+        2. run spherical K-means to form candidate centroids,
+        3. merge centroids into similar local prototypes with EMA,
+        4. append truly new centroids as new local prototypes, and
+        5. clear the buffer once the update completes.
         """
         stats = _empty_routing_stats()
         if len(self.novelty_buffer) == 0:
@@ -421,13 +434,13 @@ class FederatedClient:
     ) -> torch.Tensor:
         """Extract current-dataset centroids and merge them into local memory.
 
-        The stage-start update is:
-        1. Extract embeddings for the full current dataset.
-        2. Normalize them on the unit sphere.
-        3. Run spherical K-means to obtain stage centroids.
-        4. Initialize the local bank if no memory exists yet.
-        5. Otherwise merge or append the new centroids so older prototypes are
-           preserved instead of being overwritten.
+        The first round of each new stage uses this helper so the client's
+        stored prototype memory is enriched with fresh concepts from the new
+        dataset instead of being replaced. The update path is:
+        1. extract embeddings for the full current dataset,
+        2. normalize them on the unit sphere,
+        3. run spherical K-means to obtain stage centroids, and
+        4. merge or append those centroids into the persistent local bank.
         """
         self.model.eval()
         feature_batches: List[torch.Tensor] = []
@@ -440,7 +453,12 @@ class FederatedClient:
 
         if not feature_batches:
             if self.local_prototypes is None:
-                self.local_prototypes = torch.empty(0, 0, device=self.device)
+                self.local_prototypes = torch.empty(
+                    0,
+                    0,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
             return self.local_prototypes
 
         embeddings = torch.cat(feature_batches, dim=0)
@@ -451,8 +469,6 @@ class FederatedClient:
             self.local_prototypes = centroids.detach().clone()
             return self.local_prototypes
 
-        # New stage centroids are merged into the existing local bank so the
-        # client keeps prototype memory from older datasets instead of resetting it.
         working_prototypes = F.normalize(self.local_prototypes.to(self.device), p=2, dim=1)
         centroids = F.normalize(centroids, p=2, dim=1)
 
@@ -525,11 +541,17 @@ class FederatedClient:
 
 
 class ClientManager:
-    """Own the client collection and orchestrate per-round local training.
+    """Own the client collection and orchestrate one federated round at a time.
 
-    The manager keeps the high-level training loop simple by handling client
-    creation, weight synchronization, local-epoch repetition, and parallel
-    execution when one usable GPU is available per client.
+    The main training loop delegates round-level coordination here so the code
+    in ``main.py`` can stay focused on the stage plan and the reporting logic.
+    The manager handles:
+    1. client creation,
+    2. adapter-weight synchronization,
+    3. local-epoch repetition,
+    4. per-round parallelism when the GPU topology matches the client count,
+       and
+    5. fallback sequential execution on CPU.
     """
 
     def __init__(

@@ -1,6 +1,7 @@
 """Attach residual adapters to the frozen ViT-MAE backbone.
 
-The same parameter-efficient recipe is reused across the whole repository:
+The repository reuses the same parameter-efficient recipe everywhere:
+
 1. load the pretrained MAE model,
 2. freeze the original backbone,
 3. insert lightweight residual adapters into the upper encoder blocks, and
@@ -26,10 +27,10 @@ class IBA_Adapter(nn.Module):
     """Apply one bottleneck-style residual update to a transformer block output.
 
     Each call follows the same sequence:
-    1. Down-project the hidden state into a smaller bottleneck space.
-    2. Apply the adapter non-linearity.
-    3. Project back to the original hidden size.
-    4. Add the adapter output back to the incoming hidden state.
+    1. down-project the hidden state into a smaller bottleneck space,
+    2. apply the adapter non-linearity,
+    3. project back to the original hidden size, and
+    4. add that adapter output back to the incoming hidden state.
 
     The up-projection is initialized at zero so training starts from the exact
     pretrained backbone behavior.
@@ -84,9 +85,9 @@ class ViTBlockWithAdapter(nn.Module):
     """Wrap one transformer block and insert an adapter after it.
 
     The wrapper keeps the external interface unchanged:
-    1. Run the original transformer block exactly as before.
-    2. Apply the adapter only to the hidden-state output.
-    3. Return the same structure expected by the Hugging Face model stack.
+    1. run the original transformer block exactly as before,
+    2. apply the adapter only to the hidden-state output, and
+    3. return the same structure expected by the Hugging Face model stack.
     """
 
     def __init__(self, original_block: nn.Module, adapter: IBA_Adapter) -> None:
@@ -127,14 +128,17 @@ def inject_adapters(
     model: PreTrainedModel,
     bottleneck_dim: int = 64,
 ) -> PreTrainedModel:
-    """Freeze the backbone and inject adapters into the upper half of the encoder.
+    """Freeze the backbone and inject adapters into the upper encoder layers.
 
     The helper edits the model in place:
-    1. Freeze every pretrained MAE parameter.
-    2. Locate the encoder stack inside the model.
-    3. Compute the midpoint of the stack.
-    4. Wrap every upper-half block with a residual adapter.
-    5. Leave only the new adapter parameters trainable.
+    1. freeze every pretrained MAE parameter,
+    2. locate the encoder stack inside the model,
+    3. compute the midpoint of that stack,
+    4. wrap every upper-half block with a residual adapter, and
+    5. leave only the new adapter parameters trainable.
+
+    This is the structural step that turns the pretrained MAE into the
+    parameter-efficient model used by both run modes.
     """
     logger.info("Injecting adapters with bottleneck_dim=%s", bottleneck_dim)
 

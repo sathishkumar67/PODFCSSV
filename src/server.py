@@ -1,10 +1,13 @@
 """Implement the server-side synchronization step of the federated pipeline.
 
-After every communication round the server has two jobs:
-1. Merge the client-local prototype payloads into the shared global prototype bank.
-2. Aggregate the client adapter updates into the next global adapter state.
+The server is responsible for the global state that is shared across clients.
+After every communication round it performs two coordinated updates:
 
-The merged prototypes and aggregated adapter weights are the only pieces of
+1. merge the client-local prototype payloads into the shared global prototype
+   bank, and
+2. aggregate the uploaded adapter weights into the next global adapter state.
+
+Those merged prototypes and aggregated adapter weights are the only pieces of
 state broadcast back to the clients for the next round.
 """
 
@@ -22,18 +25,21 @@ logger = logging.getLogger(__name__)
 class GlobalPrototypeBank:
     """Store the shared prototype memory used by all federated clients.
 
-    Each round updates the bank in a fixed order:
-    1. Normalize every incoming local prototype.
-    2. Bootstrap directly from the first non-empty round if the bank is empty.
-    3. Compare each later prototype against the current bank.
-    4. EMA-merge close matches.
-    5. Append genuinely new prototypes while capacity remains.
+    The bank follows a deterministic merge-or-add update rule:
+    1. normalize every incoming local prototype,
+    2. bootstrap directly from the first non-empty round if the bank is empty,
+    3. compare each later prototype against the current bank,
+    4. EMA-merge close matches, and
+    5. append genuinely new prototypes while capacity remains.
+
+    This class therefore acts as the compact global memory of the federated
+    method.
     """
 
     def __init__(
         self,
         embedding_dim: int = 768,
-        merge_threshold: float = 0.8,
+        merge_threshold: float = 0.85,
         ema_alpha: float = 0.1,
         device: str = "cpu",
         max_prototypes: Optional[int] = 50,
@@ -42,8 +48,14 @@ class GlobalPrototypeBank:
         self.merge_threshold = merge_threshold
         self.ema_alpha = ema_alpha
         self.device = torch.device(device)
+        self.dtype = torch.float32
         self.max_prototypes = max_prototypes
-        self.prototypes = torch.zeros(0, embedding_dim, device=self.device)
+        self.prototypes = torch.zeros(
+            0,
+            embedding_dim,
+            device=self.device,
+            dtype=self.dtype,
+        )
 
     @torch.no_grad()
     def merge_local_prototypes(
@@ -62,7 +74,7 @@ class GlobalPrototypeBank:
            bank capacity.
         """
         valid_prototypes = [
-            prototypes.to(self.device)
+            prototypes.to(device=self.device, dtype=self.dtype)
             for prototypes in local_protos_list
             if prototypes is not None and prototypes.numel() > 0
         ]
@@ -113,8 +125,9 @@ class GlobalPrototypeBank:
 class FederatedModelServer:
     """Aggregate the trainable adapter weights submitted by the clients.
 
-    Only the trainable adapter subset is aggregated, which keeps the
-    communication budget small and avoids touching the frozen MAE backbone.
+    Only the trainable adapter subset is aggregated. That keeps communication
+    small, leaves the frozen MAE backbone untouched, and makes the server state
+    align exactly with the parameter-efficient training design.
     """
 
     @torch.no_grad()
@@ -191,18 +204,19 @@ def run_server_round(
     client_payloads: List[Dict[str, Any]],
     current_global_weights: Dict[str, torch.Tensor],
     round_idx: int = 1,
-    server_model_ema_alpha: float = 0.1,
+    server_model_ema_alpha: float = 0.3,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Run the full server update for one communication round.
 
-    This helper keeps the full round logic in one place:
-    1. Merge the local prototype banks.
-    2. Average the client adapter weights.
-    3. Smooth the aggregated weights with optional server-side EMA.
-    4. Return both the updated global prototypes and the updated weights.
+    This helper keeps the entire server-side round logic in one place:
+    1. merge the local prototype banks,
+    2. average the uploaded client adapter weights,
+    3. smooth the resulting adapter state with server-side EMA, and
+    4. return both the updated global prototypes and the updated adapter state
+       that should be broadcast next.
     """
     if not client_payloads:
-        return torch.empty(0, 0), {}
+        return torch.empty(0, 0, dtype=torch.float32), {}
 
     local_prototypes = [
         payload["protos"]

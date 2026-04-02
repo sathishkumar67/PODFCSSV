@@ -1,7 +1,6 @@
 # Complete Pipeline Guide
 
-This guide summarizes the current executable workflow. When this guide and the
-code disagree, trust:
+This guide explains the current executable workflow used by the repository. If this guide and the code ever disagree, treat these files as the final source of truth:
 
 - `main.py`
 - `src/client.py`
@@ -9,37 +8,69 @@ code disagree, trust:
 - `src/loss.py`
 - `src/mae_with_adapter.py`
 
-## 1. One Entry Point
+## 1. Single Entry Point
 
 The repository now runs from a single file:
 
 - `main.py`
 
-Choose the behavior by setting `RUN_MODE` inside the file:
+Set `RUN_MODE` inside that file before launching the script:
 
 - `federated`
 - `baseline`
 
-## 2. Shared Model Recipe
+Run the pipeline with:
 
-Both modes follow the same backbone recipe:
+```bash
+python main.py
+```
 
-1. load `facebook/vit-mae-base`
-2. freeze the original MAE backbone
-3. inject residual adapters into the upper half of the encoder
-4. train through the current continual dataset stream
+The script does not expect a mode argument on the command line.
 
-Image preprocessing is:
+## 2. Shared Model Construction
 
-1. convert to RGB
-2. resize to `224 x 224`
-3. convert to tensor
+Both modes build the same representation backbone and only differ in how training is orchestrated afterward.
 
-No ImageNet normalization is used.
+The model recipe is:
 
-## 3. Benchmark Datasets
+1. load `facebook/vit-mae-base`,
+2. freeze the original MAE backbone,
+3. inject residual adapters into the upper half of the encoder,
+4. keep the continual-learning updates focused on those adapters.
 
-The reported benchmark datasets are:
+Current shared model values:
+
+- backbone: `facebook/vit-mae-base`
+- embedding dimension: `768`
+- adapter bottleneck dimension: `256`
+- image size: `224 x 224`
+- dtype: `torch.float32`
+
+## 3. Input Pipeline
+
+All datasets use the same preprocessing path:
+
+1. convert the image to RGB,
+2. resize it to `224 x 224`,
+3. convert it to a tensor.
+
+No ImageNet normalization is applied in the active workflow.
+
+The dataloaders use:
+
+- dynamic worker counts based on CPU availability,
+- `shuffle = True` for training,
+- persistent workers when multiprocessing is enabled,
+- prefetching with factor `4`,
+- pinned memory only when the run is actually on CUDA.
+
+## 4. Dataset Layout
+
+The continual stream is split into benchmark datasets and stress datasets.
+
+### Benchmark Datasets
+
+These datasets define the reported results:
 
 - `EuroSAT`
 - `GTSRB`
@@ -48,20 +79,30 @@ The reported benchmark datasets are:
 - `Oxford-IIIT Pet`
 - `FGVC Aircraft`
 
-Client benchmark schedule:
+Benchmark client schedules:
 
 - Client 0: `EuroSAT -> Food101 -> Oxford-IIIT Pet`
 - Client 1: `GTSRB -> Country211 -> FGVC Aircraft`
 
-## 4. Retention-Stress Stages
+### Stress Datasets
 
-Both modes use the same extra stress stages between benchmark stages and after
-the last benchmark stage:
+These datasets are inserted to create additional distribution shift without being part of the headline evaluation benchmark:
+
+- `CIFAR10`
+- `SVHN`
+- `STL10`
+- `CIFAR100`
+- `Flowers102`
+- `DTD`
+
+Stress client schedules:
 
 - Client 0: `CIFAR10 -> STL10 -> Flowers102`
 - Client 1: `SVHN -> CIFAR100 -> DTD`
 
-The full stage order is:
+### Full Stage Order
+
+The current interleaved order is:
 
 1. `EuroSAT` vs `GTSRB`
 2. `CIFAR10` vs `SVHN`
@@ -70,20 +111,22 @@ The full stage order is:
 5. `Oxford-IIIT Pet` vs `FGVC Aircraft`
 6. `Flowers102` vs `DTD`
 
-These stress datasets are used only to create extra forgetting pressure. They
-are not part of the reported benchmark evaluation set.
-
 ## 5. Split Policy
 
-### Benchmark datasets
+### Benchmark Datasets
 
-Benchmark training uses full train-side splits, except for `EuroSAT`, which is
-fixed to a deterministic `22000`-sample train split and a `5000`-sample held-out
-evaluation split.
+Benchmark training uses the full train-side split for each dataset except `EuroSAT`, which is handled through a fixed deterministic split:
 
-### Stress datasets
+- `EuroSAT`: `22000` train, `5000` held-out evaluation
+- `Food101`: full `train`, evaluated on `test`
+- `Oxford-IIIT Pet`: full `trainval`, evaluated on `test`
+- `GTSRB`: full `train`, evaluated on `test`
+- `Country211`: full `train`, evaluated on `valid`
+- `FGVC Aircraft`: full `trainval`, evaluated on `test`
 
-Stress datasets are merged into one self-supervised training pool:
+### Stress Datasets
+
+Stress datasets are treated as self-supervised training pools, so all available official splits are merged into one training dataset:
 
 - `CIFAR10`: `train + test`
 - `STL10`: `train + test + unlabeled`
@@ -92,51 +135,72 @@ Stress datasets are merged into one self-supervised training pool:
 - `CIFAR100`: `train + test`
 - `DTD`: `train + val + test`
 
-## 6. Training Configuration
+## 6. Shared Training Defaults
 
-Current shared training defaults:
+The current common training defaults are:
 
 - `local_epochs = 1`
 - `rounds_per_dataset = 3`
 - `batch_size = 96`
 - `client_lr = 1e-4`
 - `client_weight_decay = 0.05`
+- `merge_threshold = 0.85`
+- `server_ema_alpha = 0.1`
+- `server_model_ema_alpha = 0.3`
+- `k_init_prototypes = 20`
+
+Current GPAD values:
+
+- `gpad_base_tau = 0.85`
+- `gpad_temp_gate = 0.1`
+- `gpad_lambda_entropy = 0.2`
+- `gpad_soft_assign_temp = 0.1`
+- `lambda_proto = 0.1`
 
 ## 7. Federated Mode
 
-In `RUN_MODE = "federated"`, `main.py`:
+When `RUN_MODE = "federated"`, the pipeline behaves as follows:
 
-1. builds one shared adapter-injected MAE model
-2. creates two client copies
-3. loads one dataset per client for the current stage
-4. optimizes MAE reconstruction plus GPAD
-5. keeps local prototypes and novelty buffers across dataset transitions
-6. uploads only trainable adapter weights and local prototypes
-7. merges global prototypes and aggregates adapter weights on the server
-8. broadcasts the updated global state back to the clients
+1. Build one shared adapter-injected MAE backbone.
+2. Create two client copies.
+3. Load one dataset per client for the current stage.
+4. Train each client locally for the configured round and epoch budget.
+5. Use GPAD only for samples whose embeddings are confidently anchored to the global prototype bank.
+6. Route the remaining embeddings through each client's local prototype bank and novelty buffer.
+7. Upload only trainable adapter weights and local prototypes.
+8. Merge prototypes and aggregate adapter weights on the server.
+9. Smooth the aggregated adapter weights with server-side EMA.
+10. Broadcast the updated adapter weights and global prototype bank back to the clients.
+
+Important continual-learning state that persists across dataset changes on each client:
+
+- optimizer state,
+- local prototype bank,
+- novelty buffer.
 
 ## 8. Baseline Mode
 
-In `RUN_MODE = "baseline"`, `main.py`:
+When `RUN_MODE = "baseline"`, the pipeline keeps the same stage stream but removes all federated machinery:
 
-1. builds the same adapter-injected MAE model
-2. walks through the exact same benchmark-plus-stress stage stream sequentially
-3. optimizes MAE reconstruction only
-4. preserves model and optimizer state across dataset transitions
-5. does not use federation, GPAD, or prototype communication
+1. Build the same adapter-injected MAE backbone.
+2. Walk through the exact same benchmark-plus-stress stage stream sequentially.
+3. Optimize reconstruction loss only.
+4. Preserve the model weights and optimizer state across dataset transitions.
+5. Skip GPAD, prototype exchange, and server aggregation.
 
 ## 9. Stage-Wise Evaluation
 
-After every stage, both modes evaluate the benchmark datasets seen so far in two
-separate passes.
+After every stage, both modes evaluate the benchmark datasets seen so far through one stage-wise linear-probe pass.
 
-### Linear probe
+The evaluation path is:
 
-1. freeze the encoder
-2. disable MAE masking so full images go through the encoder
-3. extract frozen features
-4. train one linear classifier per dataset
-5. evaluate on the held-out split
+1. load the benchmark train split for each seen dataset,
+2. load the corresponding held-out reporting split,
+3. temporarily disable MAE masking so the encoder processes the full image,
+4. extract frozen encoder embeddings,
+5. train a linear classifier on those embeddings,
+6. evaluate on the held-out split,
+7. update the retention summaries.
 
 Current linear-probe settings:
 
@@ -145,27 +209,9 @@ Current linear-probe settings:
 - learning rate: `1e-2`
 - weight decay: `1e-4`
 
-### Partial fine-tuning
+## 10. Retention Metrics
 
-1. start from the current checkpoint state
-2. create a fresh dataset-specific model
-3. freeze the lower half of the encoder
-4. freeze adapters in the upper half
-5. unfreeze the original transformer weights in the upper half
-6. add a linear classification head
-7. train on the dataset train split
-8. evaluate on the held-out split
-
-Current partial-fine-tuning settings:
-
-- epochs: `3`
-- batch size: `64`
-- learning rate: `1e-4`
-- weight decay: `1e-4`
-
-## 10. Tracked Metrics
-
-Both evaluation streams track:
+The stage-wise linear-probe evaluation records:
 
 - per-dataset accuracy
 - average benchmark accuracy
@@ -176,12 +222,14 @@ Both evaluation streams track:
 - per-dataset backward transfer
 - average backward transfer
 
-The federated training history also tracks:
+Federated training history also records:
 
-- total loss
 - MAE loss
 - GPAD loss
-- anchor, local-match, and novel fractions
+- total loss
+- anchor fraction
+- local-match fraction
+- novel fraction
 - global prototype count
 - client prototype counts
 - upload bytes
@@ -192,15 +240,28 @@ The federated training history also tracks:
 
 The run writes:
 
-- per-round checkpoints
-- final checkpoint
-- JSON training history
+- one final checkpoint
+- JSON histories
 - training summary plots
-- linear-probe retention plots
-- partial-fine-tuning retention plots
+- stage-wise retention heatmaps and curves
+- final forgetting bar plots
 
-## 12. Runtime Safety
+There are no mid-run checkpoints in the current workflow.
 
-Before using CUDA, the runtime validates that a small CUDA kernel can actually
-execute. If CUDA is reported but unusable, the code falls back early instead of
-failing later inside training.
+## 12. Device and Numeric Safety
+
+The current code keeps the active math path in `float32`:
+
+- model inputs are moved to the configured device with the configured dtype,
+- server aggregation aligns tensors before averaging,
+- prototype-bank operations use explicit float32 tensors,
+- linear-probe evaluation uses the same dtype-aware device placement.
+
+CUDA is only used after a real runtime smoke test confirms that kernels can execute on the visible GPU.
+
+## 13. Default Output Directories
+
+The current output folders are:
+
+- federated: `multidataset_outputs_2client`
+- baseline: `baseline_outputs`

@@ -1,8 +1,8 @@
 # Contributing to PODFCSSV
 
-This guide reflects the current single-file experiment setup.
+This guide reflects the current repository workflow. The active pipeline is intentionally centralized in `main.py`, so contributions should preserve that single-source-of-truth design unless a deliberate refactor is planned.
 
-## Setup
+## Environment Setup
 
 ```bash
 git clone https://github.com/sathishkumar67/PODFCSSV.git
@@ -28,22 +28,34 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-## Current Entry Point
+## Current Code Layout
 
-The repository now uses a single executable file:
+The active files are:
 
-- `main.py`
+- `main.py`: full experiment orchestration, dataset loading, training, linear-probe evaluation, plotting, and final checkpoint export
+- `src/mae_with_adapter.py`: frozen-backbone adapter injection
+- `src/loss.py`: GPAD loss
+- `src/client.py`: client-side continual state, local training, and local prototype maintenance
+- `src/server.py`: global prototype merging and adapter aggregation
 
-Set `RUN_MODE` in `main.py` to one of:
+## Run Modes
+
+The repository does not currently use a command-line mode flag. Instead, set `RUN_MODE` inside `main.py`:
 
 - `federated`
 - `baseline`
 
-The script does not take a command-line mode argument.
+Launch the run with:
+
+```bash
+python main.py
+```
 
 ## Current Dataset Design
 
-Benchmark datasets:
+### Benchmark Datasets
+
+These datasets define the reported continual-learning benchmark:
 
 - `EuroSAT`
 - `GTSRB`
@@ -52,7 +64,14 @@ Benchmark datasets:
 - `Oxford-IIIT Pet`
 - `FGVC Aircraft`
 
-Retention-stress datasets used by both modes:
+Benchmark schedule:
+
+- Client 0: `EuroSAT -> Food101 -> Oxford-IIIT Pet`
+- Client 1: `GTSRB -> Country211 -> FGVC Aircraft`
+
+### Stress Datasets
+
+These datasets are inserted between benchmark stages and after the final benchmark stage to strengthen forgetting pressure:
 
 - `CIFAR10`
 - `SVHN`
@@ -61,7 +80,12 @@ Retention-stress datasets used by both modes:
 - `Flowers102`
 - `DTD`
 
-The full stage order is:
+Stress schedule:
+
+- Client 0: `CIFAR10 -> STL10 -> Flowers102`
+- Client 1: `SVHN -> CIFAR100 -> DTD`
+
+Full stage order:
 
 1. `EuroSAT` vs `GTSRB`
 2. `CIFAR10` vs `SVHN`
@@ -72,10 +96,18 @@ The full stage order is:
 
 ## Split Rules
 
-Benchmark training uses full train-side splits, except for `EuroSAT`, which is
-fixed to `22000` training samples and `5000` held-out evaluation samples.
+Benchmark training uses the full train-side split for each dataset except `EuroSAT`, which uses a fixed deterministic `22000 / 5000` train-eval split.
 
-Stress datasets are merged into one self-supervised training pool per dataset:
+Current benchmark evaluation splits:
+
+- `EuroSAT`: fixed held-out `5000`
+- `Food101`: `test`
+- `Oxford-IIIT Pet`: `test`
+- `GTSRB`: `test`
+- `Country211`: `valid`
+- `FGVC Aircraft`: `test`
+
+Stress datasets are merged into a single self-supervised training pool per dataset:
 
 - `CIFAR10`: `train + test`
 - `STL10`: `train + test + unlabeled`
@@ -84,25 +116,42 @@ Stress datasets are merged into one self-supervised training pool per dataset:
 - `CIFAR100`: `train + test`
 - `DTD`: `train + val + test`
 
-## Development Rules
+## Behavioral Rules for Contributions
 
-- keep `main.py` as the single source of truth for training and built-in evaluation
-- keep the benchmark dataset list download-friendly
-- keep the stress-dataset stream aligned between baseline and federated runs when making forgetting comparisons
+When editing the pipeline, preserve these expectations unless the change is intentional and fully documented:
+
+- keep `main.py` as the active orchestration entrypoint
+- keep the benchmark and stress streams aligned between baseline and federated modes when comparing forgetting
+- keep the active numeric path in `float32`
+- keep device transfers explicit and avoid introducing silent mixed-device math
+- keep adapter-only communication in the federated path
+- keep the benchmark schedule download-friendly for a fresh environment
 - do not reintroduce manual-setup datasets into the default publishable schedule
-- update docs whenever the benchmark, stage schedule, tracked metrics, or split policy changes
-- keep Python docstrings and inline comments aligned with the exact execution flow in `main.py`
-- preserve the two stage-wise evaluation passes: linear probe first, partial fine-tuning second
+- update the docs whenever the stage order, split policy, evaluation logic, or tracked metrics change
+- keep Python docstrings and high-signal inline comments aligned with the current execution flow
+
+## Evaluation Expectations
+
+The active pipeline uses only stage-wise linear probing for retention analysis. Contributions should not reintroduce older evaluation branches unless they are intentionally restored everywhere.
+
+The current evaluation flow is:
+
+1. freeze the encoder,
+2. disable MAE masking so full images are used,
+3. extract frozen features for the seen benchmark datasets,
+4. train one linear probe per dataset,
+5. evaluate on the held-out split,
+6. update forgetting and retention summaries.
 
 ## Validation
 
-Run at least:
+At minimum, run:
 
 ```bash
 python -m py_compile main.py src\__init__.py src\client.py src\server.py src\loss.py src\mae_with_adapter.py
 ```
 
-If formatting tools are installed:
+If formatting and lint tools are available:
 
 ```bash
 ruff check .
@@ -112,10 +161,10 @@ ruff format .
 ## Pull Requests
 
 1. Create a focused branch from `main`.
-2. Keep changes scoped to one pipeline change when possible.
-3. Explain the experiment impact clearly.
-4. Include the validation commands you ran.
-5. Update documentation if behavior changed.
+2. Keep each change scoped to one pipeline improvement when possible.
+3. Explain the experimental impact clearly in the PR description.
+4. List the validation commands you ran.
+5. Update documentation whenever the behavior changed.
 
 ## License
 

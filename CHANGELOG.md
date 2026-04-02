@@ -12,7 +12,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Single Entrypoint Workflow** (`main.py`): The repository now supports both the federated experiment and the single-model baseline from one file via a `RUN_MODE` switch.
 - **Retention-Stress Stages** (`main.py`): Added interleaved stress datasets, including the later Flowers102 and DTD stress stage, so retention can be analyzed under stronger shifts without adding those datasets to the default benchmark evaluation set.
-- **Two Evaluation Views** (`main.py`): Stage-wise training now measures both frozen-feature linear-probe retention and dataset-wise partial-fine-tuning transfer quality after every stage.
 - **Step-by-Step Code Guides** (`main.py`, `src/*.py`): Active Python modules now use refreshed docstrings and comments that describe the current single-file training, communication, and evaluation workflow step by step.
 
 ### Changed
@@ -20,13 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Full-Split Training Policy** (`main.py`): Benchmark datasets now use their full train-side splits, `EuroSAT` uses a fixed `22000/5000` train-eval split, and stress datasets merge all available official splits into one self-supervised training pool.
 - **Stress-Stream Fairness** (`main.py`): The unified baseline now trains through the same stress-dataset stream as the federated mode, while benchmark reporting still excludes those stress datasets.
 - **Single-File Workflow** (`main.py`): Training-time forgetting evaluation now lives inside the same file as the training modes, and the standalone evaluation entrypoint has been removed from the active pipeline.
-- **Documentation Refresh** (`README.md`, `CONTRIBUTING.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Repository documentation now reflects the current full-split training policy, the benchmark-plus-stress stage order, and the dual evaluation pipeline.
+- **Linear-Probe-Only Retention Evaluation** (`main.py`): The active stage-wise evaluation path now uses only frozen-feature linear probing, with partial fine-tuning removed from the current workflow and docs.
+- **Final-Only Checkpointing** (`main.py`): Mid-run checkpoint saves have been removed so checkpoints now represent completed experiments rather than partial training snapshots.
+- **Documentation Refresh** (`README.md`, `CONTRIBUTING.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Repository documentation now reflects the current full-split training policy, the benchmark-plus-stress stage order, the linear-probe-only evaluation flow, and the float32/device rules used by the active pipeline.
 
 ### Fixed
 - **CUDA Runtime Validation** (`main.py`): The runtime now validates that CUDA can execute a small kernel before treating a GPU as usable, preventing deep training failures on incompatible CUDA environments.
 - **Download-Friendly Default Schedule** (`main.py`): The default benchmark now rejects datasets with known manual-download caveats so the publishable setup stays reproducible.
 - **Stage-Start Local Prototype Preservation** (`src/client.py`, `main.py`): Stage-initial prototype extraction now enriches the existing client-local prototype bank instead of overwriting it, so local memory truly persists across dataset transitions.
 - **Runtime Dependencies** (`requirements.txt`, `pyproject.toml`): Added `scipy` so the default `SVHN` and `Flowers102` dataset paths install cleanly in a fresh environment.
+- **CPU Data-Loading Consistency** (`main.py`): Federated mode now disables pinned memory on CPU the same way baseline mode already did, so both modes follow the same host-side data-loading behavior off CUDA.
+- **Country211 Evaluation Split** (`main.py`): The benchmark now evaluates `Country211` on its official validation split instead of reusing the test split.
 
 ## [0.6.0] - 2026-03-14
 

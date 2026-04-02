@@ -1,19 +1,26 @@
-"""Run the complete current experiment pipeline from one file.
+"""Run the full active PODFCSSV experiment pipeline from one file.
 
-This module is the active experiment entrypoint for the repository. It owns the
-entire paper-facing workflow:
-1. ``RUN_MODE = "federated"`` launches the proposed two-client GPAD training
-   loop with prototype exchange and server-side adapter aggregation.
-2. ``RUN_MODE = "baseline"`` launches the reconstruction-only continual
-   baseline over the same benchmark-plus-stress stage order.
-3. Benchmark stages use full train-side splits, with `EuroSAT` handled by a
-   fixed deterministic `22000/5000` train-eval split.
-4. Stress stages use merged self-supervised pools built from all official
-   splits of each stress dataset.
-5. After every stage, the benchmark datasets seen so far are evaluated twice:
-   first by frozen-feature linear probing and then by fresh partial fine-tuning.
-6. Round checkpoints, final checkpoints, JSON histories, communication stats,
-   forgetting summaries, and plots are all emitted from this file.
+This module is intentionally the executable source of truth for the repository.
+It keeps the entire paper-facing workflow in one place so the current behavior
+can be audited without following a chain of entrypoints.
+
+The high-level flow is:
+1. read ``RUN_MODE`` and decide whether to run the federated method or the
+   sequential baseline,
+2. resolve the real execution device and keep the active numeric path in
+   ``torch.float32``,
+3. build the shared adapter-injected ViT-MAE backbone,
+4. construct the benchmark-plus-stress continual stage plan,
+5. train through that stage stream while preserving the correct continual state
+   for the selected mode,
+6. after each stage, evaluate the benchmark datasets seen so far through
+   frozen-feature linear probing,
+7. summarize retention metrics and render plots, and
+8. save one final checkpoint together with JSON histories at the end.
+
+The file therefore owns configuration, dataset loading, training loops,
+aggregation, retention analysis, plotting, and final export for the active
+workflow.
 """
 
 from __future__ import annotations
@@ -63,24 +70,26 @@ CONFIG: Dict[str, Any] = {
     "gpu_count": 0,
     "device": "cpu",
     "dtype": torch.float32,
-    "num_workers": 2,
     "pin_memory": True,
     "dataloader_shuffle": True,
+    "dataloader_persistent_workers": True,
+    "dataloader_prefetch_factor": 4,
+    "cudnn_benchmark": True,
     "pretrained_model_name": "facebook/vit-mae-base",
     "embedding_dim": 768,
     "image_size": 224,
     "adapter_bottleneck_dim": 256,
     "merge_threshold": 0.85,
     "server_ema_alpha": 0.1,
-    "server_model_ema_alpha": 0.1,
+    "server_model_ema_alpha": 0.3,
     "max_global_prototypes": 2000,
-    "gpad_base_tau": 0.8,
-    "gpad_temp_gate": 0.2,
-    "gpad_lambda_entropy": 0.3,
-    "gpad_soft_assign_temp": 0.07,
+    "gpad_base_tau": 0.85,
+    "gpad_temp_gate": 0.1,
+    "gpad_lambda_entropy": 0.2,
+    "gpad_soft_assign_temp": 0.1,
     "gpad_epsilon": 1e-8,
-    "lambda_proto": 0.01,
-    "k_init_prototypes": 50,
+    "lambda_proto": 0.1,
+    "k_init_prototypes": 20,
     "client_local_update_threshold": 0.85,
     "client_local_ema_alpha": 0.05,
     "novelty_buffer_size": 256,
@@ -95,26 +104,10 @@ MULTI_DATASET_CONFIG: Dict[str, Any] = {
     **CONFIG,
     "num_clients": 2,
     "rounds_per_dataset": 3,
-    "num_workers": 2,
     "linear_eval_batch_size": 256,
     "linear_eval_epochs": 5,
     "linear_eval_lr": 1e-2,
     "linear_eval_weight_decay": 1e-4,
-    "linear_eval_num_workers": 2,
-    "linear_eval_train_samples": None,
-    "linear_eval_test_samples": None,
-    "min_linear_eval_train_samples": 0,
-    "min_linear_eval_test_samples": 0,
-    "partial_eval_batch_size": 64,
-    "partial_eval_epochs": 3,
-    "partial_eval_lr": 1e-4,
-    "partial_eval_weight_decay": 1e-4,
-    "partial_eval_num_workers": 2,
-    "partial_eval_train_samples": None,
-    "partial_eval_test_samples": None,
-    "min_partial_eval_train_samples": 0,
-    "min_partial_eval_test_samples": 0,
-    "max_global_prototypes": 2000,
     "save_dir": "multidataset_outputs_2client",
 }
 
@@ -122,12 +115,6 @@ BASELINE_CONFIG: Dict[str, Any] = {
     **MULTI_DATASET_CONFIG,
     "num_clients": 1,
     "save_dir": "baseline_outputs",
-    "batch_size": 96,
-    "num_workers": 4,
-    "pin_memory": True,
-    "dataloader_persistent_workers": True,
-    "dataloader_prefetch_factor": 4,
-    "cudnn_benchmark": True,
 }
 
 EUROSAT_TRAIN_SPLIT_SAMPLES = 22000
@@ -233,11 +220,15 @@ def get_usable_cuda_device_count() -> int:
 
 
 def resolve_runtime_config(config: Dict[str, Any]) -> None:
-    """Populate runtime device fields only after a real CUDA smoke test.
+    """Resolve the real execution device for the current run.
 
-    The training code does not trust ``torch.cuda.is_available()`` alone. It
-    first checks whether a tiny kernel can run, then records the usable GPU
-    count and chooses either CUDA or CPU for the rest of the run.
+    The code does not rely on ``torch.cuda.is_available()`` alone because some
+    environments report CUDA but still fail once the first real kernel is
+    launched. This helper performs the repository's safety check:
+    1. count the visible CUDA devices,
+    2. run a tiny convolution on each one,
+    3. keep only devices that actually execute that kernel, and
+    4. fall back to CPU when none of them pass.
     """
     usable_gpu_count = get_usable_cuda_device_count()
     if usable_gpu_count > 0:
@@ -315,6 +306,20 @@ def prepare_output_dirs(save_dir: str) -> Dict[str, Path]:
     }
 
 
+def resolve_worker_count() -> int:
+    """Choose one runtime worker count from the available CPU resources.
+
+    The current pipeline derives dataloader workers from the host CPU instead
+    of hard-coding separate values for training and evaluation. The rule is
+    intentionally simple:
+    1. read the visible CPU count,
+    2. reserve one core for the main process, and
+    3. keep at least one worker so the loaders remain asynchronous.
+    """
+    cpu_count = os.cpu_count() or 1
+    return max(1, cpu_count - 1)
+
+
 def build_base_model(config: Dict[str, Any]) -> nn.Module:
     """Build the shared adapter-injected MAE backbone used by all modes.
 
@@ -381,11 +386,17 @@ def save_checkpoint(
     is_final: bool = False,
     include_training_history: bool = True,
 ) -> Path:
-    """Save one checkpoint with trainable weights and optional run metadata.
+    """Save the final experiment snapshot in the repository checkpoint format.
 
-    The checkpoint format is shared across the unified pipeline so later
-    analysis can always recover the selected model preset, the trainable state,
-    and the optional prototype bank from the same schema.
+    The active workflow writes checkpoints only after the whole run completes.
+    Each saved file contains:
+    1. the final round index,
+    2. the trainable adapter state,
+    3. the serialized runtime config, and
+    4. the optional global prototype bank for federated runs.
+
+    The saved payload is intended for later analysis and downstream evaluation
+    of the finished run rather than for exact mid-training crash recovery.
     """
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = {
@@ -487,10 +498,15 @@ def print_round_summary(
 
 
 def initialize_history() -> Dict[str, Any]:
-    """Create the federated history structure used across training and plotting.
+    """Create the federated history structure used across the whole run.
 
-    The history keeps round-wise optimization metrics together with the later
-    stage-wise evaluation summaries so JSON files and plots stay synchronized.
+    The history dictionary stores two kinds of information:
+    1. round-wise optimization and communication metrics collected during
+       federated training, and
+    2. stage-wise linear-probe retention summaries collected after each stage.
+
+    Keeping both views in one structure ensures that JSON exports and plots
+    stay synchronized.
     """
     return {
         "round_ids": [],
@@ -510,7 +526,6 @@ def initialize_history() -> Dict[str, Any]:
         "stage_kinds": [],
         "used_for_linear_probe": [],
         "stage_evaluations": [],
-        "partial_finetune_stage_evaluations": [],
         "client_results": [],
     }
 
@@ -673,8 +688,6 @@ def build_baseline_stage_plan() -> List[Dict[str, Any]]:
     baseline_stage_plan: List[Dict[str, Any]] = []
 
     for stage_spec in federated_stage_plan:
-        # The baseline follows the identical stage stream, but one shared model
-        # means the per-client datasets must be replayed sequentially.
         for client_index in sorted(stage_spec["datasets"]):
             baseline_stage_plan.append(
                 {
@@ -848,20 +861,25 @@ def load_named_dataset(
     min_samples: Optional[int] = None,
     merge_all_training_splits: bool = False,
 ) -> torch.utils.data.Dataset:
-    """Load one named dataset using the exact split rules of the active pipeline.
+    """Load one dataset exactly the way the current pipeline expects it.
 
-    This helper keeps all split decisions in one place so training and
-    evaluation cannot drift apart:
-    1. Benchmark datasets load their official train-side split in full.
-    2. `EuroSAT` uses the repository's deterministic `22000/5000` split.
-    3. Stress datasets can merge all official splits into one self-supervised
-       pool when ``merge_all_training_splits=True``.
-    4. Optional deterministic sample shaping is applied only when explicitly requested.
+    All split policy decisions live here so the training and evaluation paths do
+    not drift apart over time.
+
+    The rules are:
+    1. benchmark datasets use their normal train-side split in full,
+    2. ``EuroSAT`` is handled as a fixed deterministic ``22000 / 5000`` split,
+    3. stress datasets may merge all official splits into one self-supervised
+       training pool when ``merge_all_training_splits`` is enabled, and
+    4. optional deterministic sample shaping is applied only when an explicit
+       cap or minimum is requested by the caller.
     """
     transform = build_dataset_transform(image_size)
     root = Path(data_root) / "multidataset" / dataset_name
 
     if train and merge_all_training_splits:
+        # Stress datasets are used as broad self-supervised training pools, so
+        # the training path intentionally consumes every official split they expose.
         if dataset_name == "cifar10":
             dataset = ConcatDataset(
                 [
@@ -994,7 +1012,7 @@ def load_named_dataset(
     elif dataset_name == "country211":
         dataset = datasets.Country211(
             root=str(root),
-            split="train" if train else "test",
+            split="train" if train else "valid",
             download=True,
             transform=transform,
         )
@@ -1118,11 +1136,15 @@ def load_named_evaluation_dataset(
     max_samples: Optional[int] = None,
     min_samples: Optional[int] = None,
 ) -> torch.utils.data.Dataset:
-    """Load the held-out split used by both stage-wise evaluation passes.
+    """Load the held-out split used by the stage-wise benchmark evaluation.
 
-    Most benchmark datasets have one official test split. The remaining special
-    cases are handled here so linear probing and partial fine-tuning always
-    report against the same held-out data.
+    The reporting path is centralized here so all retention metrics are based
+    on one consistent split policy. The current rules are:
+    1. reuse the repository's fixed `EuroSAT` held-out split,
+    2. use the official held-out split for datasets that already define one,
+    3. use `Country211` validation rather than test in the active benchmark,
+       and
+    4. keep any special merge logic for held-out reporting in one place.
     """
     transform = build_dataset_transform(image_size)
     root = Path(data_root) / "multidataset" / dataset_name
@@ -1196,16 +1218,33 @@ def create_standard_dataloader(
     num_workers: int,
     pin_memory: bool,
     shuffle: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
 ) -> DataLoader:
-    """Create a standard dataloader using the shared project defaults."""
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=False,
-    )
+    """Create one dataloader using the current project-wide loading policy.
+
+    This helper keeps the low-level loading behavior aligned across training
+    and evaluation:
+    1. respect the caller's dataset, batch size, and shuffle policy,
+    2. use the resolved runtime worker count,
+    3. enable pinned memory only when the runtime configuration says it is
+       useful,
+    4. keep worker processes alive between batches when multiprocessing is
+       enabled, and
+    5. apply the configured prefetch depth.
+    """
+    loader_kwargs: Dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "drop_last": False,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(**loader_kwargs)
 
 
 def _iter_mask_ratio_holders(model: nn.Module) -> List[Any]:
@@ -1295,7 +1334,10 @@ def collect_labeled_embeddings(
         label_batches.append(torch.as_tensor(labels, dtype=torch.long).cpu())
 
     if not feature_batches:
-        return torch.empty(0, 0), torch.empty(0, dtype=torch.long)
+        return (
+            torch.empty(0, 0, dtype=dtype),
+            torch.empty(0, dtype=torch.long),
+        )
 
     return torch.cat(feature_batches, dim=0), torch.cat(label_batches, dim=0)
 
@@ -1319,146 +1361,6 @@ def remap_labels_to_contiguous(
     return remapped_train, remapped_test, len(unique_labels)
 
 
-def extract_dataset_labels(dataset: torch.utils.data.Dataset) -> List[int]:
-    """Return labels from a dataset, subset, or concatenation in a uniform form."""
-    if isinstance(dataset, Subset):
-        base_labels = extract_dataset_labels(dataset.dataset)
-        return [int(base_labels[index]) for index in dataset.indices]
-
-    if isinstance(dataset, ConcatDataset):
-        labels: List[int] = []
-        for child_dataset in dataset.datasets:
-            labels.extend(extract_dataset_labels(child_dataset))
-        return labels
-
-    for attribute_name in ("targets", "labels", "_labels"):
-        if hasattr(dataset, attribute_name):
-            labels = getattr(dataset, attribute_name)
-            if isinstance(labels, torch.Tensor):
-                return [int(label) for label in labels.tolist()]
-            return [int(label) for label in list(labels)]
-
-    for attribute_name in ("samples", "_samples"):
-        if hasattr(dataset, attribute_name):
-            samples = getattr(dataset, attribute_name)
-            if samples:
-                return [int(sample[1]) for sample in samples]
-
-    labels = []
-    for dataset_index in range(len(dataset)):
-        sample = dataset[dataset_index]
-        if not isinstance(sample, (list, tuple)) or len(sample) < 2:
-            raise ValueError("Expected labeled datasets to return image-label tuples.")
-        labels.append(int(sample[1]))
-    return labels
-
-
-class LabelMappedDataset(torch.utils.data.Dataset):
-    """Wrap one labeled dataset and remap labels to a contiguous class range."""
-
-    def __init__(self, dataset: torch.utils.data.Dataset, label_mapping: Dict[int, int]) -> None:
-        self.dataset = dataset
-        self.label_mapping = label_mapping
-
-    def __len__(self) -> int:
-        return len(self.dataset)
-
-    def __getitem__(self, index: int) -> Tuple[Any, int]:
-        sample = self.dataset[index]
-        if not isinstance(sample, (list, tuple)) or len(sample) < 2:
-            raise ValueError("Expected labeled datasets to return image-label tuples.")
-        image, label = sample[0], int(sample[1])
-        return image, self.label_mapping[label]
-
-
-def build_label_mapping(
-    train_dataset: torch.utils.data.Dataset,
-    test_dataset: torch.utils.data.Dataset,
-) -> Dict[int, int]:
-    """Create one stable label map shared by the train and held-out splits."""
-    train_labels = extract_dataset_labels(train_dataset)
-    test_labels = extract_dataset_labels(test_dataset)
-    unique_labels = sorted(set(train_labels) | set(test_labels))
-    return {
-        original_label: new_label
-        for new_label, original_label in enumerate(unique_labels)
-    }
-
-
-def configure_partial_finetune_encoder(model: nn.Module) -> None:
-    """Freeze lower blocks and adapters while reopening upper transformer blocks.
-
-    The transfer protocol follows the agreed evaluation rule:
-    1. Keep the lower half of the encoder frozen.
-    2. In the upper half, keep adapter weights frozen.
-    3. Unfreeze the original transformer-block weights in that upper half.
-    4. Keep the MAE decoder frozen because transfer uses encoder features only.
-    """
-    for parameter in model.parameters():
-        parameter.requires_grad = False
-
-    if not hasattr(model, "vit") or not hasattr(model.vit, "encoder"):
-        raise AttributeError("Expected a ViT-MAE encoder stack for partial fine-tuning.")
-
-    encoder_layers = model.vit.encoder.layer
-    inject_start_layer = len(encoder_layers) // 2
-
-    for layer_index, layer in enumerate(encoder_layers):
-        if layer_index < inject_start_layer:
-            continue
-
-        if hasattr(layer, "adapter") and hasattr(layer, "original_block"):
-            for parameter in layer.original_block.parameters():
-                parameter.requires_grad = True
-            for parameter in layer.adapter.parameters():
-                parameter.requires_grad = False
-        else:
-            for parameter in layer.parameters():
-                parameter.requires_grad = True
-
-    if hasattr(model.vit, "layernorm"):
-        for parameter in model.vit.layernorm.parameters():
-            parameter.requires_grad = True
-
-
-class PartialFinetuneClassifier(nn.Module):
-    """Couple one partially unfrozen MAE encoder with a dataset-specific head."""
-
-    def __init__(self, encoder_model: nn.Module, num_classes: int) -> None:
-        super().__init__()
-        self.encoder_model = encoder_model
-        hidden_size = int(getattr(encoder_model.config, "hidden_size"))
-        self.classifier = nn.Linear(hidden_size, num_classes)
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        encoder_outputs = forward_encoder_without_mask(
-            model=self.encoder_model,
-            images=images,
-            output_hidden_states=False,
-        )
-        pooled_features = pool_model_hidden_states(encoder_outputs.last_hidden_state)
-        return self.classifier(pooled_features)
-
-
-def build_partial_finetune_model(
-    reference_model: nn.Module,
-    config: Dict[str, Any],
-) -> nn.Module:
-    """Build one fresh transfer-evaluation model from the current checkpoint."""
-    evaluation_config = dict(config)
-    evaluation_config["device"] = "cpu"
-    evaluation_config["dtype"] = torch.float32
-    evaluation_config["log_model_ready"] = False
-    evaluation_model = build_base_model(evaluation_config)
-    evaluation_model.load_state_dict(
-        extract_trainable_state_dict(reference_model),
-        strict=False,
-    )
-    configure_partial_finetune_encoder(evaluation_model)
-    evaluation_model = evaluation_model.to(device=config["device"], dtype=config["dtype"])
-    return evaluation_model
-
-
 def run_linear_probe(
     train_features: torch.Tensor,
     train_labels: torch.Tensor,
@@ -1466,13 +1368,17 @@ def run_linear_probe(
     test_labels: torch.Tensor,
     config: Dict[str, Any],
 ) -> float:
-    """Train one linear probe on frozen encoder features.
+    """Train one dataset-specific linear classifier on frozen encoder features.
 
-    This function implements the first evaluation view used after every stage:
-    1. Remap labels onto a contiguous class range.
-    2. Train only a single linear layer on top of frozen features.
-    3. Evaluate that probe on the held-out split.
-    4. Return the held-out accuracy used in the retention summary.
+    This function is the core of the active retention-evaluation path. For one
+    dataset pair it:
+    1. remaps labels onto a contiguous class range,
+    2. builds a single linear classification head,
+    3. trains that head on top of frozen encoder features,
+    4. evaluates the head on the held-out split, and
+    5. returns the held-out accuracy used in the forgetting summaries.
+
+    The encoder itself stays frozen throughout this function.
     """
     if train_features.numel() == 0 or test_features.numel() == 0:
         return 0.0
@@ -1492,14 +1398,18 @@ def run_linear_probe(
     loss_fn = nn.CrossEntropyLoss()
 
     train_dataset = TensorDataset(train_features, train_labels)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config["linear_eval_batch_size"],
-        shuffle=True,
-        num_workers=config["linear_eval_num_workers"],
-        pin_memory=config["pin_memory"],
-        drop_last=False,
-    )
+    train_loader_kwargs: Dict[str, Any] = {
+        "dataset": train_dataset,
+        "batch_size": config["linear_eval_batch_size"],
+        "shuffle": True,
+        "num_workers": config["linear_eval_num_workers"],
+        "pin_memory": config["pin_memory"],
+        "drop_last": False,
+    }
+    if config["linear_eval_num_workers"] > 0:
+        train_loader_kwargs["persistent_workers"] = config["dataloader_persistent_workers"]
+        train_loader_kwargs["prefetch_factor"] = config["dataloader_prefetch_factor"]
+    train_loader = DataLoader(**train_loader_kwargs)
 
     for _ in range(config["linear_eval_epochs"]):
         probe.train()
@@ -1534,33 +1444,34 @@ def evaluate_datasets(
     dataset_names: Sequence[str],
     config: Dict[str, Any],
 ) -> Dict[str, float]:
-    """Evaluate the current checkpoint by frozen-feature linear probing.
+    """Evaluate one stage checkpoint on the currently seen benchmark datasets.
 
-    For each benchmark dataset in the current seen set this helper:
-    1. Loads the train split used to fit the probe.
-    2. Loads the held-out split used for reporting.
-    3. Extracts full-image encoder features with MAE masking disabled.
-    4. Fits a linear classifier on those frozen features.
-    5. Stores the held-out accuracy.
+    This helper is called after every stage. For each benchmark dataset in the
+    current seen set it:
+    1. loads the train split used to fit the probe,
+    2. loads the held-out split used for reporting,
+    3. extracts full-image encoder features with masking disabled,
+    4. trains a linear classifier on those frozen features, and
+    5. records the held-out accuracy used by the retention summaries.
+
+    Stress datasets never enter this reporting path directly.
     """
     results: Dict[str, float] = {}
     for dataset_name in dataset_names:
+        # Only benchmark datasets are reported here. Stress datasets affect the
+        # checkpoint through training, but they are excluded from the headline metrics.
         train_dataset = load_named_dataset(
             dataset_name=dataset_name,
             data_root=config["data_root"],
             image_size=config["image_size"],
             train=True,
             seed=config["seed"],
-            max_samples=config.get("linear_eval_train_samples"),
-            min_samples=config.get("min_linear_eval_train_samples"),
         )
         test_dataset = load_named_evaluation_dataset(
             dataset_name=dataset_name,
             data_root=config["data_root"],
             image_size=config["image_size"],
             seed=config["seed"],
-            max_samples=config.get("linear_eval_test_samples"),
-            min_samples=config.get("min_linear_eval_test_samples"),
         )
 
         train_loader = create_standard_dataloader(
@@ -1569,6 +1480,8 @@ def evaluate_datasets(
             num_workers=config["linear_eval_num_workers"],
             pin_memory=config["pin_memory"],
             shuffle=False,
+            persistent_workers=config["dataloader_persistent_workers"],
+            prefetch_factor=config["dataloader_prefetch_factor"],
         )
         test_loader = create_standard_dataloader(
             dataset=test_dataset,
@@ -1576,6 +1489,8 @@ def evaluate_datasets(
             num_workers=config["linear_eval_num_workers"],
             pin_memory=config["pin_memory"],
             shuffle=False,
+            persistent_workers=config["dataloader_persistent_workers"],
+            prefetch_factor=config["dataloader_prefetch_factor"],
         )
 
         train_features, train_labels = collect_labeled_embeddings(
@@ -1602,126 +1517,6 @@ def evaluate_datasets(
     return results
 
 
-def run_partial_finetune_probe(
-    reference_model: nn.Module,
-    train_dataset: torch.utils.data.Dataset,
-    test_dataset: torch.utils.data.Dataset,
-    config: Dict[str, Any],
-) -> float:
-    """Run one fresh dataset-specific partial-finetuning evaluation.
-
-    This function implements the second evaluation view used after every stage:
-    1. Start from the current checkpoint state.
-    2. Build a fresh model dedicated to one dataset.
-    3. Freeze the lower encoder half.
-    4. Keep adapters frozen in the upper half while reopening the original
-       transformer weights there.
-    5. Train a new dataset-specific classifier head.
-    6. Evaluate on the held-out split and return accuracy.
-    """
-    label_mapping = build_label_mapping(train_dataset=train_dataset, test_dataset=test_dataset)
-    if not label_mapping:
-        return 0.0
-
-    mapped_train_dataset = LabelMappedDataset(train_dataset, label_mapping)
-    mapped_test_dataset = LabelMappedDataset(test_dataset, label_mapping)
-
-    train_loader = create_standard_dataloader(
-        dataset=mapped_train_dataset,
-        batch_size=config["partial_eval_batch_size"],
-        num_workers=config["partial_eval_num_workers"],
-        pin_memory=config["pin_memory"],
-        shuffle=True,
-    )
-    test_loader = create_standard_dataloader(
-        dataset=mapped_test_dataset,
-        batch_size=config["partial_eval_batch_size"],
-        num_workers=config["partial_eval_num_workers"],
-        pin_memory=config["pin_memory"],
-        shuffle=False,
-    )
-
-    transfer_encoder = build_partial_finetune_model(reference_model=reference_model, config=config)
-    transfer_model = PartialFinetuneClassifier(
-        encoder_model=transfer_encoder,
-        num_classes=len(label_mapping),
-    ).to(device=config["device"], dtype=config["dtype"])
-    optimizer = optim.AdamW(
-        [parameter for parameter in transfer_model.parameters() if parameter.requires_grad],
-        lr=config["partial_eval_lr"],
-        weight_decay=config["partial_eval_weight_decay"],
-    )
-    loss_fn = nn.CrossEntropyLoss()
-
-    for _ in range(config["partial_eval_epochs"]):
-        transfer_model.train()
-        for images, labels in train_loader:
-            images = images.to(device=config["device"], dtype=config["dtype"])
-            labels = labels.to(device=config["device"], dtype=torch.long)
-
-            logits = transfer_model(images)
-            loss = loss_fn(logits, labels)
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-
-    transfer_model.eval()
-    correct = 0
-    total = 0
-    with torch.inference_mode():
-        for images, labels in test_loader:
-            images = images.to(device=config["device"], dtype=config["dtype"])
-            labels = labels.to(device=config["device"], dtype=torch.long)
-            predictions = transfer_model(images).argmax(dim=1)
-            correct += int((predictions == labels).sum().item())
-            total += int(labels.size(0))
-
-    del transfer_model
-    del transfer_encoder
-    del train_loader
-    del test_loader
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return correct / total if total > 0 else 0.0
-
-
-def evaluate_datasets_with_partial_finetune(
-    model: nn.Module,
-    dataset_names: Sequence[str],
-    config: Dict[str, Any],
-) -> Dict[str, float]:
-    """Evaluate checkpoint transfer quality on the current seen benchmark set."""
-    results: Dict[str, float] = {}
-    for dataset_name in dataset_names:
-        train_dataset = load_named_dataset(
-            dataset_name=dataset_name,
-            data_root=config["data_root"],
-            image_size=config["image_size"],
-            train=True,
-            seed=config["seed"],
-            max_samples=config.get("partial_eval_train_samples"),
-            min_samples=config.get("min_partial_eval_train_samples"),
-        )
-        test_dataset = load_named_evaluation_dataset(
-            dataset_name=dataset_name,
-            data_root=config["data_root"],
-            image_size=config["image_size"],
-            seed=config["seed"],
-            max_samples=config.get("partial_eval_test_samples"),
-            min_samples=config.get("min_partial_eval_test_samples"),
-        )
-        results[dataset_name] = run_partial_finetune_probe(
-            reference_model=model,
-            train_dataset=train_dataset,
-            test_dataset=test_dataset,
-            config=config,
-        )
-    return results
-
-
 def evaluate_seen_datasets(
     model: nn.Module,
     seen_dataset_names: List[str],
@@ -1729,19 +1524,6 @@ def evaluate_seen_datasets(
 ) -> Dict[str, float]:
     """Evaluate the benchmark datasets that have been seen so far."""
     return evaluate_datasets(model=model, dataset_names=seen_dataset_names, config=config)
-
-
-def evaluate_seen_datasets_with_partial_finetune(
-    model: nn.Module,
-    seen_dataset_names: List[str],
-    config: Dict[str, Any],
-) -> Dict[str, float]:
-    """Evaluate transfer quality on the benchmark datasets seen so far."""
-    return evaluate_datasets_with_partial_finetune(
-        model=model,
-        dataset_names=seen_dataset_names,
-        config=config,
-    )
 
 
 def summarize_stage_evaluation(
@@ -1752,14 +1534,16 @@ def summarize_stage_evaluation(
     accuracies: Dict[str, float],
     history_key: str = "stage_evaluations",
 ) -> Dict[str, Any]:
-    """Turn one stage's accuracies into retention-oriented metrics.
+    """Turn one stage's accuracies into the saved retention summary block.
 
-    Each stage summary records:
-    1. Accuracy on every benchmark dataset seen so far.
-    2. Forgetting relative to the best historical accuracy.
-    3. Retention ratio relative to that same best score.
-    4. Backward transfer relative to the first score observed for each dataset.
-    5. Stage-level averages used for plots and tables.
+    The forgetting curves are built here. For the current stage the function:
+    1. records the linear-probe accuracy for each seen benchmark dataset,
+    2. compares that score against the dataset's earlier stage history,
+    3. derives forgetting, retention ratio, and backward-transfer values, and
+    4. appends one compact summary object to the run history.
+
+    The plotting and JSON-export code then reads directly from this summarized
+    history instead of recomputing the retention math later.
     """
     previous_stage_evaluations = history.get(history_key, [])
     forgetting: Dict[str, float] = {}
@@ -1945,7 +1729,7 @@ def render_all_stage_evaluation_plots(
     plots_dir: Path,
     prefix: str,
 ) -> None:
-    """Write both linear-probe and partial-finetuning retention plots."""
+    """Write the linear-probe retention plots used by the current pipeline."""
     plot_stage_evaluation_heatmap(
         history,
         dataset_order,
@@ -1969,39 +1753,15 @@ def render_all_stage_evaluation_plots(
         history_key="stage_evaluations",
         title="Linear-Probe Final Forgetting by Dataset",
     )
-    plot_stage_evaluation_heatmap(
-        history,
-        dataset_order,
-        plots_dir,
-        f"{prefix}_partial",
-        history_key="partial_finetune_stage_evaluations",
-        title="Partial-Finetuning Transfer Accuracy",
-    )
-    plot_stage_metric_curves(
-        history,
-        plots_dir,
-        f"{prefix}_partial",
-        history_key="partial_finetune_stage_evaluations",
-        title_prefix="Partial Fine-Tune",
-    )
-    plot_final_forgetting_bars(
-        history,
-        dataset_order,
-        plots_dir,
-        f"{prefix}_partial",
-        history_key="partial_finetune_stage_evaluations",
-        title="Partial-Finetuning Transfer Forgetting by Dataset",
-    )
 
 
 def initialize_baseline_history() -> Dict[str, Any]:
     """Create the history structure written by the baseline mode.
 
-    The baseline records four groups of information:
+    The baseline records three groups of information:
     1. Round-wise reconstruction metrics.
     2. Per-stage dataset summaries.
     3. Stage-wise linear-probe retention summaries.
-    4. Stage-wise partial-finetuning transfer summaries.
     """
     return {
         "round_ids": [],
@@ -2012,7 +1772,6 @@ def initialize_baseline_history() -> Dict[str, Any]:
         "avg_mae_loss": [],
         "stage_summaries": [],
         "stage_evaluations": [],
-        "partial_finetune_stage_evaluations": [],
     }
 
 
@@ -2067,7 +1826,12 @@ def create_baseline_dataloader(
     dataset: torch.utils.data.Dataset,
     config: Dict[str, Any],
 ) -> DataLoader:
-    """Create the baseline dataloader with the throughput-oriented defaults."""
+    """Create the baseline training dataloader from the active runtime config.
+
+    The baseline uses the same worker, prefetch, shuffle, and pinned-memory
+    policy as the rest of the current pipeline so throughput differences do not
+    come from a separate dataloader implementation.
+    """
     loader_kwargs: Dict[str, Any] = {
         "dataset": dataset,
         "batch_size": config["batch_size"],
@@ -2107,24 +1871,24 @@ def plot_baseline_training_history(history: Dict[str, Any], plots_dir: Path) -> 
 
 
 def run_baseline_experiment() -> None:
-    """Run the sequential continual-learning baseline.
+    """Run the sequential continual-learning baseline from start to finish.
 
-    The baseline keeps the architecture fixed and changes only the training
-    topology:
-    1. Build one adapter-injected ViT-MAE model.
-    2. Walk through the same benchmark-plus-stress stage order used by the federated run.
-    3. Train with MAE reconstruction only.
-    4. Preserve model and optimizer state across every dataset transition.
-    5. After each stage, run linear probing and then partial fine-tuning on the
-       benchmark datasets seen so far.
-    6. Save checkpoints, histories, and both families of retention plots.
+    The baseline keeps the same backbone, data stream, and stage-wise
+    evaluation as the federated run, but removes the federated-specific
+    machinery. The execution flow is:
+    1. build one adapter-injected ViT-MAE model,
+    2. walk through the same benchmark-plus-stress stage order used by the
+       federated run,
+    3. optimize reconstruction loss only,
+    4. preserve the model and optimizer state across every dataset transition,
+    5. run stage-wise linear probing on the benchmark datasets seen so far, and
+    6. save one final checkpoint together with the histories and plots.
     """
     config = dict(BASELINE_CONFIG)
     config["run_mode"] = "baseline"
     resolve_runtime_config(config)
-
-    max_worker_count = max(1, (os.cpu_count() or 1) - 1)
-    config["num_workers"] = min(config["num_workers"], max_worker_count)
+    config["num_workers"] = resolve_worker_count()
+    config["linear_eval_num_workers"] = resolve_worker_count()
     config["pin_memory"] = bool(config["pin_memory"] and config["device"] == "cuda")
     if config["device"] == "cuda" and config["cudnn_benchmark"]:
         torch.backends.cudnn.benchmark = True
@@ -2176,13 +1940,12 @@ def run_baseline_experiment() -> None:
     seen_benchmark_dataset_names: List[str] = []
 
     baseline_logger.info(
-        "Starting unified baseline | stages=%s | benchmark_datasets=%s | rounds_per_dataset=%s | batch_size=%s | linear_probe_epochs=%s | partial_eval_epochs=%s | device=%s | output=%s",
+        "Starting unified baseline | stages=%s | benchmark_datasets=%s | rounds_per_dataset=%s | batch_size=%s | linear_probe_epochs=%s | device=%s | output=%s",
         len(config["dataset_order_by_stage"]),
         len(config["linear_probe_dataset_order"]),
         config["rounds_per_dataset"],
         config["batch_size"],
         config["linear_eval_epochs"],
-        config["partial_eval_epochs"],
         config["device"],
         output_dirs["root"],
     )
@@ -2244,15 +2007,6 @@ def run_baseline_experiment() -> None:
                 round_time,
             )
 
-            save_checkpoint(
-                checkpoint_dir=output_dirs["checkpoints"],
-                round_idx=global_round_idx,
-                base_model=model,
-                config=config,
-                training_history=history,
-                is_final=False,
-                include_training_history=False,
-            )
             save_history(history, output_dirs["metrics"], filename="baseline_training_history.json")
             plot_baseline_training_history(history, output_dirs["plots"])
 
@@ -2266,8 +2020,6 @@ def run_baseline_experiment() -> None:
                 "last_round_loss": float(stage_losses[-1]),
             }
         )
-        # Stress stages are trained to create forgetting pressure, but only
-        # benchmark datasets are allowed into the reported retention curves.
         if stage_spec["use_for_linear_probe"] and dataset_name not in seen_benchmark_dataset_names:
             seen_benchmark_dataset_names.append(dataset_name)
 
@@ -2293,29 +2045,6 @@ def run_baseline_experiment() -> None:
             stage_evaluation["average_forgetting"],
             stage_evaluation["average_retention"],
             stage_evaluation["average_backward_transfer"],
-        )
-        partial_stage_accuracies = evaluate_seen_datasets_with_partial_finetune(
-            model=model,
-            seen_dataset_names=seen_benchmark_dataset_names,
-            config=config,
-        )
-        partial_stage_evaluation = summarize_stage_evaluation(
-            history=history,
-            stage_number=stage_index,
-            stage_kind=stage_kind,
-            evaluated_dataset_names=seen_benchmark_dataset_names,
-            accuracies=partial_stage_accuracies,
-            history_key="partial_finetune_stage_evaluations",
-        )
-        baseline_logger.info(
-            "Baseline stage %s partial fine-tune | kind=%s | datasets=%s | avg_acc=%.4f | avg_forgetting=%.4f | avg_retention=%.4f | avg_bwt=%.4f",
-            stage_index,
-            stage_kind,
-            ", ".join(DATASET_DISPLAY_NAMES[name] for name in seen_benchmark_dataset_names),
-            partial_stage_evaluation["average_accuracy"],
-            partial_stage_evaluation["average_forgetting"],
-            partial_stage_evaluation["average_retention"],
-            partial_stage_evaluation["average_backward_transfer"],
         )
 
         del dataloader
@@ -2360,21 +2089,31 @@ def run_baseline_experiment() -> None:
 def run_federated_experiment() -> None:
     """Run the full two-client federated continual-learning benchmark.
 
-    This path is the proposed method used by the paper:
-    1. Build the shared adapter-injected ViT-MAE backbone and the global prototype bank.
-    2. Alternate benchmark stages with retention-stress stages.
-    3. Train one dataset per client for the configured number of rounds.
-    4. Upload only trainable adapter weights and local prototype banks.
-    5. Merge prototypes and aggregate adapter weights on the server.
-    6. Broadcast the updated global state back to the clients.
-    7. Preserve both global memory and client-local memory across dataset changes.
-    8. After each stage, run linear probing and then partial fine-tuning on the
-       benchmark datasets seen so far.
-    9. Save checkpoints, communication histories, and both evaluation plot families.
+    This is the proposed method implemented by the repository. The execution
+    flow is:
+    1. build the shared adapter-injected ViT-MAE backbone and the global
+       prototype bank,
+    2. alternate benchmark stages with retention-stress stages,
+    3. train one dataset per client for the configured number of rounds,
+    4. upload only trainable adapter weights and local prototype banks,
+    5. merge prototypes and aggregate adapter weights on the server,
+    6. smooth the aggregated adapter state with server-side EMA,
+    7. broadcast the updated global state back to the clients,
+    8. preserve both global memory and client-local memory across dataset
+       changes,
+    9. run stage-wise linear probing on the benchmark datasets seen so far, and
+    10. save the final checkpoint, communication histories, and plots.
     """
     config = dict(MULTI_DATASET_CONFIG)
     config["run_mode"] = "federated"
     resolve_runtime_config(config)
+    config["num_workers"] = resolve_worker_count()
+    config["linear_eval_num_workers"] = resolve_worker_count()
+    config["pin_memory"] = bool(config["pin_memory"] and config["device"] == "cuda")
+    if config["device"] == "cuda" and config["cudnn_benchmark"]:
+        torch.backends.cudnn.benchmark = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
     benchmark_sequence = validate_client_dataset_sequence(
         BENCHMARK_CLIENT_DATASET_SEQUENCE,
         expected_num_clients=config["num_clients"],
@@ -2432,7 +2171,7 @@ def run_federated_experiment() -> None:
     output_dirs = prepare_output_dirs(config["save_dir"])
 
     logger.info(
-        "Starting unified federated run | clients=%s | total_stages=%s | benchmark_stages=%s | rounds_per_stage=%s | total_rounds=%s | batch_size=%s | linear_probe_epochs=%s | partial_eval_epochs=%s | device=%s | output=%s",
+        "Starting unified federated run | clients=%s | total_stages=%s | benchmark_stages=%s | rounds_per_stage=%s | total_rounds=%s | batch_size=%s | linear_probe_epochs=%s | device=%s | output=%s",
         config["num_clients"],
         config["num_stages"],
         config["num_benchmark_stages"],
@@ -2440,7 +2179,6 @@ def run_federated_experiment() -> None:
         config["total_sequential_rounds"],
         config["batch_size"],
         config["linear_eval_epochs"],
-        config["partial_eval_epochs"],
         config["device"],
         output_dirs["root"],
     )
@@ -2526,6 +2264,8 @@ def run_federated_experiment() -> None:
                 num_workers=config["num_workers"],
                 pin_memory=config["pin_memory"],
                 shuffle=config["dataloader_shuffle"],
+                persistent_workers=config["dataloader_persistent_workers"],
+                prefetch_factor=config["dataloader_prefetch_factor"],
             )
             for dataset in stage_datasets
         ]
@@ -2560,9 +2300,8 @@ def run_federated_experiment() -> None:
 
             for client_index, client in enumerate(client_manager.clients):
                 if stage_round == 1:
-                    # A new stage should enrich the existing local bank rather
-                    # than replace it, so the first round injects fresh stage
-                    # centroids into the accumulated prototype memory.
+                    # The first round of each stage injects fresh stage concepts
+                    # into the persistent local bank instead of resetting it.
                     local_prototypes = client.generate_prototypes(
                         stage_dataloaders[client_index],
                         K_init=config["k_init_prototypes"],
@@ -2578,6 +2317,8 @@ def run_federated_experiment() -> None:
                 upload_bytes += state_dict_num_bytes(weights)
 
                 if local_prototypes is not None and local_prototypes.numel() > 0:
+                    # Prototype payloads move to CPU only for server exchange
+                    # and byte accounting; the active training math stays on-device.
                     cpu_prototypes = local_prototypes.detach().cpu()
                     payload["protos"] = cpu_prototypes
                     upload_bytes += tensor_num_bytes(cpu_prototypes)
@@ -2659,16 +2400,6 @@ def run_federated_experiment() -> None:
                 client_prototype_counts,
             )
 
-            save_checkpoint(
-                checkpoint_dir=output_dirs["checkpoints"],
-                round_idx=global_round_idx,
-                base_model=base_model,
-                proto_bank=proto_bank,
-                training_history=training_history,
-                config=config,
-                is_final=False,
-                include_training_history=False,
-            )
             save_history(training_history, output_dirs["metrics"])
             plot_training_history(
                 training_history,
@@ -2710,29 +2441,6 @@ def run_federated_experiment() -> None:
                 stage_evaluation["average_forgetting"],
                 stage_evaluation["average_retention"],
                 stage_evaluation["average_backward_transfer"],
-            )
-            partial_stage_accuracies = evaluate_seen_datasets_with_partial_finetune(
-                model=base_model,
-                seen_dataset_names=seen_benchmark_dataset_names,
-                config=config,
-            )
-            partial_stage_evaluation = summarize_stage_evaluation(
-                history=training_history,
-                stage_number=stage_number,
-                stage_kind=stage_kind,
-                evaluated_dataset_names=seen_benchmark_dataset_names,
-                accuracies=partial_stage_accuracies,
-                history_key="partial_finetune_stage_evaluations",
-            )
-            logger.info(
-                "Stage %s partial fine-tune | kind=%s | datasets=%s | avg_acc=%.4f | avg_forgetting=%.4f | avg_retention=%.4f | avg_bwt=%.4f",
-                stage_number,
-                stage_kind,
-                ", ".join(DATASET_DISPLAY_NAMES[name] for name in seen_benchmark_dataset_names),
-                partial_stage_evaluation["average_accuracy"],
-                partial_stage_evaluation["average_forgetting"],
-                partial_stage_evaluation["average_retention"],
-                partial_stage_evaluation["average_backward_transfer"],
             )
 
         del stage_dataloaders
@@ -2784,7 +2492,7 @@ def run_federated_experiment() -> None:
 
 
 def main() -> None:
-    """Dispatch the unified entrypoint to either the federated or baseline run."""
+    """Dispatch the single repository entrypoint to the selected run mode."""
     if RUN_MODE == "federated":
         run_federated_experiment()
         return
