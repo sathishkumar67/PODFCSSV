@@ -1,8 +1,7 @@
 """Define the GPAD loss used by the federated continual-learning path.
 
-GPAD is the prototype-aware regularizer layered on top of MAE reconstruction in
-the proposed method. For every batch it:
-
+GPAD is the prototype-aware regularizer layered on top of MAE reconstruction.
+For every batch it:
 1. compares embeddings against the current global prototype bank,
 2. estimates how ambiguous each prototype assignment is,
 3. raises the anchoring threshold for uncertain samples,
@@ -10,7 +9,7 @@ the proposed method. For every batch it:
 5. penalizes anchored samples when they drift away from their closest
    prototype.
 
-This module therefore contains the logic that decides when the global semantic
+This module therefore contains the rule that decides when the shared semantic
 memory should influence a local adapter update.
 """
 
@@ -26,15 +25,15 @@ import torch.nn.functional as F
 class GPADLoss(nn.Module):
     """Compute gated prototype anchoring for one mini-batch of embeddings.
 
-    The constructor stores the small set of hyperparameters that govern when a
-    sample should trust the global bank:
+    The constructor stores the hyperparameters that control when a sample
+    should trust the global bank:
     1. ``base_tau`` is the similarity floor before uncertainty adjustment,
     2. ``temp_gate`` controls how soft or sharp the sigmoid gate becomes,
     3. ``lambda_entropy`` determines how strongly assignment uncertainty raises
        the threshold,
     4. ``soft_assign_temp`` shapes the prototype-assignment distribution used
        in the entropy calculation, and
-    5. ``epsilon`` keeps all logarithms numerically stable.
+    5. ``epsilon`` keeps the entropy computation numerically stable.
     """
 
     def __init__(

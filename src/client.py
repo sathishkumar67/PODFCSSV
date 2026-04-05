@@ -1,20 +1,18 @@
-"""Implement the full client-side training and local-memory update logic.
+"""Implement the full client-side training and local-memory logic.
 
-This module holds the client behavior that makes the federated method truly
-continual. Between two server synchronizations each client:
-
-1. receives the newest global adapter weights,
+This module contains the client behavior that makes the federated method
+continual rather than stage-local. Between two server synchronizations each
+client:
+1. receives the latest shared adapter weights,
 2. trains on its current dataset with MAE reconstruction loss,
-3. uses GPAD only for embeddings that confidently match the shared global
-   prototype bank,
-4. routes the remaining embeddings through a persistent local prototype bank or
-   into a novelty buffer,
-5. clusters buffered novel embeddings when enough evidence accumulates, and
+3. applies GPAD only to embeddings that confidently match the shared prototype
+   bank,
+4. routes the remaining embeddings through its own persistent local memory,
+5. clusters novel evidence when enough of it accumulates, and
 6. returns the updated adapter payload and local prototypes to the server.
 
-The most important design detail is persistence: when the dataset changes, the
-client keeps its optimizer state, local prototypes, and novelty buffer instead
-of resetting them.
+The key design choice is persistence: the optimizer state, local prototypes,
+and novelty buffer are preserved when the dataset changes.
 """
 
 from __future__ import annotations
@@ -52,16 +50,15 @@ def _empty_routing_stats() -> Dict[str, int]:
 class FederatedClient:
     """Represent one federated participant and its persistent local state.
 
-    Each client owns four stateful objects that survive dataset transitions:
+    Each client owns:
     1. its own adapter-injected MAE copy,
     2. its own optimizer state,
     3. a persistent local prototype bank, and
-    4. a novelty buffer for embeddings that do not match either the global bank
-       or the current local bank strongly enough.
+    4. a novelty buffer for embeddings that do not fit existing memory well
+       enough yet.
 
-    The class is responsible for both local optimization and local memory
-    maintenance, so it is the main place where continual-learning behavior is
-    expressed on the client side.
+    The class therefore handles both local optimization and local continual
+    memory maintenance.
     """
 
     def __init__(
@@ -121,11 +118,11 @@ class FederatedClient:
         self.model.load_state_dict(global_weights, strict=False)
 
     def get_trainable_state(self) -> Dict[str, torch.Tensor]:
-        """Return a CPU copy of only the trainable adapter parameters.
+        """Return the exact trainable upload payload for one client round.
 
-        This is the exact upload payload for one client round, which keeps
-        communication focused on the small adapter subset rather than the full
-        MAE backbone.
+        Only the trainable adapter parameters are copied out, which keeps the
+        communication budget focused on the parameter-efficient part of the
+        model instead of the full MAE backbone.
         """
         trainable_state: Dict[str, torch.Tensor] = {}
         for name, parameter in self.model.named_parameters():
@@ -156,9 +153,9 @@ class FederatedClient:
     ) -> tuple[Any, torch.Tensor]:
         """Run one MAE forward pass and return both outputs and pooled embeddings.
 
-        GPAD and prototype routing both depend on the same encoder pass used for
-        MAE reconstruction, so the helper exposes both the raw model outputs and
-        the pooled encoder features.
+        GPAD, prototype routing, and reconstruction loss all rely on the same
+        encoder pass, so this helper exposes both the raw model outputs and the
+        pooled encoder features from one call.
         """
         outputs = self.model(inputs, output_hidden_states=True)
         if not hasattr(outputs, "hidden_states") or outputs.hidden_states is None:
@@ -353,7 +350,7 @@ class FederatedClient:
         return stats
 
     def _maybe_cluster_buffer(self) -> Dict[str, int]:
-        """Trigger novelty-buffer clustering only after the buffer reaches capacity."""
+        """Trigger novelty-buffer clustering only when enough novel evidence exists."""
         if len(self.novelty_buffer) < self.novelty_buffer_size:
             return _empty_routing_stats()
         return self._cluster_novelty_buffer()
@@ -543,15 +540,15 @@ class FederatedClient:
 class ClientManager:
     """Own the client collection and orchestrate one federated round at a time.
 
-    The main training loop delegates round-level coordination here so the code
-    in ``main.py`` can stay focused on the stage plan and the reporting logic.
-    The manager handles:
+    The main training loop delegates round-level coordination here so
+    ``main.py`` can stay focused on the stage plan and reporting flow. The
+    manager handles:
     1. client creation,
     2. adapter-weight synchronization,
     3. local-epoch repetition,
     4. per-round parallelism when the GPU topology matches the client count,
        and
-    5. fallback sequential execution on CPU.
+    5. sequential fallback on CPU.
     """
 
     def __init__(

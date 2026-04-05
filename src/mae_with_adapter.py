@@ -1,7 +1,6 @@
 """Attach residual adapters to the frozen ViT-MAE backbone.
 
 The repository reuses the same parameter-efficient recipe everywhere:
-
 1. load the pretrained MAE model,
 2. freeze the original backbone,
 3. insert lightweight residual adapters into the upper encoder blocks, and
@@ -30,7 +29,7 @@ class IBA_Adapter(nn.Module):
     1. down-project the hidden state into a smaller bottleneck space,
     2. apply the adapter non-linearity,
     3. project back to the original hidden size, and
-    4. add that adapter output back to the incoming hidden state.
+    4. add the adapter output back to the incoming hidden state.
 
     The up-projection is initialized at zero so training starts from the exact
     pretrained backbone behavior.

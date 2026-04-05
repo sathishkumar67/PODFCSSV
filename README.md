@@ -2,7 +2,7 @@
 
 Prototype-Oriented Distillation for Federated Continual Self-Supervised Vision.
 
-This repository currently runs from a single executable file, `main.py`. The file contains the active training pipeline, the stage-wise retention evaluation, the plotting utilities, and the final checkpoint export logic used by the current research workflow.
+This repository currently runs from a single executable file, `main.py`. The file contains the active training pipeline, the final benchmark linear-probe evaluation, the plotting utilities, and the final checkpoint export logic used by the current research workflow.
 
 ## Current Workflow
 
@@ -13,8 +13,8 @@ The active experiment pipeline follows these steps:
 3. Resolve the real runtime device by validating CUDA with a small smoke test before any heavy training starts.
 4. Build the continual stage plan that interleaves benchmark datasets with additional stress datasets.
 5. Train through that stage stream in either federated mode or baseline mode.
-6. After every stage, freeze the current encoder and evaluate the benchmark datasets seen so far through linear probing.
-7. Save JSON histories, plots, and one final checkpoint at the end of the run.
+6. After the full training stream finishes, freeze the final encoder and evaluate the benchmark datasets through one linear-probe pass.
+7. Save JSON histories, plots, one final probe summary, and one final checkpoint at the end of the run.
 
 ## Run Modes
 
@@ -56,11 +56,11 @@ No ImageNet normalization is used in the current pipeline.
 
 ## Dataset Design
 
-The continual stream is divided into reported benchmark datasets and stress datasets.
+The continual stream is divided into benchmark datasets and stress datasets.
 
 ### Benchmark Datasets
 
-These datasets define the reported retention benchmark:
+These datasets define the core benchmark portion of the continual stream:
 
 - `EuroSAT`
 - `GTSRB`
@@ -76,7 +76,7 @@ Client schedules:
 
 ### Stress Datasets
 
-These datasets are trained between benchmark stages to create stronger distribution shift and stronger forgetting pressure:
+These datasets are trained between benchmark stages to create stronger distribution shift:
 
 - `CIFAR10`
 - `SVHN`
@@ -101,15 +101,15 @@ The current interleaved stage plan is:
 5. `Oxford-IIIT Pet` vs `FGVC Aircraft`
 6. `Flowers102` vs `DTD`
 
-The stress datasets are part of training in both modes, but they are not part of the reported benchmark evaluation curves.
+The stress datasets influence the final checkpoint through training, but they are not part of the final reported linear-probe comparison.
 
 ## Split Policy
 
 ### Benchmark Splits
 
-Benchmark training uses the full train-side split for each dataset, except for `EuroSAT`, which is handled through a fixed deterministic split:
+Benchmark training uses the full train-side split for each dataset, except for `EuroSAT`, which is handled through a fixed head/tail split:
 
-- `EuroSAT`: `22000` train, `5000` held-out evaluation
+- `EuroSAT`: first `22000` samples for train, last `5000` samples for held-out evaluation
 - `Food101`: full `train`, evaluated on `test`
 - `Oxford-IIIT Pet`: full `trainval`, evaluated on `test`
 - `GTSRB`: full `train`, evaluated on `test`
@@ -133,7 +133,7 @@ Current shared training defaults in `main.py`:
 
 - `local_epochs = 1`
 - `rounds_per_dataset = 3`
-- `batch_size = 96`
+- `batch_size = 512`
 - `client_lr = 1e-4`
 - `client_weight_decay = 0.05`
 - `dataloader_shuffle = True`
@@ -141,7 +141,7 @@ Current shared training defaults in `main.py`:
 - `dataloader_prefetch_factor = 4`
 - `server_model_ema_alpha = 0.3`
 
-Worker counts are chosen dynamically from the visible CPU count at runtime rather than being fixed in the config.
+Training and evaluation dataloaders currently use a worker cap of `4`.
 
 ## Federated Mode
 
@@ -182,15 +182,15 @@ In baseline mode, `main.py` uses the same benchmark-plus-stress stage order but 
 
 This makes the baseline a direct continual-learning comparison against the federated method under the same stage order.
 
-## Stage-Wise Evaluation
+## Final Linear-Probe Evaluation
 
-After every stage, the current model is evaluated only on the benchmark datasets seen so far.
+After the full training stream finishes, the final model is evaluated once on the benchmark datasets only.
 
 The current pipeline uses one evaluation view:
 
 ### Frozen-Feature Linear Probe
 
-For each seen benchmark dataset:
+For each benchmark dataset:
 
 1. Load the training split used to fit the probe.
 2. Load the held-out split used for reporting.
@@ -202,22 +202,18 @@ For each seen benchmark dataset:
 Current linear-probe settings:
 
 - epochs: `5`
-- batch size: `256`
+- batch size: `512`
 - learning rate: `1e-2`
 - weight decay: `1e-4`
 
 ## Tracked Metrics
 
-The retention analysis currently tracks:
+The final probe summary currently tracks:
 
 - per-dataset accuracy
-- average benchmark accuracy
-- per-dataset forgetting
-- average forgetting
-- per-dataset retention ratio
-- average retention ratio
-- per-dataset backward transfer
-- average backward transfer
+- per-dataset train sample count
+- per-dataset evaluation sample count
+- average accuracy across the benchmark datasets
 
 Federated runs also track:
 
@@ -240,8 +236,8 @@ Each run writes:
 - one final checkpoint
 - JSON metric and history files
 - training summary plots
-- retention heatmaps and curves
-- final forgetting bar plots
+- one final benchmark linear-probe JSON summary
+- one final linear-probe accuracy bar plot
 
 The active output directories are:
 

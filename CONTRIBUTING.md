@@ -55,7 +55,7 @@ python main.py
 
 ### Benchmark Datasets
 
-These datasets define the reported continual-learning benchmark:
+These datasets define the core benchmark portion of the continual stream:
 
 - `EuroSAT`
 - `GTSRB`
@@ -71,7 +71,7 @@ Benchmark schedule:
 
 ### Stress Datasets
 
-These datasets are inserted between benchmark stages and after the final benchmark stage to strengthen forgetting pressure:
+These datasets are inserted between benchmark stages and after the final benchmark stage to strengthen distribution shift:
 
 - `CIFAR10`
 - `SVHN`
@@ -96,11 +96,11 @@ Full stage order:
 
 ## Split Rules
 
-Benchmark training uses the full train-side split for each dataset except `EuroSAT`, which uses a fixed deterministic `22000 / 5000` train-eval split.
+Benchmark training uses the full train-side split for each dataset except `EuroSAT`, which uses a fixed head/tail `22000 / 5000` train-eval split.
 
 Current benchmark evaluation splits:
 
-- `EuroSAT`: fixed held-out `5000`
+- `EuroSAT`: last `5000`
 - `Food101`: `test`
 - `Oxford-IIIT Pet`: `test`
 - `GTSRB`: `test`
@@ -116,12 +116,14 @@ Stress datasets are merged into a single self-supervised training pool per datas
 - `CIFAR100`: `train + test`
 - `DTD`: `train + val + test`
 
+The active dataloader worker policy is capped at `4` workers for both training and linear-probe evaluation.
+
 ## Behavioral Rules for Contributions
 
 When editing the pipeline, preserve these expectations unless the change is intentional and fully documented:
 
 - keep `main.py` as the active orchestration entrypoint
-- keep the benchmark and stress streams aligned between baseline and federated modes when comparing forgetting
+- keep the benchmark and stress streams aligned between baseline and federated modes when comparing final probe accuracy
 - keep the active numeric path in `float32`
 - keep device transfers explicit and avoid introducing silent mixed-device math
 - keep adapter-only communication in the federated path
@@ -132,16 +134,16 @@ When editing the pipeline, preserve these expectations unless the change is inte
 
 ## Evaluation Expectations
 
-The active pipeline uses only stage-wise linear probing for retention analysis. Contributions should not reintroduce older evaluation branches unless they are intentionally restored everywhere.
+The active pipeline uses one final benchmark-only linear-probe pass after training completes. Contributions should not reintroduce older intermediate evaluation branches unless they are intentionally restored everywhere.
 
 The current evaluation flow is:
 
 1. freeze the encoder,
 2. disable MAE masking so full images are used,
-3. extract frozen features for the seen benchmark datasets,
+3. extract frozen features for the benchmark datasets,
 4. train one linear probe per dataset,
 5. evaluate on the held-out split,
-6. update forgetting and retention summaries.
+6. write one final comparison summary.
 
 ## Validation
 

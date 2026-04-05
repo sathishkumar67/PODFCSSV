@@ -58,7 +58,7 @@ No ImageNet normalization is applied in the active workflow.
 
 The dataloaders use:
 
-- dynamic worker counts based on CPU availability,
+- a worker cap of `4`,
 - `shuffle = True` for training,
 - persistent workers when multiprocessing is enabled,
 - prefetching with factor `4`,
@@ -70,7 +70,7 @@ The continual stream is split into benchmark datasets and stress datasets.
 
 ### Benchmark Datasets
 
-These datasets define the reported results:
+These datasets define the core benchmark portion of the continual stream:
 
 - `EuroSAT`
 - `GTSRB`
@@ -86,7 +86,7 @@ Benchmark client schedules:
 
 ### Stress Datasets
 
-These datasets are inserted to create additional distribution shift without being part of the headline evaluation benchmark:
+These datasets are inserted to create additional distribution shift:
 
 - `CIFAR10`
 - `SVHN`
@@ -115,9 +115,9 @@ The current interleaved order is:
 
 ### Benchmark Datasets
 
-Benchmark training uses the full train-side split for each dataset except `EuroSAT`, which is handled through a fixed deterministic split:
+Benchmark training uses the full train-side split for each dataset except `EuroSAT`, which is handled through a fixed head/tail split:
 
-- `EuroSAT`: `22000` train, `5000` held-out evaluation
+- `EuroSAT`: first `22000` for train, last `5000` for held-out evaluation
 - `Food101`: full `train`, evaluated on `test`
 - `Oxford-IIIT Pet`: full `trainval`, evaluated on `test`
 - `GTSRB`: full `train`, evaluated on `test`
@@ -141,7 +141,7 @@ The current common training defaults are:
 
 - `local_epochs = 1`
 - `rounds_per_dataset = 3`
-- `batch_size = 96`
+- `batch_size = 512`
 - `client_lr = 1e-4`
 - `client_weight_decay = 0.05`
 - `merge_threshold = 0.85`
@@ -188,39 +188,35 @@ When `RUN_MODE = "baseline"`, the pipeline keeps the same stage stream but remov
 4. Preserve the model weights and optimizer state across dataset transitions.
 5. Skip GPAD, prototype exchange, and server aggregation.
 
-## 9. Stage-Wise Evaluation
+## 9. Final Linear-Probe Evaluation
 
-After every stage, both modes evaluate the benchmark datasets seen so far through one stage-wise linear-probe pass.
+After the full training stream finishes, both modes evaluate the benchmark datasets through one final linear-probe pass.
 
 The evaluation path is:
 
-1. load the benchmark train split for each seen dataset,
+1. load the official train-side split for each benchmark dataset,
 2. load the corresponding held-out reporting split,
 3. temporarily disable MAE masking so the encoder processes the full image,
 4. extract frozen encoder embeddings,
 5. train a linear classifier on those embeddings,
-6. evaluate on the held-out split,
-7. update the retention summaries.
+6. evaluate on the held-out split, and
+7. write one final comparison summary.
 
 Current linear-probe settings:
 
 - epochs: `5`
-- batch size: `256`
+- batch size: `512`
 - learning rate: `1e-2`
 - weight decay: `1e-4`
 
-## 10. Retention Metrics
+## 10. Final Probe Metrics
 
-The stage-wise linear-probe evaluation records:
+The final linear-probe evaluation records:
 
 - per-dataset accuracy
-- average benchmark accuracy
-- per-dataset forgetting
-- average forgetting
-- per-dataset retention ratio
-- average retention ratio
-- per-dataset backward transfer
-- average backward transfer
+- per-dataset train sample count
+- per-dataset evaluation sample count
+- average accuracy across the benchmark datasets
 
 Federated training history also records:
 
@@ -243,8 +239,8 @@ The run writes:
 - one final checkpoint
 - JSON histories
 - training summary plots
-- stage-wise retention heatmaps and curves
-- final forgetting bar plots
+- one final benchmark linear-probe JSON summary
+- one final linear-probe accuracy bar plot
 
 There are no mid-run checkpoints in the current workflow.
 

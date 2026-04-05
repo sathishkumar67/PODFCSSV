@@ -1,8 +1,7 @@
 """Implement the server-side synchronization step of the federated pipeline.
 
-The server is responsible for the global state that is shared across clients.
-After every communication round it performs two coordinated updates:
-
+This module holds the shared state that is exchanged across clients. After
+every communication round the server performs two updates:
 1. merge the client-local prototype payloads into the shared global prototype
    bank, and
 2. aggregate the uploaded adapter weights into the next global adapter state.
@@ -26,14 +25,13 @@ class GlobalPrototypeBank:
     """Store the shared prototype memory used by all federated clients.
 
     The bank follows a deterministic merge-or-add update rule:
-    1. normalize every incoming local prototype,
+    1. normalize incoming local prototypes,
     2. bootstrap directly from the first non-empty round if the bank is empty,
     3. compare each later prototype against the current bank,
     4. EMA-merge close matches, and
     5. append genuinely new prototypes while capacity remains.
 
-    This class therefore acts as the compact global memory of the federated
-    method.
+    This class acts as the compact global memory of the federated method.
     """
 
     def __init__(
@@ -126,8 +124,8 @@ class FederatedModelServer:
     """Aggregate the trainable adapter weights submitted by the clients.
 
     Only the trainable adapter subset is aggregated. That keeps communication
-    small, leaves the frozen MAE backbone untouched, and makes the server state
-    align exactly with the parameter-efficient training design.
+    small, leaves the frozen MAE backbone untouched, and keeps the server state
+    aligned with the parameter-efficient training design.
     """
 
     @torch.no_grad()
@@ -256,8 +254,9 @@ def run_server_round(
 class GlobalModel:
     """Own a server-side MAE model instance for checkpoint-oriented workflows.
 
-    The class is kept mostly for compatibility with older utilities. It loads
-    the same adapter-injected MAE backbone used everywhere else in the repo.
+    The class mainly exists for compatibility with older utilities. It still
+    loads the same adapter-injected MAE backbone used everywhere else in the
+    repository.
     """
 
     def __init__(
