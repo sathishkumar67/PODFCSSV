@@ -133,15 +133,15 @@ Current shared training defaults in `main.py`:
 
 - `local_epochs = 1`
 - `rounds_per_dataset = 3`
-- `batch_size = 1024`
+- `batch_size = 1536`
 - `client_lr = 1e-4`
 - `client_weight_decay = 0.05`
 - `dataloader_shuffle = True`
 - `dataloader_persistent_workers = True`
-- `dataloader_prefetch_factor = 4`
+- `dataloader_prefetch_factor = 8`
 - `server_model_ema_alpha = 0.3`
 
-Training and evaluation dataloaders currently use a worker cap of `4`.
+Training and evaluation dataloaders currently use a worker cap of `16`.
 
 ## Federated Mode
 
@@ -202,7 +202,7 @@ For each benchmark dataset:
 Current linear-probe settings:
 
 - epochs: `5`
-- batch size: `1024`
+- batch size: `1536`
 - learning rate: `1e-2`
 - weight decay: `1e-4`
 

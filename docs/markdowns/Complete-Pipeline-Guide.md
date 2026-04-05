@@ -58,7 +58,7 @@ No ImageNet normalization is applied in the active workflow.
 
 The dataloaders use:
 
-- a worker cap of `4`,
+- a worker cap of `16`,
 - `shuffle = True` for training,
 - persistent workers when multiprocessing is enabled,
 - prefetching with factor `4`,
@@ -141,13 +141,17 @@ The current common training defaults are:
 
 - `local_epochs = 1`
 - `rounds_per_dataset = 3`
-- `batch_size = 1024`
+- `batch_size = 1536`
 - `client_lr = 1e-4`
 - `client_weight_decay = 0.05`
+- `dataloader_persistent_workers = True`
+- `dataloader_prefetch_factor = 8`
 - `merge_threshold = 0.85`
 - `server_ema_alpha = 0.1`
 - `server_model_ema_alpha = 0.3`
 - `k_init_prototypes = 20`
+
+Training and evaluation dataloaders currently use a worker cap of `16`.
 
 Current GPAD values:
 
@@ -205,7 +209,7 @@ The evaluation path is:
 Current linear-probe settings:
 
 - epochs: `5`
-- batch size: `1024`
+- batch size: `1536`
 - learning rate: `1e-2`
 - weight decay: `1e-4`
 

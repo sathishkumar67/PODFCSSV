@@ -59,7 +59,7 @@ CONFIG: Dict[str, Any] = {
     "seed": 42,
     "num_clients": 2,
     "local_epochs": 1,
-    "batch_size": 1024,
+    "batch_size": 1536,
     "client_lr": 1e-4,
     "client_weight_decay": 0.05,
     "gpu_count": 0,
@@ -68,7 +68,7 @@ CONFIG: Dict[str, Any] = {
     "pin_memory": True,
     "dataloader_shuffle": True,
     "dataloader_persistent_workers": True,
-    "dataloader_prefetch_factor": 4,
+    "dataloader_prefetch_factor": 8,
     "cudnn_benchmark": True,
     "pretrained_model_name": "facebook/vit-mae-base",
     "embedding_dim": 768,
@@ -99,7 +99,7 @@ MULTI_DATASET_CONFIG: Dict[str, Any] = {
     **CONFIG,
     "num_clients": 2,
     "rounds_per_dataset": 3,
-    "linear_eval_batch_size": 1024,
+    "linear_eval_batch_size": 1536,
     "linear_eval_epochs": 5,
     "linear_eval_lr": 1e-2,
     "linear_eval_weight_decay": 1e-4,
@@ -308,10 +308,10 @@ def resolve_worker_count() -> int:
     dataloaders do not oversubscribe large machines:
     1. read the visible CPU count,
     2. reserve one core for the main process when possible, and
-    3. cap the resulting worker count at ``4``.
+    3. cap the resulting worker count at ``16``.
     """
     cpu_count = os.cpu_count() or 1
-    return min(4, max(1, cpu_count - 1))
+    return min(16, max(1, cpu_count - 1))
 
 
 def build_base_model(config: Dict[str, Any]) -> nn.Module:
