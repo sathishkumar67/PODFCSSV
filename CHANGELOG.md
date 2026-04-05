@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Final-Only Checkpointing** (`main.py`): Mid-run checkpoint saves have been removed so checkpoints now represent completed experiments rather than partial training snapshots.
 - **Documentation Refresh** (`README.md`, `CONTRIBUTING.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Repository documentation now reflects the current full-split training policy, the benchmark-plus-stress stage order, the final-only benchmark linear-probe flow, and the float32/device rules used by the active pipeline.
 - **Loader Worker Policy** (`main.py`): Runtime worker counts are now capped at `4` instead of scaling to nearly the full visible CPU count.
-- **Training Batch Size** (`main.py`): The shared training batch size used by both federated and baseline modes is now `512`.
+- **Training Batch Size** (`main.py`): The shared training batch size used by both federated and baseline modes is now `1024`.
 
 ### Fixed
 - **CUDA Runtime Validation** (`main.py`): The runtime now validates that CUDA can execute a small kernel before treating a GPU as usable, preventing deep training failures on incompatible CUDA environments.

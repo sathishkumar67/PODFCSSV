@@ -133,7 +133,7 @@ Current shared training defaults in `main.py`:
 
 - `local_epochs = 1`
 - `rounds_per_dataset = 3`
-- `batch_size = 512`
+- `batch_size = 1024`
 - `client_lr = 1e-4`
 - `client_weight_decay = 0.05`
 - `dataloader_shuffle = True`
@@ -202,7 +202,7 @@ For each benchmark dataset:
 Current linear-probe settings:
 
 - epochs: `5`
-- batch size: `512`
+- batch size: `1024`
 - learning rate: `1e-2`
 - weight decay: `1e-4`
 
