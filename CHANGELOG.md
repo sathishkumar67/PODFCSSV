@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single-File Workflow** (`main.py`): The standalone evaluation entrypoint has been removed from the active pipeline, and the final comparison logic now lives directly inside the same file as the training modes.
 - **Final-Only Linear-Probe Evaluation** (`main.py`): The active workflow now trains straight through the full continual stream and runs one frozen-feature benchmark linear-probe pass only after training completes.
 - **Final-Only Checkpointing** (`main.py`): Mid-run checkpoint saves have been removed so checkpoints now represent completed experiments rather than partial training snapshots.
+- **Checkpoint/Probe Separation** (`main.py`): Final checkpoints are now saved immediately after training ends and contain only experiment state, while final probe JSON and plot artifacts are exported separately under a dedicated `final_linear_probe` folder.
 - **Documentation Refresh** (`README.md`, `CONTRIBUTING.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Repository documentation now reflects the current full-split training policy, the benchmark-plus-stress stage order, the final-only benchmark linear-probe flow, and the float32/device rules used by the active pipeline.
 - **Loader Worker Policy** (`main.py`): Runtime worker counts are now capped at `16` instead of scaling to nearly the full visible CPU count.
 - **Training Batch Size** (`main.py`): The shared training batch size used by both federated and baseline modes is now `512`.

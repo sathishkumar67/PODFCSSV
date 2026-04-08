@@ -12,7 +12,8 @@ The workflow is:
 5. train through that continual stream in either federated or baseline mode,
 6. run one final frozen-feature linear-probe pass on the benchmark datasets,
    and
-7. save histories, plots, and the final checkpoint.
+7. save the final checkpoint and training artifacts, then export probe
+   artifacts separately.
 
 This file therefore owns configuration, dataset loading, training loops, server
 communication, evaluation, plotting, and final export for the active pipeline.
@@ -281,23 +282,33 @@ def extract_trainable_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
 def prepare_output_dirs(save_dir: str) -> Dict[str, Path]:
     """Create the standard output directory structure for one run.
 
-    Every run writes into three stable locations:
+    Every run writes into stable training and evaluation locations:
     1. ``checkpoints`` for model snapshots.
     2. ``metrics`` for JSON histories.
     3. ``plots`` for publication-oriented visualizations.
+    4. ``final_linear_probe/metrics`` for the final probe JSON exports.
+    5. ``final_linear_probe/plots`` for the final probe figures.
     """
     root = Path(save_dir)
     checkpoints_dir = root / "checkpoints"
     metrics_dir = root / "metrics"
     plots_dir = root / "plots"
+    probe_root = root / "final_linear_probe"
+    probe_metrics_dir = probe_root / "metrics"
+    probe_plots_dir = probe_root / "plots"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
     plots_dir.mkdir(parents=True, exist_ok=True)
+    probe_metrics_dir.mkdir(parents=True, exist_ok=True)
+    probe_plots_dir.mkdir(parents=True, exist_ok=True)
     return {
         "root": root,
         "checkpoints": checkpoints_dir,
         "metrics": metrics_dir,
         "plots": plots_dir,
+        "probe_root": probe_root,
+        "probe_metrics": probe_metrics_dir,
+        "probe_plots": probe_plots_dir,
     }
 
 
@@ -388,23 +399,19 @@ def save_checkpoint(
     base_model: nn.Module,
     config: Dict[str, Any],
     proto_bank: Optional[GlobalPrototypeBank] = None,
-    training_history: Optional[Dict[str, Any]] = None,
-    final_linear_probe_summary: Optional[Dict[str, Any]] = None,
     is_final: bool = False,
-    include_training_history: bool = True,
 ) -> Path:
     """Save the final experiment snapshot in the repository checkpoint format.
 
-    The active workflow writes checkpoints only after the whole run completes.
+    The active workflow writes the final checkpoint as soon as training ends.
     Each saved file contains:
     1. the final round index,
     2. the trainable adapter state,
     3. the serialized runtime config, and
-    4. the optional global prototype bank for federated runs, and
-    5. the optional final linear-probe summary.
+    4. the optional global prototype bank for federated runs.
 
-    The saved payload is intended for later analysis and downstream evaluation
-    of the finished run rather than for exact mid-training crash recovery.
+    Final probe artifacts are intentionally stored outside the checkpoint so the
+    model snapshot remains available even if later evaluation fails.
     """
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = {
@@ -414,10 +421,6 @@ def save_checkpoint(
     }
     if proto_bank is not None:
         checkpoint["global_prototypes"] = proto_bank.get_prototypes().detach().cpu()
-    if include_training_history and training_history is not None:
-        checkpoint["training_history"] = training_history
-    if final_linear_probe_summary is not None:
-        checkpoint["final_linear_probe"] = final_linear_probe_summary
     filename = "final_model.pt" if is_final else f"round_{round_idx}.pt"
     checkpoint_path = checkpoint_dir / filename
     torch.save(checkpoint, checkpoint_path)
@@ -510,13 +513,13 @@ def print_round_summary(
 def initialize_history() -> Dict[str, Any]:
     """Create the federated history structure used across the whole run.
 
-    The history dictionary stores two kinds of information:
-    1. round-wise optimization and communication metrics collected during
-        federated training, and
-    2. one final benchmark-only linear-probe summary collected after training.
+    The history dictionary stores only training-time information:
+    1. round-wise optimization metrics,
+    2. communication statistics, and
+    3. per-round client summaries.
 
-    Keeping both views in one structure ensures that JSON exports, plots, and
-    final checkpoint metadata stay synchronized.
+    Final linear-probe artifacts are exported separately so finished training
+    state is preserved even if evaluation later fails.
     """
     return {
         "round_ids": [],
@@ -535,7 +538,6 @@ def initialize_history() -> Dict[str, Any]:
         "task_classes": [],
         "stage_kinds": [],
         "client_results": [],
-        "final_linear_probe": None,
     }
 
 
@@ -1603,7 +1605,7 @@ def render_final_linear_probe_outputs(
     plots_dir: Path,
     prefix: str,
 ) -> None:
-    """Write the JSON and plot artifacts for the final linear-probe summary."""
+    """Write the final probe artifacts into the dedicated probe output folder."""
     save_json_payload(
         final_linear_probe_summary,
         metrics_dir,
@@ -1637,10 +1639,11 @@ def log_final_linear_probe_summary(
 def initialize_baseline_history() -> Dict[str, Any]:
     """Create the history structure written by the baseline mode.
 
-    The baseline records three groups of information:
+    The baseline records two groups of information:
     1. Round-wise reconstruction metrics.
     2. Per-stage dataset summaries.
-    3. One final benchmark-only linear-probe summary.
+
+    The final linear probe is exported separately from the training history.
     """
     return {
         "round_ids": [],
@@ -1650,7 +1653,6 @@ def initialize_baseline_history() -> Dict[str, Any]:
         "avg_total_loss": [],
         "avg_mae_loss": [],
         "stage_summaries": [],
-        "final_linear_probe": None,
     }
 
 
@@ -1759,8 +1761,9 @@ def run_baseline_experiment() -> None:
     2. walk through the same benchmark-plus-stress stage order,
     3. optimize reconstruction loss only,
     4. preserve the model and optimizer state across dataset transitions,
-    5. run one final linear probe on the benchmark datasets only, and
-    6. save the histories, plots, probe summary, and final checkpoint.
+    5. save the finished training checkpoint and histories,
+    6. run one final linear probe on the benchmark datasets only, and
+    7. export the probe summary into the dedicated probe folder.
     """
     config = dict(BASELINE_CONFIG)
     config["run_mode"] = "baseline"
@@ -1906,52 +1909,68 @@ def run_baseline_experiment() -> None:
         save_history(history, output_dirs["metrics"], filename="baseline_training_history.json")
         plot_baseline_training_history(history, output_dirs["plots"])
 
-    final_probe_results = evaluate_datasets(
-        model=model,
-        dataset_names=config["linear_probe_dataset_order"],
-        config=config,
-    )
-    final_linear_probe_summary = summarize_final_linear_probe(
-        evaluation_results=final_probe_results,
-        dataset_order=config["linear_probe_dataset_order"],
-    )
-    history["final_linear_probe"] = final_linear_probe_summary
-    baseline_logger.info(
-        "Baseline final linear probe | datasets=%s | avg_acc=%.4f",
-        ", ".join(
-            DATASET_DISPLAY_NAMES[name]
-            for name in final_linear_probe_summary["dataset_order"]
-        ),
-        final_linear_probe_summary["average_accuracy"],
-    )
-    log_final_linear_probe_summary(
-        active_logger=baseline_logger,
-        run_label="Baseline",
-        final_linear_probe_summary=final_linear_probe_summary,
-    )
-
     save_checkpoint(
         checkpoint_dir=output_dirs["checkpoints"],
         round_idx=global_round_idx,
         base_model=model,
         config=config,
-        training_history=history,
-        final_linear_probe_summary=final_linear_probe_summary,
         is_final=True,
-        include_training_history=False,
     )
     save_history(history, output_dirs["metrics"], filename="baseline_training_history.json")
     plot_baseline_training_history(history, output_dirs["plots"])
-    render_final_linear_probe_outputs(
-        final_linear_probe_summary=final_linear_probe_summary,
-        metrics_dir=output_dirs["metrics"],
-        plots_dir=output_dirs["plots"],
-        prefix="baseline",
-    )
     baseline_logger.info(
-        "Baseline complete | rounds=%s | final_checkpoint=%s",
+        "Baseline training complete | rounds=%s | final_checkpoint=%s",
         global_round_idx,
         output_dirs["checkpoints"] / "final_model.pt",
+    )
+    try:
+        final_probe_results = evaluate_datasets(
+            model=model,
+            dataset_names=config["linear_probe_dataset_order"],
+            config=config,
+        )
+        final_linear_probe_summary = summarize_final_linear_probe(
+            evaluation_results=final_probe_results,
+            dataset_order=config["linear_probe_dataset_order"],
+        )
+        baseline_logger.info(
+            "Baseline final linear probe | datasets=%s | avg_acc=%.4f",
+            ", ".join(
+                DATASET_DISPLAY_NAMES[name]
+                for name in final_linear_probe_summary["dataset_order"]
+            ),
+            final_linear_probe_summary["average_accuracy"],
+        )
+        log_final_linear_probe_summary(
+            active_logger=baseline_logger,
+            run_label="Baseline",
+            final_linear_probe_summary=final_linear_probe_summary,
+        )
+        render_final_linear_probe_outputs(
+            final_linear_probe_summary=final_linear_probe_summary,
+            metrics_dir=output_dirs["probe_metrics"],
+            plots_dir=output_dirs["probe_plots"],
+            prefix="baseline",
+        )
+    except Exception as exc:
+        save_json_payload(
+            {
+                "run_mode": "baseline",
+                "error": str(exc),
+                "checkpoint_path": str(output_dirs["checkpoints"] / "final_model.pt"),
+            },
+            output_dirs["probe_metrics"],
+            filename="baseline_final_linear_probe_error.json",
+        )
+        baseline_logger.exception(
+            "Baseline final linear probe failed after the final checkpoint was saved."
+        )
+        raise
+    baseline_logger.info(
+        "Baseline complete | rounds=%s | final_checkpoint=%s | probe_dir=%s",
+        global_round_idx,
+        output_dirs["checkpoints"] / "final_model.pt",
+        output_dirs["probe_root"],
     )
 
 
@@ -1970,8 +1989,9 @@ def run_federated_experiment() -> None:
     7. broadcast the updated global state back to the clients,
     8. preserve both global memory and client-local memory across dataset
        changes,
-    9. run one final linear probe on the benchmark datasets only, and
-    10. save communication history, plots, the probe summary, and the final checkpoint.
+    9. save the finished training checkpoint and training artifacts,
+    10. run one final linear probe on the benchmark datasets only, and
+    11. export the probe summary into the dedicated probe folder.
     """
     config = dict(MULTI_DATASET_CONFIG)
     config["run_mode"] = "federated"
@@ -2295,40 +2315,13 @@ def run_federated_experiment() -> None:
             prefix="main",
         )
 
-    final_probe_results = evaluate_datasets(
-        model=base_model,
-        dataset_names=config["linear_probe_dataset_order"],
-        config=config,
-    )
-    final_linear_probe_summary = summarize_final_linear_probe(
-        evaluation_results=final_probe_results,
-        dataset_order=config["linear_probe_dataset_order"],
-    )
-    training_history["final_linear_probe"] = final_linear_probe_summary
-    logger.info(
-        "Final linear probe | datasets=%s | avg_acc=%.4f",
-        ", ".join(
-            DATASET_DISPLAY_NAMES[name]
-            for name in final_linear_probe_summary["dataset_order"]
-        ),
-        final_linear_probe_summary["average_accuracy"],
-    )
-    log_final_linear_probe_summary(
-        active_logger=logger,
-        run_label="Federated",
-        final_linear_probe_summary=final_linear_probe_summary,
-    )
-
     save_checkpoint(
         checkpoint_dir=output_dirs["checkpoints"],
         round_idx=global_round_idx,
         base_model=base_model,
         proto_bank=proto_bank,
-        training_history=training_history,
-        final_linear_probe_summary=final_linear_probe_summary,
         config=config,
         is_final=True,
-        include_training_history=False,
     )
     save_history(training_history, output_dirs["metrics"])
     plot_training_history(
@@ -2336,16 +2329,59 @@ def run_federated_experiment() -> None:
         output_dirs["plots"],
         prefix="main",
     )
-    render_final_linear_probe_outputs(
-        final_linear_probe_summary=final_linear_probe_summary,
-        metrics_dir=output_dirs["metrics"],
-        plots_dir=output_dirs["plots"],
-        prefix="main",
-    )
     logger.info(
-        "Training complete | rounds=%s | final_checkpoint=%s",
+        "Federated training complete | rounds=%s | final_checkpoint=%s",
         global_round_idx,
         output_dirs["checkpoints"] / "final_model.pt",
+    )
+    try:
+        final_probe_results = evaluate_datasets(
+            model=base_model,
+            dataset_names=config["linear_probe_dataset_order"],
+            config=config,
+        )
+        final_linear_probe_summary = summarize_final_linear_probe(
+            evaluation_results=final_probe_results,
+            dataset_order=config["linear_probe_dataset_order"],
+        )
+        logger.info(
+            "Final linear probe | datasets=%s | avg_acc=%.4f",
+            ", ".join(
+                DATASET_DISPLAY_NAMES[name]
+                for name in final_linear_probe_summary["dataset_order"]
+            ),
+            final_linear_probe_summary["average_accuracy"],
+        )
+        log_final_linear_probe_summary(
+            active_logger=logger,
+            run_label="Federated",
+            final_linear_probe_summary=final_linear_probe_summary,
+        )
+        render_final_linear_probe_outputs(
+            final_linear_probe_summary=final_linear_probe_summary,
+            metrics_dir=output_dirs["probe_metrics"],
+            plots_dir=output_dirs["probe_plots"],
+            prefix="main",
+        )
+    except Exception as exc:
+        save_json_payload(
+            {
+                "run_mode": "federated",
+                "error": str(exc),
+                "checkpoint_path": str(output_dirs["checkpoints"] / "final_model.pt"),
+            },
+            output_dirs["probe_metrics"],
+            filename="main_final_linear_probe_error.json",
+        )
+        logger.exception(
+            "Federated final linear probe failed after the final checkpoint was saved."
+        )
+        raise
+    logger.info(
+        "Training complete | rounds=%s | final_checkpoint=%s | probe_dir=%s",
+        global_round_idx,
+        output_dirs["checkpoints"] / "final_model.pt",
+        output_dirs["probe_root"],
     )
 
 

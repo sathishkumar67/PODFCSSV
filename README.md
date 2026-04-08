@@ -14,7 +14,7 @@ The active experiment pipeline follows these steps:
 4. Build the continual stage plan that interleaves benchmark datasets with additional stress datasets.
 5. Train through that stage stream in either federated mode or baseline mode.
 6. After the full training stream finishes, freeze the final encoder and evaluate the benchmark datasets through one linear-probe pass.
-7. Save JSON histories, plots, one final probe summary, and one final checkpoint at the end of the run.
+7. Save the final checkpoint and training artifacts as soon as training ends, then export the final probe summary into a separate probe folder.
 
 ## Run Modes
 
@@ -236,13 +236,21 @@ Each run writes:
 - one final checkpoint
 - JSON metric and history files
 - training summary plots
-- one final benchmark linear-probe JSON summary
-- one final linear-probe accuracy bar plot
+- one separate final benchmark linear-probe JSON summary
+- one separate final linear-probe accuracy bar plot
+
+The final checkpoint is state-only. Training metrics, histories, and final probe
+results are written as separate JSON and plot artifacts.
 
 The active output directories are:
 
 - federated: `multidataset_outputs_2client`
 - baseline: `baseline_outputs`
+
+Inside each run directory, final probe exports are written to:
+
+- `final_linear_probe/metrics`
+- `final_linear_probe/plots`
 
 ## Runtime and Numeric Safety
 

@@ -32,7 +32,7 @@ pip install -r requirements.txt
 
 The active files are:
 
-- `main.py`: full experiment orchestration, dataset loading, training, linear-probe evaluation, plotting, and final checkpoint export
+- `main.py`: full experiment orchestration, dataset loading, training, linear-probe evaluation, plotting, final checkpoint export, and separate final-probe artifact export
 - `src/mae_with_adapter.py`: frozen-backbone adapter injection
 - `src/loss.py`: GPAD loss
 - `src/client.py`: client-side continual state, local training, and local prototype maintenance

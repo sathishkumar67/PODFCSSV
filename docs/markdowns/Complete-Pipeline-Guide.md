@@ -243,10 +243,18 @@ The run writes:
 - one final checkpoint
 - JSON histories
 - training summary plots
-- one final benchmark linear-probe JSON summary
-- one final linear-probe accuracy bar plot
+- one separate final benchmark linear-probe JSON summary
+- one separate final linear-probe accuracy bar plot
+
+The final checkpoint contains only run state. Training metrics, histories, and
+final probe results are exported separately.
 
 There are no mid-run checkpoints in the current workflow.
+
+The final probe exports are written into a dedicated folder:
+
+- `final_linear_probe/metrics`
+- `final_linear_probe/plots`
 
 ## 12. Device and Numeric Safety
 
