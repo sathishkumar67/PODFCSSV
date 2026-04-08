@@ -27,6 +27,10 @@ python main.py
 
 The script does not expect a mode argument on the command line.
 
+Before either mode starts training, the pipeline now prepares every benchmark,
+stress, and final-probe dataset that the run will need. Training begins only
+after that dataset-preparation phase finishes.
+
 ## 2. Shared Model Construction
 
 Both modes build the same representation backbone and only differ in how training is orchestrated afterward.
@@ -61,7 +65,7 @@ The dataloaders use:
 - a worker cap of `16`,
 - `shuffle = True` for training,
 - persistent workers when multiprocessing is enabled,
-- prefetching with factor `4`,
+- prefetching with factor `8`,
 - pinned memory only when the run is actually on CUDA.
 
 ## 4. Dataset Layout
@@ -165,16 +169,17 @@ Current GPAD values:
 
 When `RUN_MODE = "federated"`, the pipeline behaves as follows:
 
-1. Build one shared adapter-injected MAE backbone.
-2. Create two client copies.
-3. Load one dataset per client for the current stage.
-4. Train each client locally for the configured round and epoch budget.
-5. Use GPAD only for samples whose embeddings are confidently anchored to the global prototype bank.
-6. Route the remaining embeddings through each client's local prototype bank and novelty buffer.
-7. Upload only trainable adapter weights and local prototypes.
-8. Merge prototypes and aggregate adapter weights on the server.
-9. Smooth the aggregated adapter weights with server-side EMA.
-10. Broadcast the updated adapter weights and global prototype bank back to the clients.
+1. Prepare every benchmark, stress, and final-probe dataset before training begins.
+2. Build one shared adapter-injected MAE backbone.
+3. Create two client copies.
+4. Reuse the prepared dataset objects for the current stage.
+5. Train each client locally for the configured round and epoch budget.
+6. Use GPAD only for samples whose embeddings are confidently anchored to the global prototype bank.
+7. Route the remaining embeddings through each client's local prototype bank and novelty buffer.
+8. Upload only trainable adapter weights and local prototypes.
+9. Merge prototypes and aggregate adapter weights on the server.
+10. Smooth the aggregated adapter weights with server-side EMA.
+11. Broadcast the updated adapter weights and global prototype bank back to the clients.
 
 Important continual-learning state that persists across dataset changes on each client:
 
@@ -186,15 +191,16 @@ Important continual-learning state that persists across dataset changes on each 
 
 When `RUN_MODE = "baseline"`, the pipeline keeps the same stage stream but removes all federated machinery:
 
-1. Build the same adapter-injected MAE backbone.
-2. Walk through the exact same benchmark-plus-stress stage stream sequentially.
-3. Optimize reconstruction loss only.
-4. Preserve the model weights and optimizer state across dataset transitions.
-5. Skip GPAD, prototype exchange, and server aggregation.
+1. Prepare every benchmark, stress, and final-probe dataset before training begins.
+2. Build the same adapter-injected MAE backbone.
+3. Walk through the exact same benchmark-plus-stress stage stream sequentially.
+4. Optimize reconstruction loss only.
+5. Preserve the model weights and optimizer state across dataset transitions.
+6. Skip GPAD, prototype exchange, and server aggregation.
 
 ## 9. Final Linear-Probe Evaluation
 
-After the full training stream finishes, both modes evaluate the benchmark datasets through one final linear-probe pass.
+After the full training stream finishes, both modes evaluate the benchmark datasets through one final linear-probe pass. Those held-out benchmark splits are prepared during startup, so the final probe reuses already prepared datasets instead of triggering late first-use downloads.
 
 The evaluation path is:
 

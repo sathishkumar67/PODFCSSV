@@ -32,7 +32,7 @@ pip install -r requirements.txt
 
 The active files are:
 
-- `main.py`: full experiment orchestration, dataset loading, training, linear-probe evaluation, plotting, final checkpoint export, and separate final-probe artifact export
+- `main.py`: full experiment orchestration, upfront dataset preparation, training, linear-probe evaluation, plotting, final checkpoint export, and separate final-probe artifact export
 - `src/mae_with_adapter.py`: frozen-backbone adapter injection
 - `src/loss.py`: GPAD loss
 - `src/client.py`: client-side continual state, local training, and local prototype maintenance
@@ -116,7 +116,11 @@ Stress datasets are merged into a single self-supervised training pool per datas
 - `CIFAR100`: `train + test`
 - `DTD`: `train + val + test`
 
-The active dataloader worker policy is capped at `4` workers for both training and linear-probe evaluation.
+The active dataloader worker policy is capped at `16` workers for both training and linear-probe evaluation.
+
+Before training starts in either mode, `main.py` prepares every benchmark,
+stress, and final-probe dataset required by the selected run so the long
+training loop does not stop later for first-use dataset downloads.
 
 ## Behavioral Rules for Contributions
 

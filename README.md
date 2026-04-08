@@ -9,12 +9,13 @@ This repository currently runs from a single executable file, `main.py`. The fil
 The active experiment pipeline follows these steps:
 
 1. Select the execution mode by setting `RUN_MODE` inside `main.py`.
-2. Build a pretrained `facebook/vit-mae-base` backbone and inject lightweight adapters into the upper half of the encoder.
-3. Resolve the real runtime device by validating CUDA with a small smoke test before any heavy training starts.
-4. Build the continual stage plan that interleaves benchmark datasets with additional stress datasets.
-5. Train through that stage stream in either federated mode or baseline mode.
-6. After the full training stream finishes, freeze the final encoder and evaluate the benchmark datasets through one linear-probe pass.
-7. Save the final checkpoint and training artifacts as soon as training ends, then export the final probe summary into a separate probe folder.
+2. Resolve the real runtime device by validating CUDA with a small smoke test before any heavy training starts.
+3. Build the continual stage plan that interleaves benchmark datasets with additional stress datasets.
+4. Prepare every benchmark, stress, and final-probe dataset before the first training round starts.
+5. Build a pretrained `facebook/vit-mae-base` backbone and inject lightweight adapters into the upper half of the encoder.
+6. Train through that stage stream in either federated mode or baseline mode.
+7. After the full training stream finishes, freeze the final encoder and evaluate the benchmark datasets through one linear-probe pass.
+8. Save the final checkpoint and training artifacts as soon as training ends, then export the final probe summary into a separate probe folder.
 
 ## Run Modes
 
@@ -147,15 +148,16 @@ Training and evaluation dataloaders currently use a worker cap of `16`.
 
 In federated mode, the training loop in `main.py` performs the following steps at every stage:
 
-1. Build one shared adapter-injected MAE backbone.
-2. Create two client copies and place them on the selected devices.
-3. Load one dataset per client for the current stage.
-4. Train each client locally with MAE reconstruction loss.
-5. Apply GPAD only to the samples that are confidently anchored to the global prototype bank.
-6. Preserve each client's optimizer state, local prototype bank, and novelty buffer across dataset transitions.
-7. Upload only trainable adapter weights and local prototypes to the server.
-8. Merge client prototypes into the global bank and aggregate adapter weights on the server.
-9. Broadcast the updated global adapter state and global prototype bank back to the clients for the next round.
+1. Prepare every benchmark, stress, and final-probe dataset before training begins.
+2. Build one shared adapter-injected MAE backbone.
+3. Create two client copies and place them on the selected devices.
+4. Reuse the prepared dataset objects stage by stage during client training.
+5. Train each client locally with MAE reconstruction loss.
+6. Apply GPAD only to the samples that are confidently anchored to the global prototype bank.
+7. Preserve each client's optimizer state, local prototype bank, and novelty buffer across dataset transitions.
+8. Upload only trainable adapter weights and local prototypes to the server.
+9. Merge client prototypes into the global bank and aggregate adapter weights on the server.
+10. Broadcast the updated global adapter state and global prototype bank back to the clients for the next round.
 
 Current GPAD and prototype settings:
 
@@ -174,17 +176,18 @@ Current GPAD and prototype settings:
 
 In baseline mode, `main.py` uses the same benchmark-plus-stress stage order but removes all federated components:
 
-1. Build the same adapter-injected MAE backbone.
-2. Train one single model sequentially across the full stage stream.
-3. Use reconstruction loss only.
-4. Preserve the model weights and optimizer state across dataset transitions.
-5. Skip GPAD, prototype exchange, and server aggregation entirely.
+1. Prepare every benchmark, stress, and final-probe dataset before training begins.
+2. Build the same adapter-injected MAE backbone.
+3. Train one single model sequentially across the full stage stream.
+4. Use reconstruction loss only.
+5. Preserve the model weights and optimizer state across dataset transitions.
+6. Skip GPAD, prototype exchange, and server aggregation entirely.
 
 This makes the baseline a direct continual-learning comparison against the federated method under the same stage order.
 
 ## Final Linear-Probe Evaluation
 
-After the full training stream finishes, the final model is evaluated once on the benchmark datasets only.
+After the full training stream finishes, the final model is evaluated once on the benchmark datasets only. The held-out benchmark splits used by the probe are already prepared during the startup dataset phase, so the final probe does not need to trigger late first-use downloads.
 
 The current pipeline uses one evaluation view:
 

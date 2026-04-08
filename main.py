@@ -7,12 +7,14 @@ training, evaluation, and export behavior can be audited step by step.
 The workflow is:
 1. read the selected ``RUN_MODE``,
 2. resolve the device and keep the active math path in ``torch.float32``,
-3. build the shared adapter-injected ViT-MAE backbone,
-4. build the benchmark-plus-stress stage plan,
-5. train through that continual stream in either federated or baseline mode,
-6. run one final frozen-feature linear-probe pass on the benchmark datasets,
+3. prepare every training and held-out dataset needed by the run before
+   training begins,
+4. build the shared adapter-injected ViT-MAE backbone,
+5. build the benchmark-plus-stress stage plan,
+6. train through that continual stream in either federated or baseline mode,
+7. run one final frozen-feature linear-probe pass on the benchmark datasets,
    and
-7. save the final checkpoint and training artifacts, then export probe
+8. save the final checkpoint and training artifacts, then export probe
    artifacts separately.
 
 This file therefore owns configuration, dataset loading, training loops, server
@@ -1223,6 +1225,94 @@ def load_named_evaluation_dataset(
     )
 
 
+def prepare_dataset_cache(
+    config: Dict[str, Any],
+    training_stage_plan: Sequence[Dict[str, Any]],
+    probe_dataset_order: Sequence[str],
+    active_logger: logging.Logger,
+) -> Dict[str, torch.utils.data.Dataset]:
+    """Prepare every dataset variant needed by the run before training begins."""
+    dataset_cache: Dict[str, torch.utils.data.Dataset] = {}
+    seen_specs: set[tuple[str, bool]] = set()
+    ordered_specs: List[tuple[str, bool]] = []
+
+    for stage_spec in training_stage_plan:
+        merge_all_training_splits = stage_spec["stage_kind"] == "retention_noise"
+        if "dataset_name" in stage_spec:
+            stage_dataset_names = [stage_spec["dataset_name"]]
+        else:
+            stage_dataset_names = [
+                stage_spec["datasets"][client_index]
+                for client_index in sorted(stage_spec["datasets"])
+            ]
+
+        for dataset_name in stage_dataset_names:
+            spec = (dataset_name, merge_all_training_splits)
+            if spec not in seen_specs:
+                seen_specs.add(spec)
+                ordered_specs.append(spec)
+
+    active_logger.info(
+        "Preparing all datasets before training starts | train_variants=%s | probe_eval_variants=%s",
+        len(ordered_specs),
+        len(probe_dataset_order),
+    )
+
+    for dataset_name, merge_all_training_splits in ordered_specs:
+        split_label = "merged" if merge_all_training_splits else "standard"
+        cache_key = f"train::{dataset_name}::{split_label}"
+        dataset_cache[cache_key] = load_named_dataset(
+            dataset_name=dataset_name,
+            data_root=config["data_root"],
+            image_size=config["image_size"],
+            train=True,
+            seed=config["seed"],
+            max_samples=None,
+            min_samples=None,
+            merge_all_training_splits=merge_all_training_splits,
+        )
+        active_logger.info(
+            "Prepared training dataset | dataset=%s | split=%s | samples=%s",
+            DATASET_DISPLAY_NAMES[dataset_name],
+            split_label,
+            len(dataset_cache[cache_key]),
+        )
+
+    for dataset_name in probe_dataset_order:
+        train_cache_key = f"train::{dataset_name}::standard"
+        if train_cache_key not in dataset_cache:
+            dataset_cache[train_cache_key] = load_named_dataset(
+                dataset_name=dataset_name,
+                data_root=config["data_root"],
+                image_size=config["image_size"],
+                train=True,
+                seed=config["seed"],
+                max_samples=None,
+                min_samples=None,
+            )
+
+        eval_cache_key = f"eval::{dataset_name}"
+        dataset_cache[eval_cache_key] = load_named_evaluation_dataset(
+            dataset_name=dataset_name,
+            data_root=config["data_root"],
+            image_size=config["image_size"],
+            seed=config["seed"],
+            max_samples=None,
+            min_samples=None,
+        )
+        active_logger.info(
+            "Prepared evaluation dataset | dataset=%s | samples=%s",
+            DATASET_DISPLAY_NAMES[dataset_name],
+            len(dataset_cache[eval_cache_key]),
+        )
+
+    active_logger.info(
+        "All required datasets are ready | cached_entries=%s",
+        len(dataset_cache),
+    )
+    return dataset_cache
+
+
 def create_standard_dataloader(
     dataset: torch.utils.data.Dataset,
     batch_size: int,
@@ -1452,30 +1542,42 @@ def evaluate_datasets(
     model: nn.Module,
     dataset_names: Sequence[str],
     config: Dict[str, Any],
+    dataset_cache: Optional[Dict[str, torch.utils.data.Dataset]] = None,
 ) -> Dict[str, Dict[str, float]]:
     """Run the final frozen-feature linear probe on the requested benchmark datasets.
 
-    The final comparison path is shared by baseline and federated runs:
-    1. load the official train-side split for probe fitting,
-    2. load the held-out split used for reporting,
+    The final comparison path is shared by baseline and federated runs and
+    reuses the prepared dataset cache whenever it is available:
+    1. reuse the benchmark train-side split for probe fitting,
+    2. reuse the held-out split used for reporting,
     3. extract full-image encoder features with masking disabled,
     4. train a linear classifier on those frozen features, and
     5. record the held-out accuracy and sample counts for the final summary.
     """
     results: Dict[str, Dict[str, float]] = {}
     for dataset_name in dataset_names:
-        train_dataset = load_named_dataset(
-            dataset_name=dataset_name,
-            data_root=config["data_root"],
-            image_size=config["image_size"],
-            train=True,
-            seed=config["seed"],
+        train_cache_key = f"train::{dataset_name}::standard"
+        eval_cache_key = f"eval::{dataset_name}"
+        train_dataset = (
+            dataset_cache[train_cache_key]
+            if dataset_cache and train_cache_key in dataset_cache
+            else load_named_dataset(
+                dataset_name=dataset_name,
+                data_root=config["data_root"],
+                image_size=config["image_size"],
+                train=True,
+                seed=config["seed"],
+            )
         )
-        test_dataset = load_named_evaluation_dataset(
-            dataset_name=dataset_name,
-            data_root=config["data_root"],
-            image_size=config["image_size"],
-            seed=config["seed"],
+        test_dataset = (
+            dataset_cache[eval_cache_key]
+            if dataset_cache and eval_cache_key in dataset_cache
+            else load_named_evaluation_dataset(
+                dataset_name=dataset_name,
+                data_root=config["data_root"],
+                image_size=config["image_size"],
+                seed=config["seed"],
+            )
         )
 
         train_loader = create_standard_dataloader(
@@ -1757,13 +1859,15 @@ def run_baseline_experiment() -> None:
     The baseline keeps the same backbone, stage order, and evaluation path as
     the federated run, but removes the federated-specific machinery. The
     execution path is:
-    1. build one adapter-injected ViT-MAE model,
-    2. walk through the same benchmark-plus-stress stage order,
-    3. optimize reconstruction loss only,
-    4. preserve the model and optimizer state across dataset transitions,
-    5. save the finished training checkpoint and histories,
-    6. run one final linear probe on the benchmark datasets only, and
-    7. export the probe summary into the dedicated probe folder.
+    1. resolve the full stage plan and the benchmark probe list,
+    2. prepare every required training and held-out dataset before training starts,
+    3. build one adapter-injected ViT-MAE model,
+    4. walk through the same benchmark-plus-stress stage order,
+    5. optimize reconstruction loss only,
+    6. preserve the model and optimizer state across dataset transitions,
+    7. save the finished training checkpoint and histories,
+    8. run one final linear probe on the benchmark datasets only, and
+    9. export the probe summary into the dedicated probe folder.
     """
     config = dict(BASELINE_CONFIG)
     config["run_mode"] = "baseline"
@@ -1809,6 +1913,12 @@ def run_baseline_experiment() -> None:
 
     set_random_seed(config["seed"])
     output_dirs = prepare_output_dirs(config["save_dir"])
+    dataset_cache = prepare_dataset_cache(
+        config=config,
+        training_stage_plan=baseline_stage_plan,
+        probe_dataset_order=config["linear_probe_dataset_order"],
+        active_logger=baseline_logger,
+    )
 
     model = build_base_model(config)
     optimizer = optim.AdamW(
@@ -1842,16 +1952,9 @@ def run_baseline_experiment() -> None:
         )
         stage_losses: List[float] = []
 
-        dataset = load_named_dataset(
-            dataset_name=dataset_name,
-            data_root=config["data_root"],
-            image_size=config["image_size"],
-            train=True,
-            seed=config["seed"],
-            max_samples=None,
-            min_samples=None,
-            merge_all_training_splits=(stage_kind == "retention_noise"),
-        )
+        dataset = dataset_cache[
+            f"train::{dataset_name}::{'merged' if stage_kind == 'retention_noise' else 'standard'}"
+        ]
         dataloader = create_baseline_dataloader(dataset=dataset, config=config)
 
         for dataset_round in range(1, config["rounds_per_dataset"] + 1):
@@ -1928,6 +2031,7 @@ def run_baseline_experiment() -> None:
             model=model,
             dataset_names=config["linear_probe_dataset_order"],
             config=config,
+            dataset_cache=dataset_cache,
         )
         final_linear_probe_summary = summarize_final_linear_probe(
             evaluation_results=final_probe_results,
@@ -1979,19 +2083,21 @@ def run_federated_experiment() -> None:
 
     This is the proposed method implemented by the repository. The execution
     path is:
-    1. build the shared adapter-injected ViT-MAE backbone and the global
+    1. resolve the full stage plan and the benchmark probe list,
+    2. prepare every required training and held-out dataset before training starts,
+    3. build the shared adapter-injected ViT-MAE backbone and the global
        prototype bank,
-    2. alternate benchmark stages with retention-stress stages,
-    3. train one dataset per client for the configured rounds,
-    4. upload only trainable adapter weights and local prototype banks,
-    5. merge prototypes and aggregate adapter weights on the server,
-    6. smooth the aggregated adapter state with server-side EMA,
-    7. broadcast the updated global state back to the clients,
-    8. preserve both global memory and client-local memory across dataset
-       changes,
-    9. save the finished training checkpoint and training artifacts,
-    10. run one final linear probe on the benchmark datasets only, and
-    11. export the probe summary into the dedicated probe folder.
+    4. alternate benchmark stages with retention-stress stages,
+    5. train one dataset per client for the configured rounds,
+    6. upload only trainable adapter weights and local prototype banks,
+    7. merge prototypes and aggregate adapter weights on the server,
+    8. smooth the aggregated adapter state with server-side EMA,
+    9. broadcast the updated global state back to the clients,
+    10. preserve both global memory and client-local memory across dataset
+        changes,
+    11. save the finished training checkpoint and training artifacts,
+    12. run one final linear probe on the benchmark datasets only, and
+    13. export the probe summary into the dedicated probe folder.
     """
     config = dict(MULTI_DATASET_CONFIG)
     config["run_mode"] = "federated"
@@ -2059,6 +2165,12 @@ def run_federated_experiment() -> None:
 
     set_random_seed(config["seed"])
     output_dirs = prepare_output_dirs(config["save_dir"])
+    dataset_cache = prepare_dataset_cache(
+        config=config,
+        training_stage_plan=stage_plan,
+        probe_dataset_order=config["linear_probe_dataset_order"],
+        active_logger=logger,
+    )
 
     logger.info(
         "Starting unified federated run | clients=%s | total_stages=%s | benchmark_stages=%s | rounds_per_stage=%s | total_rounds=%s | batch_size=%s | linear_probe_epochs=%s | device=%s | output=%s",
@@ -2128,16 +2240,9 @@ def run_federated_experiment() -> None:
 
         stage_datasets: List[torch.utils.data.Dataset] = []
         for client_index, dataset_name in enumerate(stage_dataset_names):
-            dataset = load_named_dataset(
-                dataset_name=dataset_name,
-                data_root=config["data_root"],
-                image_size=config["image_size"],
-                train=True,
-                seed=config["seed"],
-                max_samples=None,
-                min_samples=None,
-                merge_all_training_splits=(stage_kind == "retention_noise"),
-            )
+            dataset = dataset_cache[
+                f"train::{dataset_name}::{'merged' if stage_kind == 'retention_noise' else 'standard'}"
+            ]
             stage_datasets.append(dataset)
             logger.info(
                 "Client %s ready | dataset=%s | train_samples=%s",
@@ -2339,6 +2444,7 @@ def run_federated_experiment() -> None:
             model=base_model,
             dataset_names=config["linear_probe_dataset_order"],
             config=config,
+            dataset_cache=dataset_cache,
         )
         final_linear_probe_summary = summarize_final_linear_probe(
             evaluation_results=final_probe_results,
