@@ -56,7 +56,7 @@ logging.basicConfig(
 logger = logging.getLogger("PODFCSSV_Main")
 baseline_logger = logging.getLogger("PODFCSSV_Baseline")
 
-RUN_MODE = "federated"
+RUN_MODE = "baseline"
 
 CONFIG: Dict[str, Any] = {
     "seed": 42,
