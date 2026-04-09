@@ -117,6 +117,9 @@ Stress datasets are merged into a single self-supervised training pool per datas
 - `DTD`: `train + val + test`
 
 The active dataloader worker policy is capped at `16` workers for both training and linear-probe evaluation.
+Stage-training loaders keep persistent workers enabled, while final linear-probe
+loaders use non-persistent workers plus explicit teardown to avoid file-handle
+leaks on long runs.
 
 Before training starts in either mode, `main.py` prepares every benchmark,
 stress, and final-probe dataset required by the selected run so the long

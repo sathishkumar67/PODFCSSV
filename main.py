@@ -1347,6 +1347,35 @@ def create_standard_dataloader(
     return DataLoader(**loader_kwargs)
 
 
+def shutdown_dataloader_workers(dataloader: Optional[DataLoader]) -> None:
+    """Shut down one dataloader's worker pool if it is still alive.
+
+    The current pipeline uses persistent workers for long training loaders, so
+    cleanup must be explicit when a loader is no longer needed. This helper:
+    1. inspects the private iterator cache used by persistent workers,
+    2. requests worker shutdown when the iterator exposes that hook, and
+    3. clears the cached iterator reference so file descriptors can be released.
+    """
+    if dataloader is None:
+        return
+
+    iterator = getattr(dataloader, "_iterator", None)
+    if iterator is None:
+        return
+
+    shutdown_fn = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown_fn):
+        try:
+            shutdown_fn()
+        except Exception:
+            pass
+
+    try:
+        dataloader._iterator = None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def _iter_mask_ratio_holders(model: nn.Module) -> List[Any]:
     """Collect every config object that can carry the MAE mask ratio."""
     holders: List[Any] = []
@@ -1506,36 +1535,40 @@ def run_linear_probe(
         "drop_last": False,
     }
     if config["linear_eval_num_workers"] > 0:
-        train_loader_kwargs["persistent_workers"] = config["dataloader_persistent_workers"]
+        train_loader_kwargs["persistent_workers"] = False
         train_loader_kwargs["prefetch_factor"] = config["dataloader_prefetch_factor"]
     train_loader = DataLoader(**train_loader_kwargs)
 
-    for _ in range(config["linear_eval_epochs"]):
-        probe.train()
-        for batch_features, batch_labels in train_loader:
-            batch_features = batch_features.to(probe_device)
-            batch_labels = batch_labels.to(probe_device)
+    try:
+        for _ in range(config["linear_eval_epochs"]):
+            probe.train()
+            for batch_features, batch_labels in train_loader:
+                batch_features = batch_features.to(probe_device)
+                batch_labels = batch_labels.to(probe_device)
 
-            logits = probe(batch_features)
-            loss = loss_fn(logits, batch_labels)
+                logits = probe(batch_features)
+                loss = loss_fn(logits, batch_labels)
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
 
-    probe.eval()
-    correct = 0
-    total = 0
-    with torch.inference_mode():
-        for start_index in range(0, test_features.size(0), config["linear_eval_batch_size"]):
-            end_index = start_index + config["linear_eval_batch_size"]
-            batch_features = test_features[start_index:end_index].to(probe_device)
-            batch_labels = test_labels[start_index:end_index].to(probe_device)
-            predictions = probe(batch_features).argmax(dim=1)
-            correct += int((predictions == batch_labels).sum().item())
-            total += int(batch_labels.size(0))
+        probe.eval()
+        correct = 0
+        total = 0
+        with torch.inference_mode():
+            for start_index in range(0, test_features.size(0), config["linear_eval_batch_size"]):
+                end_index = start_index + config["linear_eval_batch_size"]
+                batch_features = test_features[start_index:end_index].to(probe_device)
+                batch_labels = test_labels[start_index:end_index].to(probe_device)
+                predictions = probe(batch_features).argmax(dim=1)
+                correct += int((predictions == batch_labels).sum().item())
+                total += int(batch_labels.size(0))
 
-    return correct / total if total > 0 else 0.0
+        return correct / total if total > 0 else 0.0
+    finally:
+        shutdown_dataloader_workers(train_loader)
+        del train_loader
 
 
 def evaluate_datasets(
@@ -1586,7 +1619,7 @@ def evaluate_datasets(
             num_workers=config["linear_eval_num_workers"],
             pin_memory=config["pin_memory"],
             shuffle=False,
-            persistent_workers=config["dataloader_persistent_workers"],
+            persistent_workers=False,
             prefetch_factor=config["dataloader_prefetch_factor"],
         )
         test_loader = create_standard_dataloader(
@@ -1595,35 +1628,40 @@ def evaluate_datasets(
             num_workers=config["linear_eval_num_workers"],
             pin_memory=config["pin_memory"],
             shuffle=False,
-            persistent_workers=config["dataloader_persistent_workers"],
+            persistent_workers=False,
             prefetch_factor=config["dataloader_prefetch_factor"],
         )
+        try:
+            train_features, train_labels = collect_labeled_embeddings(
+                model=model,
+                dataloader=train_loader,
+                device=config["device"],
+                dtype=config["dtype"],
+            )
+            test_features, test_labels = collect_labeled_embeddings(
+                model=model,
+                dataloader=test_loader,
+                device=config["device"],
+                dtype=config["dtype"],
+            )
 
-        train_features, train_labels = collect_labeled_embeddings(
-            model=model,
-            dataloader=train_loader,
-            device=config["device"],
-            dtype=config["dtype"],
-        )
-        test_features, test_labels = collect_labeled_embeddings(
-            model=model,
-            dataloader=test_loader,
-            device=config["device"],
-            dtype=config["dtype"],
-        )
-
-        accuracy = run_linear_probe(
-            train_features=train_features,
-            train_labels=train_labels,
-            test_features=test_features,
-            test_labels=test_labels,
-            config=config,
-        )
-        results[dataset_name] = {
-            "accuracy": float(accuracy),
-            "num_train_samples": float(len(train_dataset)),
-            "num_eval_samples": float(len(test_dataset)),
-        }
+            accuracy = run_linear_probe(
+                train_features=train_features,
+                train_labels=train_labels,
+                test_features=test_features,
+                test_labels=test_labels,
+                config=config,
+            )
+            results[dataset_name] = {
+                "accuracy": float(accuracy),
+                "num_train_samples": float(len(train_dataset)),
+                "num_eval_samples": float(len(test_dataset)),
+            }
+        finally:
+            shutdown_dataloader_workers(train_loader)
+            shutdown_dataloader_workers(test_loader)
+            del train_loader
+            del test_loader
 
     return results
 
@@ -2003,6 +2041,7 @@ def run_baseline_experiment() -> None:
             }
         )
 
+        shutdown_dataloader_workers(dataloader)
         del dataloader
         del dataset
         gc.collect()
@@ -2407,6 +2446,8 @@ def run_federated_experiment() -> None:
             stage_kind,
         )
 
+        for dataloader in stage_dataloaders:
+            shutdown_dataloader_workers(dataloader)
         del stage_dataloaders
         del stage_datasets
         gc.collect()

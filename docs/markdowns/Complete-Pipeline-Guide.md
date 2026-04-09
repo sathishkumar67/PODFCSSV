@@ -64,9 +64,13 @@ The dataloaders use:
 
 - a worker cap of `16`,
 - `shuffle = True` for training,
-- persistent workers when multiprocessing is enabled,
+- persistent workers for stage-training loaders when multiprocessing is enabled,
 - prefetching with factor `8`,
 - pinned memory only when the run is actually on CUDA.
+
+The final benchmark linear probe intentionally turns persistent workers off and
+explicitly tears each probe dataloader down after use so the run does not build
+up file descriptors across datasets.
 
 ## 4. Dataset Layout
 

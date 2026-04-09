@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CPU Data-Loading Consistency** (`main.py`): Federated mode now disables pinned memory on CPU the same way baseline mode already did, so both modes follow the same host-side data-loading behavior off CUDA.
 - **Country211 Evaluation Split** (`main.py`): The benchmark now evaluates `Country211` on its official validation split instead of reusing the test split.
 - **EuroSAT Split Semantics** (`main.py`): The fixed `22000/5000` EuroSAT split now literally uses the first `22000` samples for training and the last `5000` for evaluation.
+- **Final-Probe Worker Cleanup** (`main.py`): Final linear-probe dataloaders now disable persistent workers and explicitly shut their workers down after each dataset so long runs do not fail with `Too many open files`.
 
 ## [0.6.0] - 2026-03-14
 

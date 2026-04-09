@@ -143,6 +143,9 @@ Current shared training defaults in `main.py`:
 - `server_model_ema_alpha = 0.3`
 
 Training and evaluation dataloaders currently use a worker cap of `16`.
+Stage-training dataloaders keep persistent workers enabled, while the final
+benchmark linear probe uses non-persistent workers with explicit teardown so
+long runs do not accumulate file descriptors across probe datasets.
 
 ## Federated Mode
 
