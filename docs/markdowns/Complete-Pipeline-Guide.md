@@ -74,10 +74,10 @@ The final benchmark linear probe intentionally turns persistent workers off and
 explicitly tears each probe dataloader down after use so the run does not build
 up file descriptors across datasets.
 
-The federated multi-GPU round path is more conservative: because the two
-clients already train in parallel threads, each per-round stage dataloader is
-built with `num_workers = 0` so the run does not nest multiprocessing
-DataLoader workers underneath `ThreadPoolExecutor`.
+Federated mode is more conservative everywhere: because the two clients already
+train in parallel threads, the federated training loop and the federated final
+probe both use `num_workers = 0` and `persistent_workers = False` so the run
+never nests multiprocessing DataLoader workers underneath `ThreadPoolExecutor`.
 
 ## 4. Dataset Layout
 
@@ -159,14 +159,16 @@ The current common training defaults are:
 - `batch_size = 512`
 - `client_lr = 1e-4`
 - `client_weight_decay = 0.05`
-- `dataloader_persistent_workers = True`
+- `dataloader_persistent_workers = True` in the shared config, overridden to `False` in federated mode
 - `dataloader_prefetch_factor = 8`
 - `merge_threshold = 0.85`
 - `server_ema_alpha = 0.1`
 - `server_model_ema_alpha = 0.3`
 - `k_init_prototypes = 20`
 
-Training and evaluation dataloaders currently use a worker cap of `16`.
+Baseline training and evaluation dataloaders currently use a worker cap of
+`16`. Federated mode uses `0` workers for both round training and final probe
+evaluation.
 
 Current GPAD values:
 
@@ -197,9 +199,9 @@ stages temporary embeddings on CPU before K-means so very large training pools
 do not accumulate full-dataset embeddings on the GPU.
 
 During the round-training phase itself, the per-client dataloaders are rebuilt
-from scratch every round and stay single-process on multi-GPU federated runs to
-avoid worker crashes that can happen when multiprocessing loaders are driven
-from multiple training threads at once.
+from scratch every round and stay single-process in federated mode to avoid
+worker crashes that can happen when multiprocessing loaders are driven from
+multiple training threads at once.
 
 Important continual-learning state that persists across dataset changes on each client:
 

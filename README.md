@@ -140,17 +140,23 @@ Current shared training defaults in `main.py`:
 - `client_lr = 1e-4`
 - `client_weight_decay = 0.05`
 - `dataloader_shuffle = True`
-- `dataloader_persistent_workers = True`
+- `dataloader_persistent_workers = True` in the shared config, overridden to `False` in federated mode
 - `dataloader_prefetch_factor = 8`
 - `server_model_ema_alpha = 0.3`
 
-Training and evaluation dataloaders currently use a worker cap of `16`.
-Baseline stage-training dataloaders keep persistent workers enabled when
-multiprocessing is active. Federated multi-GPU stage training now uses
-single-process dataloaders because the two clients already run in parallel
-threads, and the final benchmark linear probe uses non-persistent workers with
-explicit teardown so long runs do not accumulate file descriptors across probe
-datasets.
+Baseline training and evaluation dataloaders currently use a worker cap of
+`16`. Baseline stage-training dataloaders keep persistent workers enabled when
+multiprocessing is active, and the final benchmark linear probe uses
+non-persistent workers with explicit teardown so long runs do not accumulate
+file descriptors across probe datasets.
+
+Federated mode now uses the simplest loader policy everywhere:
+
+- `num_workers = 0`
+- `persistent_workers = False`
+
+This applies to both federated stage training and the final benchmark linear
+probe.
 
 ## Federated Mode
 
@@ -171,9 +177,9 @@ During the first round of each stage, client-side prototype extraction now
 stages temporary embeddings on CPU before K-means so large stages such as
 merged `SVHN` do not exhaust GPU memory.
 
-When federated mode runs with GPUs, each round now builds stage dataloaders
-with `num_workers = 0` so the threaded two-client execution path does not nest
-DataLoader multiprocessing underneath `ThreadPoolExecutor`.
+Federated mode now keeps every dataloader single-process, so the threaded
+two-client execution path never nests DataLoader multiprocessing underneath
+`ThreadPoolExecutor`.
 
 Current GPAD and prototype settings:
 
@@ -224,6 +230,8 @@ Current linear-probe settings:
 - batch size: `512`
 - learning rate: `1e-2`
 - weight decay: `1e-4`
+- federated loader workers: `0`
+- federated persistent workers: `False`
 
 ## Tracked Metrics
 

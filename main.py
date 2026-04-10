@@ -1334,8 +1334,9 @@ def create_standard_dataloader(
     5. apply the configured prefetch depth.
 
     Callers may still override the worker count for stability. The federated
-    multi-GPU round path, for example, intentionally uses single-process
-    loading because two client threads are already running in parallel.
+    run, for example, intentionally uses single-process loading for both
+    round training and final evaluation so every loader follows the same
+    no-worker-subprocess policy.
     """
     loader_kwargs: Dict[str, Any] = {
         "dataset": dataset,
@@ -2145,8 +2146,9 @@ def run_federated_experiment() -> None:
     config = dict(MULTI_DATASET_CONFIG)
     config["run_mode"] = "federated"
     resolve_runtime_config(config)
-    config["num_workers"] = resolve_worker_count()
-    config["linear_eval_num_workers"] = resolve_worker_count()
+    config["num_workers"] = 0
+    config["linear_eval_num_workers"] = 0
+    config["dataloader_persistent_workers"] = False
     config["pin_memory"] = bool(config["pin_memory"] and config["device"] == "cuda")
     if config["device"] == "cuda" and config["cudnn_benchmark"]:
         torch.backends.cudnn.benchmark = True
@@ -2305,7 +2307,7 @@ def run_federated_experiment() -> None:
                 config["rounds_per_dataset"],
             )
 
-            stage_loader_num_workers = 0 if config["gpu_count"] > 0 else config["num_workers"]
+            stage_loader_num_workers = config["num_workers"]
             stage_loader_persistent_workers = (
                 config["dataloader_persistent_workers"]
                 if stage_loader_num_workers > 0
@@ -2319,8 +2321,8 @@ def run_federated_experiment() -> None:
             )
 
             # Create fresh DataLoaders each round so loader state never carries
-            # across rounds, and keep threaded multi-GPU client execution on a
-            # single-process loading path to avoid nested worker crashes.
+            # across rounds. Federated mode keeps every loader single-process
+            # to avoid worker crashes under the threaded two-client execution.
             stage_dataloaders = [
                 create_standard_dataloader(
                     dataset=dataset,

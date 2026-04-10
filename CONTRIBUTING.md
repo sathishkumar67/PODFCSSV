@@ -122,8 +122,9 @@ The active dataloader worker policy is capped at `16` workers for both training 
 Baseline stage-training loaders keep persistent workers enabled when
 multiprocessing is active, while final linear-probe loaders use
 non-persistent workers plus explicit teardown to avoid file-handle leaks on
-long runs. Federated multi-GPU stage loaders intentionally use
-`num_workers = 0` because the two clients already run in parallel threads.
+long runs. Federated mode now uses `num_workers = 0` and
+`persistent_workers = False` for both stage training and final probe
+evaluation because the two clients already run in parallel threads.
 
 Before training starts in either mode, `main.py` prepares every benchmark,
 stress, and final-probe dataset required by the selected run so the long
@@ -140,8 +141,8 @@ When editing the pipeline, preserve these expectations unless the change is inte
 - keep adapter-only communication in the federated path
 - keep the CPU-staged stage-start prototype extraction in the federated path so
   very large datasets do not accumulate full-dataset embeddings on GPU
-- keep federated multi-GPU round loaders on the single-process path unless the
-  threaded client execution model itself changes
+- keep federated loaders on the single-process path unless the threaded client
+  execution model itself changes
 - keep the benchmark schedule download-friendly for a fresh environment
 - do not reintroduce manual-setup datasets into the default publishable schedule
 - update the docs whenever the stage order, split policy, evaluation logic, or tracked metrics change
