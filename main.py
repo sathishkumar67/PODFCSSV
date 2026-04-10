@@ -2290,19 +2290,6 @@ def run_federated_experiment() -> None:
                 len(dataset),
             )
 
-        stage_dataloaders = [
-            create_standard_dataloader(
-                dataset=dataset,
-                batch_size=config["batch_size"],
-                num_workers=config["num_workers"],
-                pin_memory=config["pin_memory"],
-                shuffle=config["dataloader_shuffle"],
-                persistent_workers=config["dataloader_persistent_workers"],
-                prefetch_factor=config["dataloader_prefetch_factor"],
-            )
-            for dataset in stage_datasets
-        ]
-
         for stage_round in range(1, config["rounds_per_dataset"] + 1):
             global_round_idx += 1
             logger.info(
@@ -2313,6 +2300,21 @@ def run_federated_experiment() -> None:
                 stage_round,
                 config["rounds_per_dataset"],
             )
+
+            # Create fresh DataLoaders each round to prevent BrokenPipeError
+            # from stale persistent worker IPC state under memory pressure.
+            stage_dataloaders = [
+                create_standard_dataloader(
+                    dataset=dataset,
+                    batch_size=config["batch_size"],
+                    num_workers=config["num_workers"],
+                    pin_memory=config["pin_memory"],
+                    shuffle=config["dataloader_shuffle"],
+                    persistent_workers=False,
+                    prefetch_factor=config["dataloader_prefetch_factor"],
+                )
+                for dataset in stage_datasets
+            ]
             round_start = time.time()
             client_manager.sync_clients(current_global_weights)
 
@@ -2433,6 +2435,11 @@ def run_federated_experiment() -> None:
                 client_prototype_counts,
             )
 
+            # Shut down this round's DataLoader workers before the next round
+            for dataloader in stage_dataloaders:
+                shutdown_dataloader_workers(dataloader)
+            del stage_dataloaders
+
             save_history(training_history, output_dirs["metrics"])
             plot_training_history(
                 training_history,
@@ -2441,14 +2448,11 @@ def run_federated_experiment() -> None:
             )
 
         logger.info(
-            "Stage %s complete | kind=%s | releasing stage dataloaders and cached tensors",
+            "Stage %s complete | kind=%s | releasing stage datasets and cached tensors",
             stage_number,
             stage_kind,
         )
 
-        for dataloader in stage_dataloaders:
-            shutdown_dataloader_workers(dataloader)
-        del stage_dataloaders
         del stage_datasets
         gc.collect()
         if torch.cuda.is_available():
