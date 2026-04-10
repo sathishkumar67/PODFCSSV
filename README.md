@@ -110,9 +110,9 @@ The stress datasets influence the final checkpoint through training, but they ar
 
 ### Benchmark Splits
 
-Benchmark training uses the full train-side split for each dataset, except for `EuroSAT`, which is handled through a fixed head/tail split:
+Benchmark training uses the full train-side split for each dataset, except for `EuroSAT`, which is handled through a fixed class-balanced split:
 
-- `EuroSAT`: first `22000` samples for train, last `5000` samples for held-out evaluation
+- `EuroSAT`: deterministic class-balanced `22000` train and `5000` held-out evaluation samples
 - `Food101`: full `train`, evaluated on `test`
 - `Oxford-IIIT Pet`: full `trainval`, evaluated on `test`
 - `GTSRB`: full `train`, evaluated on `test`
@@ -166,16 +166,17 @@ In federated mode, the training loop in `main.py` performs the following steps a
 2. Build one shared adapter-injected MAE backbone.
 3. Create two client copies and place them on the selected devices.
 4. Reuse the prepared dataset objects stage by stage during client training.
-5. Train each client locally with MAE reconstruction loss.
-6. Apply GPAD only to the samples that are confidently anchored to the global prototype bank.
-7. Preserve each client's optimizer state, local prototype bank, and novelty buffer across dataset transitions.
-8. Upload only trainable adapter weights and local prototypes to the server.
-9. Merge client prototypes into the global bank and aggregate adapter weights on the server.
-10. Broadcast the updated global adapter state and global prototype bank back to the clients for the next round.
+5. Bootstrap stage-specific local prototypes before round 1 so the current dataset is represented in the global bank before training starts.
+6. Train each client locally with MAE reconstruction loss.
+7. Apply GPAD only to the samples that are confidently anchored to the global prototype bank.
+8. Preserve each client's optimizer state, local prototype bank, and novelty buffer across dataset transitions.
+9. Upload only trainable adapter weights and local prototypes to the server.
+10. Merge client prototypes into the global bank and aggregate adapter weights on the server.
+11. Broadcast the updated global adapter state and global prototype bank back to the clients for the next round.
 
-During the first round of each stage, client-side prototype extraction now
-stages temporary embeddings on CPU before K-means so large stages such as
-merged `SVHN` do not exhaust GPU memory.
+Before round 1 of each stage, client-side prototype extraction now stages
+temporary embeddings on CPU before K-means so large stages such as merged
+`SVHN` do not exhaust GPU memory.
 
 Federated mode now keeps every dataloader single-process, so the threaded
 two-client execution path never nests DataLoader multiprocessing underneath
@@ -184,14 +185,14 @@ two-client execution path never nests DataLoader multiprocessing underneath
 Current GPAD and prototype settings:
 
 - `lambda_proto = 0.1`
-- `gpad_base_tau = 0.85`
+- `gpad_base_tau = 0.60`
 - `gpad_temp_gate = 0.1`
-- `gpad_lambda_entropy = 0.2`
+- `gpad_lambda_entropy = 0.05`
 - `gpad_soft_assign_temp = 0.1`
-- `merge_threshold = 0.85`
+- `merge_threshold = 0.80`
 - `server_ema_alpha = 0.1`
 - `server_model_ema_alpha = 0.3`
-- `k_init_prototypes = 20`
+- `k_init_prototypes = 5`
 - `max_global_prototypes = 2000`
 
 ## Baseline Mode

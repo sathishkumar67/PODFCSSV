@@ -98,11 +98,11 @@ Full stage order:
 
 ## Split Rules
 
-Benchmark training uses the full train-side split for each dataset except `EuroSAT`, which uses a fixed head/tail `22000 / 5000` train-eval split.
+Benchmark training uses the full train-side split for each dataset except `EuroSAT`, which uses a fixed class-balanced `22000 / 5000` train-eval split.
 
 Current benchmark evaluation splits:
 
-- `EuroSAT`: last `5000`
+- `EuroSAT`: deterministic class-balanced held-out `5000`
 - `Food101`: `test`
 - `Oxford-IIIT Pet`: `test`
 - `GTSRB`: `test`
@@ -141,6 +141,8 @@ When editing the pipeline, preserve these expectations unless the change is inte
 - keep adapter-only communication in the federated path
 - keep the CPU-staged stage-start prototype extraction in the federated path so
   very large datasets do not accumulate full-dataset embeddings on GPU
+- keep stage-start prototype bootstrap ahead of round 1 so GPAD sees
+  current-stage global memory before the first local update
 - keep federated loaders on the single-process path unless the threaded client
   execution model itself changes
 - keep the benchmark schedule download-friendly for a fresh environment

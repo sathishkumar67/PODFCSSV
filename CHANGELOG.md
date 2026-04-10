@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Publishable Benchmark Refresh** (`main.py`): Replaced the earlier small mixed benchmark with `EuroSAT`, `GTSRB`, `Food101`, `Country211`, `Oxford-IIIT Pet`, and `FGVC Aircraft`, all chosen from the supported auto-downloadable paths with held-out evaluation splits.
-- **Full-Split Training Policy** (`main.py`): Benchmark datasets now use their full train-side splits, `EuroSAT` uses a fixed `22000/5000` train-eval split, and stress datasets merge all available official splits into one self-supervised training pool.
+- **Full-Split Training Policy** (`main.py`): Benchmark datasets now use their full train-side splits, `EuroSAT` uses a fixed class-balanced `22000/5000` train-eval split, and stress datasets merge all available official splits into one self-supervised training pool.
 - **Stress-Stream Fairness** (`main.py`): The unified baseline now trains through the same stress-dataset stream as the federated mode, and both modes now use the same final benchmark probe list for comparison.
 - **Single-File Workflow** (`main.py`): The standalone evaluation entrypoint has been removed from the active pipeline, and the final comparison logic now lives directly inside the same file as the training modes.
 - **Final-Only Linear-Probe Evaluation** (`main.py`): The active workflow now trains straight through the full continual stream and runs one frozen-feature benchmark linear-probe pass only after training completes.
@@ -28,17 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Loader Worker Policy** (`main.py`): Runtime worker counts are now capped at `16` instead of scaling to nearly the full visible CPU count.
 - **Training Batch Size** (`main.py`): The shared training batch size used by both federated and baseline modes is now `512`.
 - **Federated Prototype Memory Safety** (`src/client.py`, `main.py`): The checked-in default mode is now `federated`, and stage-start prototype extraction stages temporary embeddings on CPU before K-means so very large datasets do not exhaust GPU memory.
+- **Experimental GPAD Calibration** (`main.py`, `src/loss.py`): The active GPAD settings are now more permissive for experimentation, with `gpad_base_tau = 0.60`, `gpad_lambda_entropy = 0.05`, `merge_threshold = 0.80`, and `k_init_prototypes = 5` so anchored samples have a practical chance to appear.
 
 ### Fixed
 - **DataLoader IPC Exhaustion** (`main.py`): Fixed a `BrokenPipeError` that occurred during long federated rounds on large datasets (like `SVHN`). Training DataLoaders now use `persistent_workers=False` and are recreated from scratch each round to prevent stale inter-process communication state from accumulating under memory pressure. Explicit worker shutdown is also enforced between rounds.
 - **Federated Threaded Loader Stability** (`main.py`): Federated mode now uses single-process dataloaders for both round training and the final probe while the two clients already execute in parallel threads, preventing nested DataLoader multiprocessing crashes that surfaced as `worker exited unexpectedly`.
+- **Stage-Start GPAD Bootstrap** (`main.py`): Each federated stage now builds and merges stage-specific client prototypes before round 1 training, so GPAD can use current-stage global memory from the first local update instead of waiting until round 2.
 - **CUDA Runtime Validation** (`main.py`): The runtime now validates that CUDA can execute a small kernel before treating a GPU as usable, preventing deep training failures on incompatible CUDA environments.
 - **Download-Friendly Default Schedule** (`main.py`): The default benchmark now rejects datasets with known manual-download caveats so the publishable setup stays reproducible.
 - **Stage-Start Local Prototype Preservation** (`src/client.py`, `main.py`): Stage-initial prototype extraction now enriches the existing client-local prototype bank instead of overwriting it, so local memory truly persists across dataset transitions.
 - **Runtime Dependencies** (`requirements.txt`, `pyproject.toml`): Added `scipy` so the default `SVHN` and `Flowers102` dataset paths install cleanly in a fresh environment.
 - **CPU Data-Loading Consistency** (`main.py`): Federated mode now disables pinned memory on CPU the same way baseline mode already did, so both modes follow the same host-side data-loading behavior off CUDA.
 - **Country211 Evaluation Split** (`main.py`): The benchmark now evaluates `Country211` on its official validation split instead of reusing the test split.
-- **EuroSAT Split Semantics** (`main.py`): The fixed `22000/5000` EuroSAT split now literally uses the first `22000` samples for training and the last `5000` for evaluation.
+- **EuroSAT Probe Split Robustness** (`main.py`): The fixed `22000/5000` EuroSAT protocol now uses a deterministic class-balanced split, and the final linear probe now raises a clear error if the train split ever fails to cover every evaluation class.
 - **Final-Probe Worker Cleanup** (`main.py`): Final linear-probe dataloaders now disable persistent workers and explicitly shut their workers down after each dataset so long runs do not fail with `Too many open files`.
 
 ## [0.6.0] - 2026-03-14

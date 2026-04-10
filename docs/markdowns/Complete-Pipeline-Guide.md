@@ -130,9 +130,9 @@ The current interleaved order is:
 
 ### Benchmark Datasets
 
-Benchmark training uses the full train-side split for each dataset except `EuroSAT`, which is handled through a fixed head/tail split:
+Benchmark training uses the full train-side split for each dataset except `EuroSAT`, which is handled through a fixed class-balanced split:
 
-- `EuroSAT`: first `22000` for train, last `5000` for held-out evaluation
+- `EuroSAT`: deterministic class-balanced `22000` train and `5000` held-out evaluation samples
 - `Food101`: full `train`, evaluated on `test`
 - `Oxford-IIIT Pet`: full `trainval`, evaluated on `test`
 - `GTSRB`: full `train`, evaluated on `test`
@@ -161,10 +161,10 @@ The current common training defaults are:
 - `client_weight_decay = 0.05`
 - `dataloader_persistent_workers = True` in the shared config, overridden to `False` in federated mode
 - `dataloader_prefetch_factor = 8`
-- `merge_threshold = 0.85`
+- `merge_threshold = 0.80`
 - `server_ema_alpha = 0.1`
 - `server_model_ema_alpha = 0.3`
-- `k_init_prototypes = 20`
+- `k_init_prototypes = 5`
 
 Baseline training and evaluation dataloaders currently use a worker cap of
 `16`. Federated mode uses `0` workers for both round training and final probe
@@ -172,9 +172,9 @@ evaluation.
 
 Current GPAD values:
 
-- `gpad_base_tau = 0.85`
+- `gpad_base_tau = 0.60`
 - `gpad_temp_gate = 0.1`
-- `gpad_lambda_entropy = 0.2`
+- `gpad_lambda_entropy = 0.05`
 - `gpad_soft_assign_temp = 0.1`
 - `lambda_proto = 0.1`
 
@@ -186,17 +186,18 @@ When `RUN_MODE = "federated"`, the pipeline behaves as follows:
 2. Build one shared adapter-injected MAE backbone.
 3. Create two client copies.
 4. Reuse the prepared dataset objects for the current stage.
-5. Train each client locally for the configured round and epoch budget.
-6. Use GPAD only for samples whose embeddings are confidently anchored to the global prototype bank.
-7. Route the remaining embeddings through each client's local prototype bank and novelty buffer.
-8. Upload only trainable adapter weights and local prototypes.
-9. Merge prototypes and aggregate adapter weights on the server.
-10. Smooth the aggregated adapter weights with server-side EMA.
-11. Broadcast the updated adapter weights and global prototype bank back to the clients.
+5. Bootstrap stage-specific local prototypes before round 1 so the global bank already reflects the current datasets.
+6. Train each client locally for the configured round and epoch budget.
+7. Use GPAD only for samples whose embeddings are confidently anchored to the global prototype bank.
+8. Route the remaining embeddings through each client's local prototype bank and novelty buffer.
+9. Upload only trainable adapter weights and local prototypes.
+10. Merge prototypes and aggregate adapter weights on the server.
+11. Smooth the aggregated adapter weights with server-side EMA.
+12. Broadcast the updated adapter weights and global prototype bank back to the clients.
 
-During the first round of each stage, client-side prototype extraction now
-stages temporary embeddings on CPU before K-means so very large training pools
-do not accumulate full-dataset embeddings on the GPU.
+Before round 1 of each stage, client-side prototype extraction now stages
+temporary embeddings on CPU before K-means so very large training pools do not
+accumulate full-dataset embeddings on the GPU.
 
 During the round-training phase itself, the per-client dataloaders are rebuilt
 from scratch every round and stay single-process in federated mode to avoid

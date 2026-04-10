@@ -77,17 +77,17 @@ CONFIG: Dict[str, Any] = {
     "embedding_dim": 768,
     "image_size": 224,
     "adapter_bottleneck_dim": 256,
-    "merge_threshold": 0.85,
+    "merge_threshold": 0.80,
     "server_ema_alpha": 0.1,
     "server_model_ema_alpha": 0.3,
     "max_global_prototypes": 2000,
-    "gpad_base_tau": 0.85,
+    "gpad_base_tau": 0.60,
     "gpad_temp_gate": 0.1,
-    "gpad_lambda_entropy": 0.2,
+    "gpad_lambda_entropy": 0.05,
     "gpad_soft_assign_temp": 0.1,
     "gpad_epsilon": 1e-8,
     "lambda_proto": 0.1,
-    "k_init_prototypes": 20,
+    "k_init_prototypes": 5,
     "client_local_update_threshold": 0.85,
     "client_local_ema_alpha": 0.05,
     "novelty_buffer_size": 256,
@@ -844,12 +844,13 @@ def build_fixed_count_split_subset(
 ) -> torch.utils.data.Dataset:
     """Create a deterministic fixed-size train/eval split for one combined dataset.
 
-    The current `EuroSAT` protocol uses the leading portion of the dataset for
-    training and the trailing portion for evaluation:
-    1. take the first ``train_samples`` examples for training,
-    2. take the last ``eval_samples`` examples for evaluation, and
-    3. leave any middle portion unused when the full dataset is larger than the
-       requested split sizes.
+    The current `EuroSAT` protocol needs exact split sizes while still keeping
+    both train and evaluation label coverage healthy. The helper therefore:
+    1. reads per-sample class targets from the dataset,
+    2. allocates class-balanced train and eval quotas that sum to the requested
+       fixed counts,
+    3. shuffles indices deterministically within each class, and
+    4. returns the split requested by the caller.
     """
     required_samples = train_samples + eval_samples
     dataset_size = len(dataset)
@@ -859,9 +860,110 @@ def build_fixed_count_split_subset(
             f"but the fixed split needs {required_samples} samples."
         )
 
-    train_indices = list(range(train_samples))
-    eval_start_index = dataset_size - eval_samples
-    eval_indices = list(range(eval_start_index, dataset_size))
+    raw_targets = getattr(dataset, "targets", None)
+    if raw_targets is None:
+        raw_targets = getattr(dataset, "_labels", None)
+    if raw_targets is None:
+        raise ValueError(
+            f"{DATASET_DISPLAY_NAMES[dataset_name]} does not expose targets needed "
+            "for the fixed-count stratified split."
+        )
+
+    targets = [int(target) for target in raw_targets]
+    class_to_indices: Dict[int, List[int]] = {}
+    for sample_index, target in enumerate(targets):
+        class_to_indices.setdefault(target, []).append(sample_index)
+
+    class_labels = sorted(class_to_indices)
+    if not class_labels:
+        raise ValueError(f"{DATASET_DISPLAY_NAMES[dataset_name]} has no labeled samples.")
+
+    def allocate_counts(
+        available_counts: Dict[int, int],
+        requested_total: int,
+        allocation_tag: str,
+    ) -> Dict[int, int]:
+        total_available = sum(available_counts.values())
+        if requested_total > total_available:
+            raise ValueError(
+                f"Cannot allocate {requested_total} samples from only {total_available} available "
+                f"examples for {DATASET_DISPLAY_NAMES[dataset_name]} {allocation_tag}."
+            )
+
+        if requested_total == 0:
+            return {label: 0 for label in available_counts}
+
+        raw_allocations = {
+            label: available_counts[label] * requested_total / total_available
+            for label in available_counts
+        }
+        allocated = {
+            label: min(int(raw_allocations[label]), available_counts[label])
+            for label in available_counts
+        }
+        assigned_total = sum(allocated.values())
+        remainders = sorted(
+            (
+                raw_allocations[label] - allocated[label],
+                label,
+            )
+            for label in available_counts
+        )
+        remainders.reverse()
+
+        while assigned_total < requested_total:
+            updated = False
+            for _, label in remainders:
+                if allocated[label] >= available_counts[label]:
+                    continue
+                allocated[label] += 1
+                assigned_total += 1
+                updated = True
+                if assigned_total == requested_total:
+                    break
+            if not updated:
+                raise RuntimeError(
+                    f"Failed to finish {allocation_tag} allocation for "
+                    f"{DATASET_DISPLAY_NAMES[dataset_name]}."
+                )
+
+        return allocated
+
+    eval_quota = allocate_counts(
+        available_counts={label: len(class_to_indices[label]) for label in class_labels},
+        requested_total=eval_samples,
+        allocation_tag="eval",
+    )
+    train_available = {
+        label: len(class_to_indices[label]) - eval_quota[label] for label in class_labels
+    }
+    train_quota = allocate_counts(
+        available_counts=train_available,
+        requested_total=train_samples,
+        allocation_tag="train",
+    )
+
+    train_indices: List[int] = []
+    eval_indices: List[int] = []
+    for label in class_labels:
+        permutation_seed = stable_int_from_parts(
+            seed,
+            dataset_name,
+            "fixed_count_split",
+            str(label),
+        )
+        generator = torch.Generator().manual_seed(permutation_seed)
+        class_indices = torch.tensor(class_to_indices[label], dtype=torch.long)
+        permutation = torch.randperm(class_indices.numel(), generator=generator)
+        shuffled_indices = class_indices[permutation].tolist()
+
+        current_eval_quota = eval_quota[label]
+        current_train_quota = train_quota[label]
+        eval_indices.extend(shuffled_indices[:current_eval_quota])
+        train_indices.extend(
+            shuffled_indices[current_eval_quota : current_eval_quota + current_train_quota]
+        )
+
     return Subset(dataset, train_indices if train else eval_indices)
 
 
@@ -880,7 +982,7 @@ def load_named_dataset(
     This helper keeps the training and evaluation paths aligned by centralizing
     all dataset rules in one place. The current rules are:
     1. benchmark datasets use their normal train-side split in full,
-    2. ``EuroSAT`` uses the repository's fixed head/tail ``22000 / 5000``
+    2. ``EuroSAT`` uses the repository's fixed class-balanced ``22000 / 5000``
        split,
     3. stress datasets can merge all official splits into one self-supervised
        pool when ``merge_all_training_splits`` is enabled, and
@@ -1520,6 +1622,13 @@ def run_linear_probe(
         train_labels=train_labels,
         test_labels=test_labels,
     )
+    num_train_classes = int(torch.unique(train_labels).numel())
+    if num_train_classes != num_classes:
+        raise ValueError(
+            "Linear probe train split does not cover every class present in the combined "
+            f"train/test labels. Observed {num_train_classes} train classes for {num_classes} "
+            "total classes."
+        )
 
     probe_device = config["device"]
     probe = nn.Linear(train_features.size(1), num_classes).to(probe_device)
@@ -2132,16 +2241,18 @@ def run_federated_experiment() -> None:
     3. build the shared adapter-injected ViT-MAE backbone and the global
        prototype bank,
     4. alternate benchmark stages with retention-stress stages,
-    5. train one dataset per client for the configured rounds,
-    6. upload only trainable adapter weights and local prototype banks,
-    7. merge prototypes and aggregate adapter weights on the server,
-    8. smooth the aggregated adapter state with server-side EMA,
-    9. broadcast the updated global state back to the clients,
-    10. preserve both global memory and client-local memory across dataset
+    5. bootstrap stage-specific local prototypes before round 1 so GPAD can
+       see current-stage global memory immediately,
+    6. train one dataset per client for the configured rounds,
+    7. upload only trainable adapter weights and local prototype banks,
+    8. merge prototypes and aggregate adapter weights on the server,
+    9. smooth the aggregated adapter state with server-side EMA,
+    10. broadcast the updated global state back to the clients,
+    11. preserve both global memory and client-local memory across dataset
         changes,
-    11. save the finished training checkpoint and training artifacts,
-    12. run one final linear probe on the benchmark datasets only, and
-    13. export the probe summary into the dedicated probe folder.
+    12. save the finished training checkpoint and training artifacts,
+    13. run one final linear probe on the benchmark datasets only, and
+    14. export the probe summary into the dedicated probe folder.
     """
     config = dict(MULTI_DATASET_CONFIG)
     config["run_mode"] = "federated"
@@ -2296,6 +2407,56 @@ def run_federated_experiment() -> None:
                 len(dataset),
             )
 
+        # Bootstrap current-stage prototypes before round 1 so the very first
+        # update on a new dataset can already use a stage-aware global bank.
+        client_manager.sync_clients(current_global_weights)
+        stage_bootstrap_upload_bytes = 0
+        bootstrap_dataloaders = [
+            create_standard_dataloader(
+                dataset=dataset,
+                batch_size=config["batch_size"],
+                num_workers=config["num_workers"],
+                pin_memory=config["pin_memory"],
+                shuffle=False,
+                persistent_workers=False,
+                prefetch_factor=config["dataloader_prefetch_factor"],
+            )
+            for dataset in stage_datasets
+        ]
+        try:
+            bootstrap_local_prototypes: List[torch.Tensor] = []
+            bootstrap_client_prototype_counts: List[int] = []
+
+            for client_index, client in enumerate(client_manager.clients):
+                local_prototypes = client.generate_prototypes(
+                    bootstrap_dataloaders[client_index],
+                    K_init=config["k_init_prototypes"],
+                )
+                if local_prototypes is not None and local_prototypes.numel() > 0:
+                    cpu_prototypes = local_prototypes.detach().cpu()
+                    bootstrap_local_prototypes.append(cpu_prototypes)
+                    stage_bootstrap_upload_bytes += tensor_num_bytes(cpu_prototypes)
+                    bootstrap_client_prototype_counts.append(int(cpu_prototypes.size(0)))
+                else:
+                    bootstrap_client_prototype_counts.append(0)
+
+            if bootstrap_local_prototypes:
+                global_prototypes = proto_bank.merge_local_prototypes(
+                    bootstrap_local_prototypes
+                ).detach().cpu()
+
+            logger.info(
+                "Stage %s prototype bootstrap complete | kind=%s | global_prototypes=%s | client_prototypes=%s",
+                stage_number,
+                stage_kind,
+                int(global_prototypes.size(0)) if global_prototypes is not None else 0,
+                bootstrap_client_prototype_counts,
+            )
+        finally:
+            for dataloader in bootstrap_dataloaders:
+                shutdown_dataloader_workers(dataloader)
+            del bootstrap_dataloaders
+
         for stage_round in range(1, config["rounds_per_dataset"] + 1):
             global_round_idx += 1
             logger.info(
@@ -2350,20 +2511,11 @@ def run_federated_experiment() -> None:
             )
 
             client_payloads: List[Dict[str, Any]] = []
-            upload_bytes = 0
+            upload_bytes = stage_bootstrap_upload_bytes if stage_round == 1 else 0
             client_prototype_counts: List[int] = []
 
             for client_index, client in enumerate(client_manager.clients):
-                if stage_round == 1:
-                    # The first round of a new stage enriches the persistent
-                    # local bank with fresh stage concepts instead of resetting
-                    # older client memory.
-                    local_prototypes = client.generate_prototypes(
-                        stage_dataloaders[client_index],
-                        K_init=config["k_init_prototypes"],
-                    )
-                else:
-                    local_prototypes = client.get_local_prototypes()
+                local_prototypes = client.get_local_prototypes()
 
                 weights = client.get_trainable_state()
                 payload: Dict[str, Any] = {

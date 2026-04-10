@@ -100,6 +100,8 @@ class GPADLoss(nn.Module):
         2. Ambiguous assignments spread mass over many prototypes.
         3. Higher ambiguity raises the threshold.
         4. Higher thresholds make anchoring more conservative.
+        5. The final threshold is clamped into cosine similarity's valid range
+           so anchoring cannot become mathematically impossible.
         """
         batch_size, num_prototypes = similarities.shape
         if num_prototypes <= 1:
@@ -114,7 +116,8 @@ class GPADLoss(nn.Module):
             similarities.new_tensor(float(num_prototypes)).clamp(min=1.0)
         )
         normalized_entropy = entropy / max_entropy.clamp(min=self.epsilon)
-        return self.base_tau + self.lambda_entropy * normalized_entropy
+        adaptive_tau = self.base_tau + self.lambda_entropy * normalized_entropy
+        return adaptive_tau.clamp(min=0.0, max=1.0 - self.epsilon)
 
     def _compute_gating(
         self,
