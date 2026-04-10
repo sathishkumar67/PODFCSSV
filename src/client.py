@@ -435,9 +435,10 @@ class FederatedClient:
         stored prototype memory is enriched with fresh concepts from the new
         dataset instead of being replaced. The update path is:
         1. extract embeddings for the full current dataset,
-        2. normalize them on the unit sphere,
-        3. run spherical K-means to obtain stage centroids, and
-        4. merge or append those centroids into the persistent local bank.
+        2. stage those embeddings on CPU so large datasets do not exhaust GPU memory,
+        3. normalize them on the unit sphere,
+        4. run spherical K-means to obtain stage centroids, and
+        5. merge or append those centroids into the persistent local bank.
         """
         self.model.eval()
         feature_batches: List[torch.Tensor] = []
@@ -446,7 +447,7 @@ class FederatedClient:
             inputs = batch[0] if isinstance(batch, (list, tuple)) else batch
             inputs = inputs.to(device=self.device, dtype=self.dtype)
             _, embeddings = self._forward_embeddings(inputs)
-            feature_batches.append(embeddings.detach())
+            feature_batches.append(embeddings.detach().cpu())
 
         if not feature_batches:
             if self.local_prototypes is None:
@@ -461,6 +462,7 @@ class FederatedClient:
         embeddings = torch.cat(feature_batches, dim=0)
         embeddings = F.normalize(embeddings, p=2, dim=1)
         centroids = self._kmeans(embeddings, K=K_init)
+        centroids = centroids.to(device=self.device, dtype=self.dtype)
 
         if self.local_prototypes is None or self.local_prototypes.size(0) == 0:
             self.local_prototypes = centroids.detach().clone()

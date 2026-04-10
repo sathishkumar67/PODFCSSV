@@ -45,6 +45,8 @@ The repository does not currently use a command-line mode flag. Instead, set `RU
 - `federated`
 - `baseline`
 
+The current checked-in default is `federated`.
+
 Launch the run with:
 
 ```bash
@@ -134,6 +136,8 @@ When editing the pipeline, preserve these expectations unless the change is inte
 - keep the active numeric path in `float32`
 - keep device transfers explicit and avoid introducing silent mixed-device math
 - keep adapter-only communication in the federated path
+- keep the CPU-staged stage-start prototype extraction in the federated path so
+  very large datasets do not accumulate full-dataset embeddings on GPU
 - keep the benchmark schedule download-friendly for a fresh environment
 - do not reintroduce manual-setup datasets into the default publishable schedule
 - update the docs whenever the stage order, split policy, evaluation logic, or tracked metrics change

@@ -19,6 +19,8 @@ Set `RUN_MODE` inside that file before launching the script:
 - `federated`
 - `baseline`
 
+The current checked-in default is `federated`.
+
 Run the pipeline with:
 
 ```bash
@@ -184,6 +186,10 @@ When `RUN_MODE = "federated"`, the pipeline behaves as follows:
 9. Merge prototypes and aggregate adapter weights on the server.
 10. Smooth the aggregated adapter weights with server-side EMA.
 11. Broadcast the updated adapter weights and global prototype bank back to the clients.
+
+During the first round of each stage, client-side prototype extraction now
+stages temporary embeddings on CPU before K-means so very large training pools
+do not accumulate full-dataset embeddings on the GPU.
 
 Important continual-learning state that persists across dataset changes on each client:
 

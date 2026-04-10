@@ -24,6 +24,8 @@ The script does not take a command-line argument for the mode. Instead, set the 
 - `RUN_MODE = "federated"` runs the proposed two-client GPAD workflow.
 - `RUN_MODE = "baseline"` runs the sequential reconstruction-only continual baseline.
 
+The current checked-in default is `RUN_MODE = "federated"`.
+
 Launch the pipeline with:
 
 ```bash
@@ -161,6 +163,10 @@ In federated mode, the training loop in `main.py` performs the following steps a
 8. Upload only trainable adapter weights and local prototypes to the server.
 9. Merge client prototypes into the global bank and aggregate adapter weights on the server.
 10. Broadcast the updated global adapter state and global prototype bank back to the clients for the next round.
+
+During the first round of each stage, client-side prototype extraction now
+stages temporary embeddings on CPU before K-means so large stages such as
+merged `SVHN` do not exhaust GPU memory.
 
 Current GPAD and prototype settings:
 
