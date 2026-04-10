@@ -145,9 +145,12 @@ Current shared training defaults in `main.py`:
 - `server_model_ema_alpha = 0.3`
 
 Training and evaluation dataloaders currently use a worker cap of `16`.
-Stage-training dataloaders keep persistent workers enabled, while the final
-benchmark linear probe uses non-persistent workers with explicit teardown so
-long runs do not accumulate file descriptors across probe datasets.
+Baseline stage-training dataloaders keep persistent workers enabled when
+multiprocessing is active. Federated multi-GPU stage training now uses
+single-process dataloaders because the two clients already run in parallel
+threads, and the final benchmark linear probe uses non-persistent workers with
+explicit teardown so long runs do not accumulate file descriptors across probe
+datasets.
 
 ## Federated Mode
 
@@ -167,6 +170,10 @@ In federated mode, the training loop in `main.py` performs the following steps a
 During the first round of each stage, client-side prototype extraction now
 stages temporary embeddings on CPU before K-means so large stages such as
 merged `SVHN` do not exhaust GPU memory.
+
+When federated mode runs with GPUs, each round now builds stage dataloaders
+with `num_workers = 0` so the threaded two-client execution path does not nest
+DataLoader multiprocessing underneath `ThreadPoolExecutor`.
 
 Current GPAD and prototype settings:
 

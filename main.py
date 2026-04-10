@@ -1332,6 +1332,10 @@ def create_standard_dataloader(
     4. keep worker processes alive between batches when multiprocessing is
        enabled, and
     5. apply the configured prefetch depth.
+
+    Callers may still override the worker count for stability. The federated
+    multi-GPU round path, for example, intentionally uses single-process
+    loading because two client threads are already running in parallel.
     """
     loader_kwargs: Dict[str, Any] = {
         "dataset": dataset,
@@ -2301,16 +2305,30 @@ def run_federated_experiment() -> None:
                 config["rounds_per_dataset"],
             )
 
-            # Create fresh DataLoaders each round to prevent BrokenPipeError
-            # from stale persistent worker IPC state under memory pressure.
+            stage_loader_num_workers = 0 if config["gpu_count"] > 0 else config["num_workers"]
+            stage_loader_persistent_workers = (
+                config["dataloader_persistent_workers"]
+                if stage_loader_num_workers > 0
+                else False
+            )
+            logger.info(
+                "Federated stage loader policy | num_workers=%s | persistent_workers=%s | gpu_count=%s",
+                stage_loader_num_workers,
+                stage_loader_persistent_workers,
+                config["gpu_count"],
+            )
+
+            # Create fresh DataLoaders each round so loader state never carries
+            # across rounds, and keep threaded multi-GPU client execution on a
+            # single-process loading path to avoid nested worker crashes.
             stage_dataloaders = [
                 create_standard_dataloader(
                     dataset=dataset,
                     batch_size=config["batch_size"],
-                    num_workers=config["num_workers"],
+                    num_workers=stage_loader_num_workers,
                     pin_memory=config["pin_memory"],
                     shuffle=config["dataloader_shuffle"],
-                    persistent_workers=False,
+                    persistent_workers=stage_loader_persistent_workers,
                     prefetch_factor=config["dataloader_prefetch_factor"],
                 )
                 for dataset in stage_datasets

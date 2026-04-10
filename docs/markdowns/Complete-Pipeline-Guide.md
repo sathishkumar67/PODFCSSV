@@ -74,6 +74,11 @@ The final benchmark linear probe intentionally turns persistent workers off and
 explicitly tears each probe dataloader down after use so the run does not build
 up file descriptors across datasets.
 
+The federated multi-GPU round path is more conservative: because the two
+clients already train in parallel threads, each per-round stage dataloader is
+built with `num_workers = 0` so the run does not nest multiprocessing
+DataLoader workers underneath `ThreadPoolExecutor`.
+
 ## 4. Dataset Layout
 
 The continual stream is split into benchmark datasets and stress datasets.
@@ -190,6 +195,11 @@ When `RUN_MODE = "federated"`, the pipeline behaves as follows:
 During the first round of each stage, client-side prototype extraction now
 stages temporary embeddings on CPU before K-means so very large training pools
 do not accumulate full-dataset embeddings on the GPU.
+
+During the round-training phase itself, the per-client dataloaders are rebuilt
+from scratch every round and stay single-process on multi-GPU federated runs to
+avoid worker crashes that can happen when multiprocessing loaders are driven
+from multiple training threads at once.
 
 Important continual-learning state that persists across dataset changes on each client:
 

@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **DataLoader IPC Exhaustion** (`main.py`): Fixed a `BrokenPipeError` that occurred during long federated rounds on large datasets (like `SVHN`). Training DataLoaders now use `persistent_workers=False` and are recreated from scratch each round to prevent stale inter-process communication state from accumulating under memory pressure. Explicit worker shutdown is also enforced between rounds.
+- **Federated Threaded Loader Stability** (`main.py`): Federated multi-GPU round training now uses single-process stage dataloaders while the two clients already execute in parallel threads, preventing nested DataLoader multiprocessing crashes that surfaced as `worker exited unexpectedly`.
 - **CUDA Runtime Validation** (`main.py`): The runtime now validates that CUDA can execute a small kernel before treating a GPU as usable, preventing deep training failures on incompatible CUDA environments.
 - **Download-Friendly Default Schedule** (`main.py`): The default benchmark now rejects datasets with known manual-download caveats so the publishable setup stays reproducible.
 - **Stage-Start Local Prototype Preservation** (`src/client.py`, `main.py`): Stage-initial prototype extraction now enriches the existing client-local prototype bank instead of overwriting it, so local memory truly persists across dataset transitions.
