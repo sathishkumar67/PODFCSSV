@@ -63,36 +63,19 @@ The continual stream is divided into benchmark datasets and stress datasets.
 
 ### Benchmark Datasets
 
-The checked-in repository now uses two benchmark schedules.
+The checked-in repository now uses the same benchmark schedule in both modes.
 
-Baseline benchmark datasets:
-
-- `EuroSAT`
-- `GTSRB`
-- `Food101`
-- `Country211`
-- `Oxford-IIIT Pet`
-- `FGVC Aircraft`
-
-Baseline benchmark schedule:
-
-- Client 0: `EuroSAT -> Food101 -> Oxford-IIIT Pet`
-- Client 1: `GTSRB -> Country211 -> FGVC Aircraft`
-
-Federated benchmark datasets:
+Active benchmark datasets:
 
 - `EuroSAT`
 - `GTSRB`
 - `Oxford-IIIT Pet`
 - `FGVC Aircraft`
 
-Federated benchmark schedule:
+Client benchmark schedule:
 
 - Client 0: `EuroSAT -> Oxford-IIIT Pet`
 - Client 1: `GTSRB -> FGVC Aircraft`
-
-The current federated run intentionally removes the middle `Food101` /
-`Country211` benchmark pair while keeping the remaining stress stages.
 
 ### Stress Datasets
 
@@ -120,20 +103,18 @@ The current federated interleaved stage plan is:
 4. `STL10` vs `CIFAR100`
 5. `Flowers102` vs `DTD`
 
-The current baseline sequential order remains:
+The current baseline sequential order is:
 
 1. `EuroSAT`
 2. `GTSRB`
 3. `CIFAR10`
 4. `SVHN`
-5. `Food101`
-6. `Country211`
+5. `Oxford-IIIT Pet`
+6. `FGVC Aircraft`
 7. `STL10`
 8. `CIFAR100`
-9. `Oxford-IIIT Pet`
-10. `FGVC Aircraft`
-11. `Flowers102`
-12. `DTD`
+9. `Flowers102`
+10. `DTD`
 
 The stress datasets influence the final checkpoint through training, but they are not part of the final reported linear-probe comparison.
 
@@ -141,21 +122,16 @@ The stress datasets influence the final checkpoint through training, but they ar
 
 ### Benchmark Splits
 
-Benchmark training uses the full train-side split for each dataset used by the selected mode, except for `EuroSAT`, which is handled through a fixed class-balanced split:
+Benchmark training uses the full train-side split for each active benchmark dataset, except for `EuroSAT`, which is handled through a fixed class-balanced split:
 
 - `EuroSAT`: deterministic class-balanced `22000` train and `5000` held-out evaluation samples
-- `Food101`: full `train`, evaluated on `test`
+
 - `Oxford-IIIT Pet`: full `trainval`, evaluated on `test`
 - `GTSRB`: full `train`, evaluated on `test`
-- `Country211`: full `train`, evaluated on `valid`
+
 - `FGVC Aircraft`: full `trainval`, evaluated on `test`
 
-The current federated final probe reports only:
 
-- `EuroSAT`
-- `GTSRB`
-- `Oxford-IIIT Pet`
-- `FGVC Aircraft`
 
 ### Stress Splits
 
@@ -244,7 +220,7 @@ In baseline mode, `main.py` uses the canonical full six-benchmark stage stream a
 5. Preserve the model weights and optimizer state across dataset transitions.
 6. Skip GPAD, prototype exchange, and server aggregation entirely.
 
-This keeps the baseline as the full sequential reference run, while the current federated mode follows the trimmed four-benchmark stream documented above.
+This keeps the baseline as the sequential reference run while matching the same trimmed benchmark schedule used by the current federated mode.
 
 ## Final Linear-Probe Evaluation
 
@@ -328,6 +304,14 @@ The current code keeps the active math path in `float32` and validates device pl
 - Pinned memory is enabled only when the run is actually on CUDA.
 
 The remaining CPU transfers in the code are intentional and are used only for communication payloads, saved histories, and checkpoint export.
+
+
+
+
+
+
+
+
 
 
 

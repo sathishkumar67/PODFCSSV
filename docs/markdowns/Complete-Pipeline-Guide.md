@@ -85,36 +85,19 @@ The continual stream is split into benchmark datasets and stress datasets.
 
 ### Benchmark Datasets
 
-The checked-in repository now uses two benchmark schedules.
+The checked-in repository now uses the same benchmark schedule in both modes.
 
-Baseline benchmark datasets:
-
-- `EuroSAT`
-- `GTSRB`
-- `Food101`
-- `Country211`
-- `Oxford-IIIT Pet`
-- `FGVC Aircraft`
-
-Baseline benchmark schedule:
-
-- Client 0: `EuroSAT -> Food101 -> Oxford-IIIT Pet`
-- Client 1: `GTSRB -> Country211 -> FGVC Aircraft`
-
-Federated benchmark datasets:
+Active benchmark datasets:
 
 - `EuroSAT`
 - `GTSRB`
 - `Oxford-IIIT Pet`
 - `FGVC Aircraft`
 
-Federated benchmark schedule:
+Client benchmark schedule:
 
 - Client 0: `EuroSAT -> Oxford-IIIT Pet`
 - Client 1: `GTSRB -> FGVC Aircraft`
-
-The current federated run intentionally removes the middle `Food101` /
-`Country211` benchmark pair while keeping the remaining stress stages.
 
 ### Stress Datasets
 
@@ -142,32 +125,30 @@ The current federated interleaved order is:
 4. `STL10` vs `CIFAR100`
 5. `Flowers102` vs `DTD`
 
-The current baseline sequential order remains:
+The current baseline sequential order is:
 
 1. `EuroSAT`
 2. `GTSRB`
 3. `CIFAR10`
 4. `SVHN`
-5. `Food101`
-6. `Country211`
+5. `Oxford-IIIT Pet`
+6. `FGVC Aircraft`
 7. `STL10`
 8. `CIFAR100`
-9. `Oxford-IIIT Pet`
-10. `FGVC Aircraft`
-11. `Flowers102`
-12. `DTD`
+9. `Flowers102`
+10. `DTD`
 
 ## 5. Split Policy
 
 ### Benchmark Datasets
 
-Benchmark training uses the full train-side split for each dataset used by the selected mode except `EuroSAT`, which is handled through a fixed class-balanced split:
+Benchmark training uses the full train-side split for each active benchmark dataset except `EuroSAT`, which is handled through a fixed class-balanced split:
 
 - `EuroSAT`: deterministic class-balanced `22000` train and `5000` held-out evaluation samples
-- `Food101`: full `train`, evaluated on `test`
+
 - `Oxford-IIIT Pet`: full `trainval`, evaluated on `test`
 - `GTSRB`: full `train`, evaluated on `test`
-- `Country211`: full `train`, evaluated on `valid`
+
 - `FGVC Aircraft`: full `trainval`, evaluated on `test`
 
 ### Stress Datasets
@@ -333,6 +314,10 @@ The current output folders are:
 
 - federated: `multidataset_outputs_2client`
 - baseline: `baseline_outputs`
+
+
+
+
 
 
 

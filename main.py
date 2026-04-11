@@ -1,4 +1,4 @@
-"""Run the full current PODFCSSV workflow from one file.
+﻿"""Run the full current PODFCSSV workflow from one file.
 
 This module is the active experiment entrypoint for the repository. The file is
 designed to keep the whole pipeline visible in one place so the current
@@ -119,12 +119,12 @@ EUROSAT_TRAIN_SPLIT_SAMPLES = 22000
 EUROSAT_EVAL_SPLIT_SAMPLES = 5000
 
 BENCHMARK_CLIENT_DATASET_SEQUENCE: Dict[int, List[str]] = {
-    0: ["eurosat", "food101", "oxfordiiitpet"],
-    1: ["gtsrb", "country211", "fgvcaircraft"],
+    0: ["eurosat", "oxfordiiitpet"],
+    1: ["gtsrb", "fgvcaircraft"],
 }
 
-# Federated mode intentionally skips the middle benchmark pair so the
-# distributed run no longer depends on the failing Country211 download path.
+# The active benchmark stream intentionally skips the middle benchmark pair so
+# the default runs no longer depend on the failing Country211 download path.
 FEDERATED_BENCHMARK_CLIENT_DATASET_SEQUENCE: Dict[int, List[str]] = {
     0: ["eurosat", "oxfordiiitpet"],
     1: ["gtsrb", "fgvcaircraft"],
@@ -719,13 +719,13 @@ def build_federated_stage_plan(
 
 
 def build_baseline_stage_plan() -> List[Dict[str, Any]]:
-    """Flatten the canonical full benchmark schedule into one sequential order.
+    """Flatten the active trimmed benchmark schedule into one sequential order.
 
-    The baseline intentionally keeps the full benchmark stream, including the
-    middle `Food101` / `Country211` stage. Because it owns only one model, each
-    client-stage dataset becomes its own sequential training stage:
-    1. Reuse the canonical full stage plan.
-    2. Keep benchmark and stress ordering identical to that reference stream.
+    The baseline now follows the same trimmed benchmark stream as the current
+    federated run. Because it owns only one model, each client-stage dataset
+    becomes its own sequential training stage:
+    1. Reuse the active benchmark-plus-stress plan.
+    2. Keep benchmark and stress ordering identical to that shared reference stream.
     3. Flatten each multi-client stage into a one-model sequential list.
     """
     federated_stage_plan = build_federated_stage_plan(dict(MULTI_DATASET_CONFIG))
@@ -2045,14 +2045,14 @@ def plot_baseline_training_history(history: Dict[str, Any], plots_dir: Path) -> 
 def run_baseline_experiment() -> None:
     """Run the sequential continual-learning baseline from start to finish.
 
-    The baseline keeps the same shared backbone and final-probe recipe as the
-    federated run, but retains the full six-dataset benchmark stream while the
-    current federated path skips the middle `Food101` / `Country211` stage. The
+    The baseline keeps the same shared backbone, trimmed benchmark schedule, and
+    final-probe recipe as the current federated run while still removing the
+    federated-specific communication machinery. The
     execution path is:
-    1. resolve the trimmed federated benchmark plan and its final probe list,
+    1. resolve the shared trimmed benchmark plan and its final probe list,
     2. prepare every required training and held-out dataset before training starts,
     3. build one adapter-injected ViT-MAE model,
-    4. walk through the canonical full benchmark-plus-stress stage order,
+    4. walk through the shared trimmed benchmark-plus-stress stage order,
     5. optimize reconstruction loss only,
     6. preserve the model and optimizer state across dataset transitions,
     7. save the finished training checkpoint and histories,
@@ -2274,7 +2274,7 @@ def run_federated_experiment() -> None:
 
     This is the proposed method implemented by the repository. The execution
     path is:
-    1. resolve the trimmed federated benchmark plan and its final probe list,
+    1. resolve the shared trimmed benchmark plan and its final probe list,
     2. prepare every required training and held-out dataset before training starts,
     3. build the shared adapter-injected ViT-MAE backbone and the global
        prototype bank,
@@ -2762,6 +2762,13 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
 
 
 

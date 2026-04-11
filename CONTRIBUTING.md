@@ -57,30 +57,16 @@ python main.py
 
 ### Benchmark Datasets
 
-The checked-in repository now uses two benchmark schedules.
+The checked-in repository now uses the same benchmark schedule in both modes.
 
-Baseline benchmark datasets:
-
-- `EuroSAT`
-- `GTSRB`
-- `Food101`
-- `Country211`
-- `Oxford-IIIT Pet`
-- `FGVC Aircraft`
-
-Baseline benchmark schedule:
-
-- Client 0: `EuroSAT -> Food101 -> Oxford-IIIT Pet`
-- Client 1: `GTSRB -> Country211 -> FGVC Aircraft`
-
-Federated benchmark datasets:
+Active benchmark datasets:
 
 - `EuroSAT`
 - `GTSRB`
 - `Oxford-IIIT Pet`
 - `FGVC Aircraft`
 
-Federated benchmark schedule:
+Client benchmark schedule:
 
 - Client 0: `EuroSAT -> Oxford-IIIT Pet`
 - Client 1: `GTSRB -> FGVC Aircraft`
@@ -115,30 +101,27 @@ Current baseline sequential order:
 2. `GTSRB`
 3. `CIFAR10`
 4. `SVHN`
-5. `Food101`
-6. `Country211`
+5. `Oxford-IIIT Pet`
+6. `FGVC Aircraft`
 7. `STL10`
 8. `CIFAR100`
-9. `Oxford-IIIT Pet`
-10. `FGVC Aircraft`
-11. `Flowers102`
-12. `DTD`
+9. `Flowers102`
+10. `DTD`
 
 ## Split Rules
 
-Benchmark training uses the full train-side split for each dataset used by the selected mode except `EuroSAT`, which uses a fixed class-balanced `22000 / 5000` train-eval split.
+Benchmark training uses the full train-side split for each active benchmark dataset except `EuroSAT`, which uses a fixed class-balanced `22000 / 5000` train-eval split.
 
 Current benchmark evaluation splits:
 
 - `EuroSAT`: deterministic class-balanced held-out `5000`
-- `Food101`: `test`
+
 - `Oxford-IIIT Pet`: `test`
 - `GTSRB`: `test`
-- `Country211`: `valid`
+
 - `FGVC Aircraft`: `test`
 
-The current federated final probe reports only `EuroSAT`, `GTSRB`,
-`Oxford-IIIT Pet`, and `FGVC Aircraft`.
+
 
 Stress datasets are merged into a single self-supervised training pool per dataset:
 
@@ -220,6 +203,11 @@ ruff format .
 ## License
 
 By contributing, you agree that your contributions will be licensed under the [MIT License](LICENSE).
+
+
+
+
+
 
 
 

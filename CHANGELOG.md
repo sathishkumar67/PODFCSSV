@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Training Batch Size** (`main.py`): The shared training batch size used by both federated and baseline modes is now `512`.
 - **Federated Prototype Memory Safety** (`src/client.py`, `main.py`): The checked-in default mode is now `federated`, and stage-start prototype extraction stages temporary embeddings on CPU before K-means so very large datasets do not exhaust GPU memory.
 - **Experimental GPAD Calibration** (`main.py`, `src/loss.py`): The active GPAD settings are now more permissive for experimentation, with `gpad_base_tau = 0.60`, `gpad_lambda_entropy = 0.05`, `merge_threshold = 0.80`, and `k_init_prototypes = 5` so anchored samples have a practical chance to appear.
-- **Federated Benchmark Trim** (`main.py`, `README.md`, `CONTRIBUTING.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Federated mode now removes the `Food101` / `Country211` benchmark stage and evaluates only `EuroSAT`, `GTSRB`, `Oxford-IIIT Pet`, and `FGVC Aircraft`, while baseline keeps the full six-dataset benchmark reference.
+- **Active Benchmark Trim** (`main.py`, `README.md`, `CONTRIBUTING.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Both baseline and federated modes now remove the `Food101` / `Country211` benchmark stage and evaluate only `EuroSAT`, `GTSRB`, `Oxford-IIIT Pet`, and `FGVC Aircraft`.
 
 ### Fixed
 - **DataLoader IPC Exhaustion** (`main.py`): Fixed a `BrokenPipeError` that occurred during long federated rounds on large datasets (like `SVHN`). Training DataLoaders now use `persistent_workers=False` and are recreated from scratch each round to prevent stale inter-process communication state from accumulating under memory pressure. Explicit worker shutdown is also enforced between rounds.
@@ -241,6 +241,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Adapter Injection** (`src/mae_with_adapter.py`): `IBA_Adapter` bottleneck module and `inject_adapters()` for parameter-efficient ViT-MAE fine-tuning.
 - **Main Orchestrator** (`main.py`): Full round-based federated pipeline with `MockViTMAE` for dependency-free testing.
 - **Documentation**: Comprehensive `README.md`, architecture diagrams, and `Complete-Pipeline-Guide.md`.
+
+
 
 
 
