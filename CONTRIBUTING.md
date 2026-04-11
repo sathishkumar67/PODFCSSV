@@ -1,4 +1,4 @@
-# Contributing to PODFCSSV
+﻿# Contributing to PODFCSSV
 
 This guide reflects the current repository workflow. The active pipeline is intentionally centralized in `main.py`, so contributions should preserve that single-source-of-truth design unless a deliberate refactor is planned.
 
@@ -57,7 +57,9 @@ python main.py
 
 ### Benchmark Datasets
 
-These datasets define the core benchmark portion of the continual stream:
+The checked-in repository now uses two benchmark schedules.
+
+Baseline benchmark datasets:
 
 - `EuroSAT`
 - `GTSRB`
@@ -66,10 +68,22 @@ These datasets define the core benchmark portion of the continual stream:
 - `Oxford-IIIT Pet`
 - `FGVC Aircraft`
 
-Benchmark schedule:
+Baseline benchmark schedule:
 
 - Client 0: `EuroSAT -> Food101 -> Oxford-IIIT Pet`
 - Client 1: `GTSRB -> Country211 -> FGVC Aircraft`
+
+Federated benchmark datasets:
+
+- `EuroSAT`
+- `GTSRB`
+- `Oxford-IIIT Pet`
+- `FGVC Aircraft`
+
+Federated benchmark schedule:
+
+- Client 0: `EuroSAT -> Oxford-IIIT Pet`
+- Client 1: `GTSRB -> FGVC Aircraft`
 
 ### Stress Datasets
 
@@ -87,18 +101,32 @@ Stress schedule:
 - Client 0: `CIFAR10 -> STL10 -> Flowers102`
 - Client 1: `SVHN -> CIFAR100 -> DTD`
 
-Full stage order:
+Current federated stage order:
 
 1. `EuroSAT` vs `GTSRB`
 2. `CIFAR10` vs `SVHN`
-3. `Food101` vs `Country211`
+3. `Oxford-IIIT Pet` vs `FGVC Aircraft`
 4. `STL10` vs `CIFAR100`
-5. `Oxford-IIIT Pet` vs `FGVC Aircraft`
-6. `Flowers102` vs `DTD`
+5. `Flowers102` vs `DTD`
+
+Current baseline sequential order:
+
+1. `EuroSAT`
+2. `GTSRB`
+3. `CIFAR10`
+4. `SVHN`
+5. `Food101`
+6. `Country211`
+7. `STL10`
+8. `CIFAR100`
+9. `Oxford-IIIT Pet`
+10. `FGVC Aircraft`
+11. `Flowers102`
+12. `DTD`
 
 ## Split Rules
 
-Benchmark training uses the full train-side split for each dataset except `EuroSAT`, which uses a fixed class-balanced `22000 / 5000` train-eval split.
+Benchmark training uses the full train-side split for each dataset used by the selected mode except `EuroSAT`, which uses a fixed class-balanced `22000 / 5000` train-eval split.
 
 Current benchmark evaluation splits:
 
@@ -108,6 +136,9 @@ Current benchmark evaluation splits:
 - `GTSRB`: `test`
 - `Country211`: `valid`
 - `FGVC Aircraft`: `test`
+
+The current federated final probe reports only `EuroSAT`, `GTSRB`,
+`Oxford-IIIT Pet`, and `FGVC Aircraft`.
 
 Stress datasets are merged into a single self-supervised training pool per dataset:
 
@@ -135,7 +166,7 @@ training loop does not stop later for first-use dataset downloads.
 When editing the pipeline, preserve these expectations unless the change is intentional and fully documented:
 
 - keep `main.py` as the active orchestration entrypoint
-- keep the benchmark and stress streams aligned between baseline and federated modes when comparing final probe accuracy
+- keep the per-mode benchmark and stress streams explicitly documented whenever baseline and federated schedules intentionally diverge
 - keep the active numeric path in `float32`
 - keep device transfers explicit and avoid introducing silent mixed-device math
 - keep adapter-only communication in the federated path
@@ -189,3 +220,8 @@ ruff format .
 ## License
 
 By contributing, you agree that your contributions will be licensed under the [MIT License](LICENSE).
+
+
+
+
+

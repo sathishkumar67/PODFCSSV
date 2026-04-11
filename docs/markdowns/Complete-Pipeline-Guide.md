@@ -1,4 +1,4 @@
-# Complete Pipeline Guide
+﻿# Complete Pipeline Guide
 
 This guide explains the current executable workflow used by the repository. If this guide and the code ever disagree, treat these files as the final source of truth:
 
@@ -85,7 +85,9 @@ The continual stream is split into benchmark datasets and stress datasets.
 
 ### Benchmark Datasets
 
-These datasets define the core benchmark portion of the continual stream:
+The checked-in repository now uses two benchmark schedules.
+
+Baseline benchmark datasets:
 
 - `EuroSAT`
 - `GTSRB`
@@ -94,10 +96,25 @@ These datasets define the core benchmark portion of the continual stream:
 - `Oxford-IIIT Pet`
 - `FGVC Aircraft`
 
-Benchmark client schedules:
+Baseline benchmark schedule:
 
 - Client 0: `EuroSAT -> Food101 -> Oxford-IIIT Pet`
 - Client 1: `GTSRB -> Country211 -> FGVC Aircraft`
+
+Federated benchmark datasets:
+
+- `EuroSAT`
+- `GTSRB`
+- `Oxford-IIIT Pet`
+- `FGVC Aircraft`
+
+Federated benchmark schedule:
+
+- Client 0: `EuroSAT -> Oxford-IIIT Pet`
+- Client 1: `GTSRB -> FGVC Aircraft`
+
+The current federated run intentionally removes the middle `Food101` /
+`Country211` benchmark pair while keeping the remaining stress stages.
 
 ### Stress Datasets
 
@@ -117,20 +134,34 @@ Stress client schedules:
 
 ### Full Stage Order
 
-The current interleaved order is:
+The current federated interleaved order is:
 
 1. `EuroSAT` vs `GTSRB`
 2. `CIFAR10` vs `SVHN`
-3. `Food101` vs `Country211`
+3. `Oxford-IIIT Pet` vs `FGVC Aircraft`
 4. `STL10` vs `CIFAR100`
-5. `Oxford-IIIT Pet` vs `FGVC Aircraft`
-6. `Flowers102` vs `DTD`
+5. `Flowers102` vs `DTD`
+
+The current baseline sequential order remains:
+
+1. `EuroSAT`
+2. `GTSRB`
+3. `CIFAR10`
+4. `SVHN`
+5. `Food101`
+6. `Country211`
+7. `STL10`
+8. `CIFAR100`
+9. `Oxford-IIIT Pet`
+10. `FGVC Aircraft`
+11. `Flowers102`
+12. `DTD`
 
 ## 5. Split Policy
 
 ### Benchmark Datasets
 
-Benchmark training uses the full train-side split for each dataset except `EuroSAT`, which is handled through a fixed class-balanced split:
+Benchmark training uses the full train-side split for each dataset used by the selected mode except `EuroSAT`, which is handled through a fixed class-balanced split:
 
 - `EuroSAT`: deterministic class-balanced `22000` train and `5000` held-out evaluation samples
 - `Food101`: full `train`, evaluated on `test`
@@ -212,18 +243,18 @@ Important continual-learning state that persists across dataset changes on each 
 
 ## 8. Baseline Mode
 
-When `RUN_MODE = "baseline"`, the pipeline keeps the same stage stream but removes all federated machinery:
+When `RUN_MODE = "baseline"`, the pipeline keeps the canonical full six-benchmark stream but removes all federated machinery:
 
 1. Prepare every benchmark, stress, and final-probe dataset before training begins.
 2. Build the same adapter-injected MAE backbone.
-3. Walk through the exact same benchmark-plus-stress stage stream sequentially.
+3. Walk through the full benchmark-plus-stress stage stream sequentially.
 4. Optimize reconstruction loss only.
 5. Preserve the model weights and optimizer state across dataset transitions.
 6. Skip GPAD, prototype exchange, and server aggregation.
 
 ## 9. Final Linear-Probe Evaluation
 
-After the full training stream finishes, both modes evaluate the benchmark datasets through one final linear-probe pass. Those held-out benchmark splits are prepared during startup, so the final probe reuses already prepared datasets instead of triggering late first-use downloads.
+After the full training stream finishes, each mode evaluates only its own benchmark datasets through one final linear-probe pass. Those held-out benchmark splits are prepared during startup, so the final probe reuses already prepared datasets instead of triggering late first-use downloads.
 
 The evaluation path is:
 
@@ -302,3 +333,12 @@ The current output folders are:
 
 - federated: `multidataset_outputs_2client`
 - baseline: `baseline_outputs`
+
+
+
+
+
+
+
+
+

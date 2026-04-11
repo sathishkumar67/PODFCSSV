@@ -123,6 +123,13 @@ BENCHMARK_CLIENT_DATASET_SEQUENCE: Dict[int, List[str]] = {
     1: ["gtsrb", "country211", "fgvcaircraft"],
 }
 
+# Federated mode intentionally skips the middle benchmark pair so the
+# distributed run no longer depends on the failing Country211 download path.
+FEDERATED_BENCHMARK_CLIENT_DATASET_SEQUENCE: Dict[int, List[str]] = {
+    0: ["eurosat", "oxfordiiitpet"],
+    1: ["gtsrb", "fgvcaircraft"],
+}
+
 FEDERATED_RETENTION_NOISE_SEQUENCE: Dict[int, List[str]] = {
     0: ["cifar10", "stl10", "flowers102"],
     1: ["svhn", "cifar100", "dtd"],
@@ -628,33 +635,47 @@ def build_dataset_order_by_stage(
     return dataset_order
 
 
-def build_federated_stage_plan(config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Build the federated stage plan with benchmark and stress stages interleaved.
+def build_federated_stage_plan(
+    config: Dict[str, Any],
+    benchmark_dataset_sequence: Optional[Dict[int, Sequence[str]]] = None,
+    noise_dataset_sequence: Optional[Dict[int, Sequence[str]]] = None,
+) -> List[Dict[str, Any]]:
+    """Build one federated stage plan with benchmark and stress stages interleaved.
 
     The resulting plan alternates between:
     1. benchmark stages,
     2. stress stages that exist only to create extra forgetting pressure, and
-    3. an optional final stress stage after the last benchmark stage when the
-       noise schedule is as long as the benchmark schedule.
+    3. optional trailing stress-only stages after the final benchmark stage when
+       the retained stress schedule is longer than the benchmark schedule.
     """
+    benchmark_sequence_name = (
+        "FEDERATED_BENCHMARK_CLIENT_DATASET_SEQUENCE"
+        if benchmark_dataset_sequence is FEDERATED_BENCHMARK_CLIENT_DATASET_SEQUENCE
+        else "BENCHMARK_CLIENT_DATASET_SEQUENCE"
+    )
     benchmark_sequence = validate_client_dataset_sequence(
-        BENCHMARK_CLIENT_DATASET_SEQUENCE,
+        benchmark_dataset_sequence or BENCHMARK_CLIENT_DATASET_SEQUENCE,
         expected_num_clients=config["num_clients"],
-        sequence_name="BENCHMARK_CLIENT_DATASET_SEQUENCE",
+        sequence_name=benchmark_sequence_name,
     )
     noise_sequence = validate_client_dataset_sequence(
-        FEDERATED_RETENTION_NOISE_SEQUENCE,
+        noise_dataset_sequence or FEDERATED_RETENTION_NOISE_SEQUENCE,
         expected_num_clients=config["num_clients"],
         sequence_name="FEDERATED_RETENTION_NOISE_SEQUENCE",
     )
 
     benchmark_stage_count = len(next(iter(benchmark_sequence.values())))
     noise_stage_count = len(next(iter(noise_sequence.values())))
-    allowed_noise_stage_counts = {max(benchmark_stage_count - 1, 0), benchmark_stage_count}
+    allowed_noise_stage_counts = {
+        max(benchmark_stage_count - 1, 0),
+        benchmark_stage_count,
+        benchmark_stage_count + 1,
+    }
     if noise_stage_count not in allowed_noise_stage_counts:
         raise ValueError(
             "The retention-noise schedule must have either exactly one fewer "
-            "stage than the benchmark schedule or the same number of stages."
+            "stage than the benchmark schedule, the same number of stages, or "
+            "one extra trailing stage."
         )
 
     stage_plan: List[Dict[str, Any]] = []
@@ -680,17 +701,31 @@ def build_federated_stage_plan(config: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "datasets": noise_datasets,
                 }
             )
+    # Keep any remaining stress-only stages when the federated benchmark stream
+    # is shorter than the stress stream, so those datasets still shape the final
+    # checkpoint even after a benchmark pair is intentionally removed.
+    for stage_index in range(benchmark_stage_count, noise_stage_count):
+        noise_datasets = {
+            client_index: noise_sequence[client_index][stage_index]
+            for client_index in sorted(noise_sequence)
+        }
+        stage_plan.append(
+            {
+                "stage_kind": "retention_noise",
+                "datasets": noise_datasets,
+            }
+        )
     return stage_plan
 
 
 def build_baseline_stage_plan() -> List[Dict[str, Any]]:
-    """Flatten the benchmark and stress schedule into one sequential baseline order.
+    """Flatten the canonical full benchmark schedule into one sequential order.
 
-    The baseline sees the same dataset stream as the federated run, but because
-    it owns only one model, each client-stage dataset becomes its own sequential
-    training stage:
-    1. Reuse the validated federated stage plan.
-    2. Keep benchmark and stress ordering identical to the federated stream.
+    The baseline intentionally keeps the full benchmark stream, including the
+    middle `Food101` / `Country211` stage. Because it owns only one model, each
+    client-stage dataset becomes its own sequential training stage:
+    1. Reuse the canonical full stage plan.
+    2. Keep benchmark and stress ordering identical to that reference stream.
     3. Flatten each multi-client stage into a one-model sequential list.
     """
     federated_stage_plan = build_federated_stage_plan(dict(MULTI_DATASET_CONFIG))
@@ -1257,8 +1292,8 @@ def load_named_evaluation_dataset(
     number is based on one consistent split policy:
     1. reuse the repository's fixed `EuroSAT` held-out split,
     2. use the official held-out split for datasets that already define one,
-    3. use `Country211` validation rather than test in the current benchmark,
-       and
+    3. use `Country211` validation rather than test when that dataset is part
+       of the active mode's benchmark list, and
     4. keep any exceptional merge logic for held-out reporting in one place.
     """
     transform = build_dataset_transform(image_size)
@@ -1693,8 +1728,10 @@ def evaluate_datasets(
 ) -> Dict[str, Dict[str, float]]:
     """Run the final frozen-feature linear probe on the requested benchmark datasets.
 
-    The final comparison path is shared by baseline and federated runs and
-    reuses the prepared dataset cache whenever it is available:
+    The final comparison helper is shared by baseline and federated runs, but it
+    only touches the dataset names explicitly requested by the caller. That
+    keeps the final probe aligned with each mode's own benchmark list while it
+    still reuses the prepared dataset cache whenever it is available:
     1. reuse the benchmark train-side split for probe fitting,
     2. reuse the held-out split used for reporting,
     3. extract full-image encoder features with masking disabled,
@@ -2008,13 +2045,14 @@ def plot_baseline_training_history(history: Dict[str, Any], plots_dir: Path) -> 
 def run_baseline_experiment() -> None:
     """Run the sequential continual-learning baseline from start to finish.
 
-    The baseline keeps the same backbone, stage order, and evaluation path as
-    the federated run, but removes the federated-specific machinery. The
+    The baseline keeps the same shared backbone and final-probe recipe as the
+    federated run, but retains the full six-dataset benchmark stream while the
+    current federated path skips the middle `Food101` / `Country211` stage. The
     execution path is:
-    1. resolve the full stage plan and the benchmark probe list,
+    1. resolve the trimmed federated benchmark plan and its final probe list,
     2. prepare every required training and held-out dataset before training starts,
     3. build one adapter-injected ViT-MAE model,
-    4. walk through the same benchmark-plus-stress stage order,
+    4. walk through the canonical full benchmark-plus-stress stage order,
     5. optimize reconstruction loss only,
     6. preserve the model and optimizer state across dataset transitions,
     7. save the finished training checkpoint and histories,
@@ -2236,7 +2274,7 @@ def run_federated_experiment() -> None:
 
     This is the proposed method implemented by the repository. The execution
     path is:
-    1. resolve the full stage plan and the benchmark probe list,
+    1. resolve the trimmed federated benchmark plan and its final probe list,
     2. prepare every required training and held-out dataset before training starts,
     3. build the shared adapter-injected ViT-MAE backbone and the global
        prototype bank,
@@ -2266,11 +2304,14 @@ def run_federated_experiment() -> None:
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
     benchmark_sequence = validate_client_dataset_sequence(
-        BENCHMARK_CLIENT_DATASET_SEQUENCE,
+        FEDERATED_BENCHMARK_CLIENT_DATASET_SEQUENCE,
         expected_num_clients=config["num_clients"],
-        sequence_name="BENCHMARK_CLIENT_DATASET_SEQUENCE",
+        sequence_name="FEDERATED_BENCHMARK_CLIENT_DATASET_SEQUENCE",
     )
-    stage_plan = build_federated_stage_plan(config)
+    stage_plan = build_federated_stage_plan(
+        config,
+        benchmark_dataset_sequence=FEDERATED_BENCHMARK_CLIENT_DATASET_SEQUENCE,
+    )
 
     available_gpu_count = config["gpu_count"]
     if available_gpu_count > config["num_clients"]:
@@ -2721,3 +2762,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+

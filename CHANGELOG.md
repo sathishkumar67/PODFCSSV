@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to this project will be documented in this file.
 
@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **Publishable Benchmark Refresh** (`main.py`): Replaced the earlier small mixed benchmark with `EuroSAT`, `GTSRB`, `Food101`, `Country211`, `Oxford-IIIT Pet`, and `FGVC Aircraft`, all chosen from the supported auto-downloadable paths with held-out evaluation splits.
 - **Full-Split Training Policy** (`main.py`): Benchmark datasets now use their full train-side splits, `EuroSAT` uses a fixed class-balanced `22000/5000` train-eval split, and stress datasets merge all available official splits into one self-supervised training pool.
-- **Stress-Stream Fairness** (`main.py`): The unified baseline now trains through the same stress-dataset stream as the federated mode, and both modes now use the same final benchmark probe list for comparison.
+- **Stress-Stream Fairness** (`main.py`): The unified baseline now trains through the same stress-dataset stream as the federated mode, while the benchmark probe list remains configurable per mode when the research schedule intentionally diverges.
 - **Single-File Workflow** (`main.py`): The standalone evaluation entrypoint has been removed from the active pipeline, and the final comparison logic now lives directly inside the same file as the training modes.
 - **Final-Only Linear-Probe Evaluation** (`main.py`): The active workflow now trains straight through the full continual stream and runs one frozen-feature benchmark linear-probe pass only after training completes.
 - **Final-Only Checkpointing** (`main.py`): Mid-run checkpoint saves have been removed so checkpoints now represent completed experiments rather than partial training snapshots.
@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Training Batch Size** (`main.py`): The shared training batch size used by both federated and baseline modes is now `512`.
 - **Federated Prototype Memory Safety** (`src/client.py`, `main.py`): The checked-in default mode is now `federated`, and stage-start prototype extraction stages temporary embeddings on CPU before K-means so very large datasets do not exhaust GPU memory.
 - **Experimental GPAD Calibration** (`main.py`, `src/loss.py`): The active GPAD settings are now more permissive for experimentation, with `gpad_base_tau = 0.60`, `gpad_lambda_entropy = 0.05`, `merge_threshold = 0.80`, and `k_init_prototypes = 5` so anchored samples have a practical chance to appear.
+- **Federated Benchmark Trim** (`main.py`, `README.md`, `CONTRIBUTING.md`, `docs/markdowns/Complete-Pipeline-Guide.md`): Federated mode now removes the `Food101` / `Country211` benchmark stage and evaluates only `EuroSAT`, `GTSRB`, `Oxford-IIIT Pet`, and `FGVC Aircraft`, while baseline keeps the full six-dataset benchmark reference.
 
 ### Fixed
 - **DataLoader IPC Exhaustion** (`main.py`): Fixed a `BrokenPipeError` that occurred during long federated rounds on large datasets (like `SVHN`). Training DataLoaders now use `persistent_workers=False` and are recreated from scratch each round to prevent stale inter-process communication state from accumulating under memory pressure. Explicit worker shutdown is also enforced between rounds.
@@ -62,36 +63,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.5.5] — 2026-03-14
+## [0.5.5] â€” 2026-03-14
 
 ### Fixed
 - **Aggregation Loop Restoration**: Corrected a `NameError` and logic regression in `FederatedModelServer.aggregate_weights`. Missing `cid` and `client_sd` variables were restored, and the key validation check was fixed to target the correct dictionary keys instead of client indices.
 
-## [0.5.4] — 2026-03-14
+## [0.5.4] â€” 2026-03-14
 
 ### Fixed
 - **Multi-GPU Device Mismatch (Weight Aggregation)**: Resolved a `RuntimeError` in `FederatedModelServer.aggregate_weights` triggered when client updates were submitted from different GPU device IDs. Parameters are now explicitly aligned to a common hardware target before sum-reduction.
 - **Documentation Refactoring**: Integrated researcher-grade commentary into the server and client orchestration modules to clarify topological synchronization and EMA blending dynamics.
 
-## [0.5.3] — 2026-03-14
+## [0.5.3] â€” 2026-03-14
 
 ### Fixed
 - **Multi-GPU Device Mismatch (Prototype Merging)**: Resolved a `RuntimeError` during Round 2+ synchronization where `torch.cat` crashed due to prototypes arriving from different GPU accelerators (`cuda:0` vs `cuda:1`). The `GlobalPrototypeBank` now enforces strict hardware alignment for all incoming tensors before synthesis.
 - **Topological Audit**: Verified and documented all tensor aggregation points (cat/stack) across `src/client.py` and `src/server.py` to ensure hardware safety in distributed environments.
 
-## [0.5.2] — 2026-03-08
+## [0.5.2] â€” 2026-03-08
 
 ### Fixed
 - **Distributed Device Mismatch (FedAvg/EMA)**: Resolved a `RuntimeError: Expected all tensors to be on the same device` occurring during server-side EMA parameter synchronization. Server aggregation now dynamically aligns `old_w` layers to the correct hardware device corresponding to the aggregated payload state.
 - **Client Payload Locality**: Removed unnecessary, aggressive `.cpu()` casts from the training orchestrator (`main.py`) which were coercing multi-GPU topologies into mixed-device CPU collisions. Accelerated client hardware residency is now properly preserved entering the synchronization phase.
 
-## [0.5.1] — 2026-03-07
+## [0.5.1] â€” 2026-03-07
 
 ### Fixed
 - **LaTeX String Formatters**: Converted all docstrings and logging f-strings containing backslashes to raw strings (`r"""`, `fr"..."`). This resolves `SyntaxWarning: invalid escape sequence` alerts triggered by LaTeX math notation ($ \mathbb{D}, \mathcal{L}, \tau $) in modern Python environments.
 - **Verification**: Verified zero warnings via `py_compile` across the core module suite.
 
-## [0.5.0] — 2026-03-07
+## [0.5.0] â€” 2026-03-07
 
 ### Documentation Overhaul for AI Publication
 
@@ -107,12 +108,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.4.0] — 2026-03-02
+## [0.4.0] â€” 2026-03-02
 
 ### Added
 
-- **Adapter Injection in Main Orchestrator** (`main.py`): `main.py` now loads the official `facebook/vit-mae-base` pre-trained checkpoint and calls `inject_adapters()` to freeze the backbone and add trainable IBA adapters. Previously the model was initialised from scratch with all parameters trainable — this was a critical gap between the documented architecture and the actual execution.
-- **`adapter_bottleneck_dim` CONFIG Key** (`main.py`): New hyperparameter (default: 256, range: 32–256) controls the bottleneck dimension of the injected IBA adapters.
+- **Adapter Injection in Main Orchestrator** (`main.py`): `main.py` now loads the official `facebook/vit-mae-base` pre-trained checkpoint and calls `inject_adapters()` to freeze the backbone and add trainable IBA adapters. Previously the model was initialised from scratch with all parameters trainable â€” this was a critical gap between the documented architecture and the actual execution.
+- **`adapter_bottleneck_dim` CONFIG Key** (`main.py`): New hyperparameter (default: 256, range: 32â€“256) controls the bottleneck dimension of the injected IBA adapters.
 - **Round 1 Prototype Concatenation** (`src/server.py`): When the global prototype bank is empty (Round 1), all incoming local prototypes are now concatenated directly into the bank without applying the Merge-or-Add algorithm. From Round 2 onwards the original sequential Merge-or-Add logic is preserved. This ensures the initial global bank captures all client concepts without premature merging.
 
 ### Fixed
@@ -127,15 +128,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Docstring Style Overhaul** (`src/server.py`, `src/client.py`, `src/loss.py`): All module-level, class-level, and method-level docstrings were condensed into a compact, scannable format. Verbose prose was replaced with structured summaries, inline attribute tables, and concise parameter descriptions while retaining all mathematical and algorithmic detail.
 - **CONFIG Defaults Updated** (`main.py`):
-  - `merge_threshold`: 0.7 → **0.15** (ViT-MAE pre-trained features are dense on the unit sphere; a high threshold collapses all prototypes).
-  - `server_ema_alpha`: 0.05 → **0.1**.
-  - `max_global_prototypes`: 50 → **500** (increased capacity for 200-class Tiny ImageNet).
-  - `k_init_prototypes`: 10 → **50**.
-  - `client_local_update_threshold`: 0.6 → **0.2**.
-  - `gpad_base_tau`: 0.5 → **0.4**.
-  - `novelty_k`: 5 → **10** (Range: 3–10).
+  - `merge_threshold`: 0.7 â†’ **0.15** (ViT-MAE pre-trained features are dense on the unit sphere; a high threshold collapses all prototypes).
+  - `server_ema_alpha`: 0.05 â†’ **0.1**.
+  - `max_global_prototypes`: 50 â†’ **500** (increased capacity for 200-class Tiny ImageNet).
+  - `k_init_prototypes`: 10 â†’ **50**.
+  - `client_local_update_threshold`: 0.6 â†’ **0.2**.
+  - `gpad_base_tau`: 0.5 â†’ **0.4**.
+  - `novelty_k`: 5 â†’ **10** (Range: 3â€“10).
 - **Model Architecture Section Removed** (`main.py`): The from-scratch `ViTMAEConfig` initialisation block was replaced with pre-trained loading + adapter injection.
-- **Architecture Log** (`main.py`): The post-init log now reports the percentage of trainable parameters (e.g., "1.09% — frozen backbone") instead of "100% — full end-to-end training".
+- **Architecture Log** (`main.py`): The post-init log now reports the percentage of trainable parameters (e.g., "1.09% â€” frozen backbone") instead of "100% â€” full end-to-end training".
 
 ### Documentation
 
@@ -145,39 +146,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.3.0] — 2026-02-27
+## [0.3.0] â€” 2026-02-27
 
 ### Added
 
 - **New Hyperparameters in CONFIG** (`main.py`): 10 previously hardcoded or missing values are now centralized in the `CONFIG` dictionary with descriptive comments and tuning ranges:
-  - `seed` (42) — Random seed for reproducibility.
-  - `local_epochs` (1) — Number of local training epochs per round. Range: 1–10.
-  - `dataloader_shuffle` (True) — Whether to shuffle the DataLoader between epochs.
-  - `pretrained_model_name` ("facebook/vit-mae-base") — HuggingFace model identifier for the ViT-MAE backbone.
-  - `adapter_dropout` (0.0) — Dropout rate for IBA adapters. Range: 0.0–0.5.
-  - `max_global_prototypes` (50) — Maximum capacity of the global prototype bank. Range: 20–200.
-  - `gpad_soft_assign_temp` (0.1) — Temperature for the soft assignment distribution in GPAD. Range: 0.05–0.5.
-  - `gpad_epsilon` (1e-8) — Numerical epsilon for GPAD loss computation.
-  - `kmeans_max_iters` (100) — Maximum K-Means iterations before forced termination.
-  - `kmeans_tol` (1e-4) — Convergence tolerance for K-Means centroid shift.
+  - `seed` (42) â€” Random seed for reproducibility.
+  - `local_epochs` (1) â€” Number of local training epochs per round. Range: 1â€“10.
+  - `dataloader_shuffle` (True) â€” Whether to shuffle the DataLoader between epochs.
+  - `pretrained_model_name` ("facebook/vit-mae-base") â€” HuggingFace model identifier for the ViT-MAE backbone.
+  - `adapter_dropout` (0.0) â€” Dropout rate for IBA adapters. Range: 0.0â€“0.5.
+  - `max_global_prototypes` (50) â€” Maximum capacity of the global prototype bank. Range: 20â€“200.
+  - `gpad_soft_assign_temp` (0.1) â€” Temperature for the soft assignment distribution in GPAD. Range: 0.05â€“0.5.
+  - `gpad_epsilon` (1e-8) â€” Numerical epsilon for GPAD loss computation.
+  - `kmeans_max_iters` (100) â€” Maximum K-Means iterations before forced termination.
+  - `kmeans_tol` (1e-4) â€” Convergence tolerance for K-Means centroid shift.
 
 - **Global Prototype Bank Capacity** (`src/server.py`): `GlobalPrototypeBank` now accepts a `max_prototypes` parameter. Once the bank reaches this limit, novel prototypes are rejected (merges still occur). This prevents unbounded bank growth in long-running federations.
 
 - **Configurable GPAD Internals** (`src/loss.py`): `GPADLoss` now accepts `soft_assign_temp` and `epsilon` as constructor parameters (previously class-level constants), enabling external control via `CONFIG`.
 
-- **Configurable K-Means** (`src/client.py`): `FederatedClient._kmeans()` now uses `self.kmeans_max_iters` and `self.kmeans_tol` from CONFIG instead of hardcoded values. These parameters are threaded through `ClientManager` → `FederatedClient`.
+- **Configurable K-Means** (`src/client.py`): `FederatedClient._kmeans()` now uses `self.kmeans_max_iters` and `self.kmeans_tol` from CONFIG instead of hardcoded values. These parameters are threaded through `ClientManager` â†’ `FederatedClient`.
 
 ### Changed
 
 - **8 Hyperparameter Defaults Updated** (`main.py`): Based on initial experimentation and tuning guidance, the following defaults were recalibrated:
-  - `k_init_prototypes`: 5 → **10** (Range: 5–50)
-  - `novelty_k`: 20 → **5** (Range: 3–10)
-  - `merge_threshold`: 0.85 → **0.7** (Range: 0.5–0.85)
-  - `gpad_lambda_entropy`: 0.1 → **0.3** (Range: 0.1–0.5)
-  - `client_local_update_threshold`: 0.7 → **0.6** (Range: 0.4–0.8)
-  - `lambda_proto`: 1.0 → **0.01** (Range: 0.001–0.1)
-  - `novelty_buffer_size`: 500 → **256** (Options: 128, 256, 512)
-  - `server_ema_alpha`: 0.1 → **0.05** (Range: 0.01–0.2)
+  - `k_init_prototypes`: 5 â†’ **10** (Range: 5â€“50)
+  - `novelty_k`: 20 â†’ **5** (Range: 3â€“10)
+  - `merge_threshold`: 0.85 â†’ **0.7** (Range: 0.5â€“0.85)
+  - `gpad_lambda_entropy`: 0.1 â†’ **0.3** (Range: 0.1â€“0.5)
+  - `client_local_update_threshold`: 0.7 â†’ **0.6** (Range: 0.4â€“0.8)
+  - `lambda_proto`: 1.0 â†’ **0.01** (Range: 0.001â€“0.1)
+  - `novelty_buffer_size`: 500 â†’ **256** (Options: 128, 256, 512)
+  - `server_ema_alpha`: 0.1 â†’ **0.05** (Range: 0.01â€“0.2)
 
 - **Seed Setup** (`main.py`): Added explicit `torch.manual_seed()` and `torch.cuda.manual_seed_all()` calls based on `CONFIG["seed"]` for reproducibility.
 
@@ -200,17 +201,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.0] — 2026-02-26
+## [0.2.0] â€” 2026-02-26
 
 ### Added
 
-- **Per-Embedding Routing** (`src/client.py`): Three-stage decision tree in `train_epoch` — each embedding is classified as anchored (→ GPAD loss), locally known (→ EMA update), or truly novel (→ novelty buffer).
+- **Per-Embedding Routing** (`src/client.py`): Three-stage decision tree in `train_epoch` â€” each embedding is classified as anchored (â†’ GPAD loss), locally known (â†’ EMA update), or truly novel (â†’ novelty buffer).
 - **Novelty Buffer** (`src/client.py`): Accumulates genuinely unseen embeddings that fail both global and local similarity checks. Triggers fresh K-Means clustering when buffer reaches configurable threshold (`novelty_buffer_size`).
-- **Merge-or-Add Strategy** (`src/client.py`): Buffer clustering centroids are compared against existing local prototypes — merged via EMA if similar (`local_update_threshold`), appended as new prototypes if distinct.
+- **Merge-or-Add Strategy** (`src/client.py`): Buffer clustering centroids are compared against existing local prototypes â€” merged via EMA if similar (`local_update_threshold`), appended as new prototypes if distinct.
 - **Anchor Mask** (`src/loss.py`): New `compute_anchor_mask()` method on `GPADLoss` for per-embedding anchor/non-anchor classification.
-- **Lambda Proto Weighting** (`main.py`, `src/client.py`): Configurable `lambda_proto` scales GPAD loss contribution: `total = MAE + λ × GPAD`.
+- **Lambda Proto Weighting** (`main.py`, `src/client.py`): Configurable `lambda_proto` scales GPAD loss contribution: `total = MAE + Î» Ã— GPAD`.
 - **New Hyperparameters** (`main.py`): `lambda_proto` (1.0), `novelty_buffer_size` (500), `novelty_k` (20) added to CONFIG.
-- **Conditional Orchestration** (`main.py`): Round 1 uses full K-Means via `generate_prototypes()`; Round ≥ 2 uses `get_local_prototypes()` maintained by routing and buffer clustering.
+- **Conditional Orchestration** (`main.py`): Round 1 uses full K-Means via `generate_prototypes()`; Round â‰¥ 2 uses `get_local_prototypes()` maintained by routing and buffer clustering.
 - **`get_local_prototypes()`** (`src/client.py`): Returns current live prototypes without re-clustering.
 - **Project Configuration**: Added `pyproject.toml`, `CONTRIBUTING.md`, `CHANGELOG.md`, `ruff.toml`.
 
@@ -225,12 +226,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`FederatedClient.__init__`**: Accepts new hyperparameters (`lambda_proto`, `novelty_buffer_size`, `novelty_k`).
 - **`ClientManager.__init__`**: Passes through all new hyperparameters to each `FederatedClient` instance.
 - **`train_epoch`**: Fully rewritten for per-embedding routing with anchored/non-anchored branching.
-- **Training Loop** (`main.py`): Split into Round 1 (full K-Means) vs. Round ≥ 2 (live prototype retrieval) paths.
+- **Training Loop** (`main.py`): Split into Round 1 (full K-Means) vs. Round â‰¥ 2 (live prototype retrieval) paths.
 - **`README.md`**: Comprehensive rewrite with routing diagrams, novelty buffer documentation, and complete CONFIG reference tables.
 
 ---
 
-## [0.1.0] — 2025-02-17
+## [0.1.0] â€” 2025-02-17
 
 ### Added
 
@@ -240,4 +241,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Adapter Injection** (`src/mae_with_adapter.py`): `IBA_Adapter` bottleneck module and `inject_adapters()` for parameter-efficient ViT-MAE fine-tuning.
 - **Main Orchestrator** (`main.py`): Full round-based federated pipeline with `MockViTMAE` for dependency-free testing.
 - **Documentation**: Comprehensive `README.md`, architecture diagrams, and `Complete-Pipeline-Guide.md`.
+
+
 

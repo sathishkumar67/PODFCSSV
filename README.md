@@ -1,4 +1,4 @@
-# PODFCSSV
+﻿# PODFCSSV
 
 Prototype-Oriented Distillation for Federated Continual Self-Supervised Vision.
 
@@ -63,7 +63,9 @@ The continual stream is divided into benchmark datasets and stress datasets.
 
 ### Benchmark Datasets
 
-These datasets define the core benchmark portion of the continual stream:
+The checked-in repository now uses two benchmark schedules.
+
+Baseline benchmark datasets:
 
 - `EuroSAT`
 - `GTSRB`
@@ -72,10 +74,25 @@ These datasets define the core benchmark portion of the continual stream:
 - `Oxford-IIIT Pet`
 - `FGVC Aircraft`
 
-Client schedules:
+Baseline benchmark schedule:
 
 - Client 0: `EuroSAT -> Food101 -> Oxford-IIIT Pet`
 - Client 1: `GTSRB -> Country211 -> FGVC Aircraft`
+
+Federated benchmark datasets:
+
+- `EuroSAT`
+- `GTSRB`
+- `Oxford-IIIT Pet`
+- `FGVC Aircraft`
+
+Federated benchmark schedule:
+
+- Client 0: `EuroSAT -> Oxford-IIIT Pet`
+- Client 1: `GTSRB -> FGVC Aircraft`
+
+The current federated run intentionally removes the middle `Food101` /
+`Country211` benchmark pair while keeping the remaining stress stages.
 
 ### Stress Datasets
 
@@ -95,14 +112,28 @@ Stress schedules:
 
 ### Full Stage Order
 
-The current interleaved stage plan is:
+The current federated interleaved stage plan is:
 
 1. `EuroSAT` vs `GTSRB`
 2. `CIFAR10` vs `SVHN`
-3. `Food101` vs `Country211`
+3. `Oxford-IIIT Pet` vs `FGVC Aircraft`
 4. `STL10` vs `CIFAR100`
-5. `Oxford-IIIT Pet` vs `FGVC Aircraft`
-6. `Flowers102` vs `DTD`
+5. `Flowers102` vs `DTD`
+
+The current baseline sequential order remains:
+
+1. `EuroSAT`
+2. `GTSRB`
+3. `CIFAR10`
+4. `SVHN`
+5. `Food101`
+6. `Country211`
+7. `STL10`
+8. `CIFAR100`
+9. `Oxford-IIIT Pet`
+10. `FGVC Aircraft`
+11. `Flowers102`
+12. `DTD`
 
 The stress datasets influence the final checkpoint through training, but they are not part of the final reported linear-probe comparison.
 
@@ -110,7 +141,7 @@ The stress datasets influence the final checkpoint through training, but they ar
 
 ### Benchmark Splits
 
-Benchmark training uses the full train-side split for each dataset, except for `EuroSAT`, which is handled through a fixed class-balanced split:
+Benchmark training uses the full train-side split for each dataset used by the selected mode, except for `EuroSAT`, which is handled through a fixed class-balanced split:
 
 - `EuroSAT`: deterministic class-balanced `22000` train and `5000` held-out evaluation samples
 - `Food101`: full `train`, evaluated on `test`
@@ -118,6 +149,13 @@ Benchmark training uses the full train-side split for each dataset, except for `
 - `GTSRB`: full `train`, evaluated on `test`
 - `Country211`: full `train`, evaluated on `valid`
 - `FGVC Aircraft`: full `trainval`, evaluated on `test`
+
+The current federated final probe reports only:
+
+- `EuroSAT`
+- `GTSRB`
+- `Oxford-IIIT Pet`
+- `FGVC Aircraft`
 
 ### Stress Splits
 
@@ -197,7 +235,7 @@ Current GPAD and prototype settings:
 
 ## Baseline Mode
 
-In baseline mode, `main.py` uses the same benchmark-plus-stress stage order but removes all federated components:
+In baseline mode, `main.py` uses the canonical full six-benchmark stage stream and removes all federated components:
 
 1. Prepare every benchmark, stress, and final-probe dataset before training begins.
 2. Build the same adapter-injected MAE backbone.
@@ -206,11 +244,11 @@ In baseline mode, `main.py` uses the same benchmark-plus-stress stage order but 
 5. Preserve the model weights and optimizer state across dataset transitions.
 6. Skip GPAD, prototype exchange, and server aggregation entirely.
 
-This makes the baseline a direct continual-learning comparison against the federated method under the same stage order.
+This keeps the baseline as the full sequential reference run, while the current federated mode follows the trimmed four-benchmark stream documented above.
 
 ## Final Linear-Probe Evaluation
 
-After the full training stream finishes, the final model is evaluated once on the benchmark datasets only. The held-out benchmark splits used by the probe are already prepared during the startup dataset phase, so the final probe does not need to trigger late first-use downloads.
+After the full training stream finishes, the final model is evaluated once on the benchmark datasets associated with the selected mode only. The held-out benchmark splits used by the probe are already prepared during the startup dataset phase, so the final probe does not need to trigger late first-use downloads.
 
 The current pipeline uses one evaluation view:
 
@@ -241,7 +279,7 @@ The final probe summary currently tracks:
 - per-dataset accuracy
 - per-dataset train sample count
 - per-dataset evaluation sample count
-- average accuracy across the benchmark datasets
+- average accuracy across the benchmark datasets for the active mode
 
 Federated runs also track:
 
@@ -290,3 +328,9 @@ The current code keeps the active math path in `float32` and validates device pl
 - Pinned memory is enabled only when the run is actually on CUDA.
 
 The remaining CPU transfers in the code are intentional and are used only for communication payloads, saved histories, and checkpoint export.
+
+
+
+
+
+
