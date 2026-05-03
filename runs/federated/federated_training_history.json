@@ -1,0 +1,964 @@
+{
+  "round_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "round_times": [
+    96.57070016860962,
+    95.17356395721436,
+    95.88138628005981,
+    2310.997955799103,
+    2315.875370979309,
+    2333.824500799179,
+    82.29091787338257,
+    82.97325253486633,
+    82.29249262809753,
+    401.63629961013794,
+    404.5236921310425,
+    405.7044024467468,
+    54.665590047836304,
+    55.08575940132141,
+    55.065791845321655
+  ],
+  "avg_total_loss": [
+    0.003813941786989256,
+    0.003265541812062538,
+    0.0032155103569775955,
+    0.002342674546936618,
+    0.0022846030176810273,
+    0.002233982288260032,
+    0.01200522533950529,
+    0.011482014146167785,
+    0.011220086964645555,
+    0.006731847835217309,
+    0.006672913331188595,
+    0.00661986824983234,
+    0.014419129642192274,
+    0.014696656638989225,
+    0.014002641662955284
+  ],
+  "avg_mae_loss": [
+    0.0030233566827788873,
+    0.0027842565853710187,
+    0.00277266332297024,
+    0.0021583275378058877,
+    0.0021219163511062406,
+    0.002096728023809419,
+    0.011115628477585102,
+    0.010684641236106733,
+    0.010467174304981848,
+    0.006418883342416451,
+    0.006385905084509335,
+    0.006352251724066496,
+    0.013642879494000226,
+    0.013741373365822557,
+    0.013288196312108386
+  ],
+  "avg_gpad_loss": [
+    0.007905850976872282,
+    0.004812852219868894,
+    0.004428470201590909,
+    0.0018434700336357648,
+    0.00162686671788095,
+    0.0013725425842510603,
+    0.00889596770866774,
+    0.007973728772153015,
+    0.007529127162082919,
+    0.003129644917866094,
+    0.0028700825012957817,
+    0.002676165210930256,
+    0.007762502122204751,
+    0.009552832969347946,
+    0.007144453241683853
+  ],
+  "avg_anchor_fraction": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "avg_local_match_fraction": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "avg_novel_fraction": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "global_prototype_count": [
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10
+  ],
+  "client_prototype_counts": [
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ],
+    [
+      5,
+      5
+    ]
+  ],
+  "upload_bytes": [
+    18984960,
+    18954240,
+    18954240,
+    18984960,
+    18954240,
+    18954240,
+    18984960,
+    18954240,
+    18954240,
+    18984960,
+    18954240,
+    18954240,
+    18984960,
+    18954240,
+    18954240
+  ],
+  "download_bytes": [
+    18984960,
+    18984960,
+    18984960,
+    18984960,
+    18984960,
+    18984960,
+    18984960,
+    18984960,
+    18984960,
+    18984960,
+    18984960,
+    18984960,
+    18984960,
+    18984960,
+    18984960
+  ],
+  "total_communication_bytes": [
+    37969920,
+    37939200,
+    37939200,
+    37969920,
+    37939200,
+    37939200,
+    37969920,
+    37939200,
+    37939200,
+    37969920,
+    37939200,
+    37939200,
+    37969920,
+    37939200,
+    37939200
+  ],
+  "task_classes": [
+    [
+      "eurosat",
+      "gtsrb"
+    ],
+    [
+      "eurosat",
+      "gtsrb"
+    ],
+    [
+      "eurosat",
+      "gtsrb"
+    ],
+    [
+      "cifar10",
+      "svhn"
+    ],
+    [
+      "cifar10",
+      "svhn"
+    ],
+    [
+      "cifar10",
+      "svhn"
+    ],
+    [
+      "oxfordiiitpet",
+      "fgvcaircraft"
+    ],
+    [
+      "oxfordiiitpet",
+      "fgvcaircraft"
+    ],
+    [
+      "oxfordiiitpet",
+      "fgvcaircraft"
+    ],
+    [
+      "stl10",
+      "cifar100"
+    ],
+    [
+      "stl10",
+      "cifar100"
+    ],
+    [
+      "stl10",
+      "cifar100"
+    ],
+    [
+      "flowers102",
+      "dtd"
+    ],
+    [
+      "flowers102",
+      "dtd"
+    ],
+    [
+      "flowers102",
+      "dtd"
+    ]
+  ],
+  "stage_kinds": [
+    "benchmark",
+    "benchmark",
+    "benchmark",
+    "retention_noise",
+    "retention_noise",
+    "retention_noise",
+    "benchmark",
+    "benchmark",
+    "benchmark",
+    "retention_noise",
+    "retention_noise",
+    "retention_noise",
+    "retention_noise",
+    "retention_noise",
+    "retention_noise"
+  ],
+  "client_results": [
+    {
+      "stage": 1,
+      "stage_kind": "benchmark",
+      "stage_round": 1,
+      "dataset_names": [
+        "eurosat",
+        "gtsrb"
+      ],
+      "results": [
+        {
+          "loss": 0.002969508801132094,
+          "mae_loss": 0.002227975442723999,
+          "gpad_loss": 0.00741533356783695,
+          "num_batches": 43.0,
+          "num_samples": 22000.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.004658374772846418,
+          "mae_loss": 0.0038187379228337755,
+          "gpad_loss": 0.008396368385907614,
+          "num_batches": 53.0,
+          "num_samples": 26640.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 1,
+      "stage_kind": "benchmark",
+      "stage_round": 2,
+      "dataset_names": [
+        "eurosat",
+        "gtsrb"
+      ],
+      "results": [
+        {
+          "loss": 0.0024587325372754836,
+          "mae_loss": 0.0019996260444438735,
+          "gpad_loss": 0.004591064592606799,
+          "num_batches": 43.0,
+          "num_samples": 22000.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.004072351086849593,
+          "mae_loss": 0.0035688871262981644,
+          "gpad_loss": 0.005034639847130989,
+          "num_batches": 53.0,
+          "num_samples": 26640.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 1,
+      "stage_kind": "benchmark",
+      "stage_round": 3,
+      "dataset_names": [
+        "eurosat",
+        "gtsrb"
+      ],
+      "results": [
+        {
+          "loss": 0.0024073301641227202,
+          "mae_loss": 0.0019856771632899032,
+          "gpad_loss": 0.00421652986754685,
+          "num_batches": 43.0,
+          "num_samples": 22000.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.00402369054983247,
+          "mae_loss": 0.003559649482650577,
+          "gpad_loss": 0.00464041053563497,
+          "num_batches": 53.0,
+          "num_samples": 26640.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 2,
+      "stage_kind": "retention_noise",
+      "stage_round": 1,
+      "dataset_names": [
+        "cifar10",
+        "svhn"
+      ],
+      "results": [
+        {
+          "loss": 0.003983091817521569,
+          "mae_loss": 0.0036936608948192353,
+          "gpad_loss": 0.002894309121460291,
+          "num_batches": 118.0,
+          "num_samples": 60000.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.0007022572763516665,
+          "mae_loss": 0.0006229941807925405,
+          "gpad_loss": 0.0007926309458112387,
+          "num_batches": 1232.0,
+          "num_samples": 630420.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 2,
+      "stage_kind": "retention_noise",
+      "stage_round": 2,
+      "dataset_names": [
+        "cifar10",
+        "svhn"
+      ],
+      "results": [
+        {
+          "loss": 0.003896441156739148,
+          "mae_loss": 0.00364299383314358,
+          "gpad_loss": 0.002534473349411293,
+          "num_batches": 118.0,
+          "num_samples": 60000.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.0006727648786229064,
+          "mae_loss": 0.0006008388690689016,
+          "gpad_loss": 0.0007192600863506071,
+          "num_batches": 1232.0,
+          "num_samples": 630420.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 2,
+      "stage_kind": "retention_noise",
+      "stage_round": 3,
+      "dataset_names": [
+        "cifar10",
+        "svhn"
+      ],
+      "results": [
+        {
+          "loss": 0.0038135910438278973,
+          "mae_loss": 0.003604765833450197,
+          "gpad_loss": 0.002088251980455687,
+          "num_batches": 118.0,
+          "num_samples": 60000.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.000654373532692167,
+          "mae_loss": 0.0005886902141686402,
+          "gpad_loss": 0.0006568331880464337,
+          "num_batches": 1232.0,
+          "num_samples": 630420.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 3,
+      "stage_kind": "benchmark",
+      "stage_round": 1,
+      "dataset_names": [
+        "oxfordiiitpet",
+        "fgvcaircraft"
+      ],
+      "results": [
+        {
+          "loss": 0.012989059323444963,
+          "mae_loss": 0.012050361139699817,
+          "gpad_loss": 0.009386980615090579,
+          "num_batches": 8.0,
+          "num_samples": 3680.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.011021391355565615,
+          "mae_loss": 0.01018089581547039,
+          "gpad_loss": 0.008404954802244902,
+          "num_batches": 14.0,
+          "num_samples": 6667.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 3,
+      "stage_kind": "benchmark",
+      "stage_round": 2,
+      "dataset_names": [
+        "oxfordiiitpet",
+        "fgvcaircraft"
+      ],
+      "results": [
+        {
+          "loss": 0.012423576437868178,
+          "mae_loss": 0.011542069842107594,
+          "gpad_loss": 0.008815065899398178,
+          "num_batches": 8.0,
+          "num_samples": 3680.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.010540451854467392,
+          "mae_loss": 0.00982721263010587,
+          "gpad_loss": 0.007132391644907849,
+          "num_batches": 14.0,
+          "num_samples": 6667.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 3,
+      "stage_kind": "benchmark",
+      "stage_round": 3,
+      "dataset_names": [
+        "oxfordiiitpet",
+        "fgvcaircraft"
+      ],
+      "results": [
+        {
+          "loss": 0.012118299957364798,
+          "mae_loss": 0.011259648366831243,
+          "gpad_loss": 0.008586516370996833,
+          "num_batches": 8.0,
+          "num_samples": 3680.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.010321873971926314,
+          "mae_loss": 0.009674700243132455,
+          "gpad_loss": 0.0064717379531690055,
+          "num_batches": 14.0,
+          "num_samples": 6667.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 4,
+      "stage_kind": "retention_noise",
+      "stage_round": 1,
+      "dataset_names": [
+        "stl10",
+        "cifar100"
+      ],
+      "results": [
+        {
+          "loss": 0.00996723368645928,
+          "mae_loss": 0.009544183862526222,
+          "gpad_loss": 0.004230498215099333,
+          "num_batches": 221.0,
+          "num_samples": 113000.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.003496461983975339,
+          "mae_loss": 0.0032935828223066813,
+          "gpad_loss": 0.0020287916206328544,
+          "num_batches": 118.0,
+          "num_samples": 60000.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 4,
+      "stage_kind": "retention_noise",
+      "stage_round": 2,
+      "dataset_names": [
+        "stl10",
+        "cifar100"
+      ],
+      "results": [
+        {
+          "loss": 0.009901348943927439,
+          "mae_loss": 0.009507002818874375,
+          "gpad_loss": 0.003943461435952337,
+          "num_batches": 221.0,
+          "num_samples": 113000.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.0034444777184497503,
+          "mae_loss": 0.0032648073501442953,
+          "gpad_loss": 0.0017967035666392264,
+          "num_batches": 118.0,
+          "num_samples": 60000.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 4,
+      "stage_kind": "retention_noise",
+      "stage_round": 3,
+      "dataset_names": [
+        "stl10",
+        "cifar100"
+      ],
+      "results": [
+        {
+          "loss": 0.009837789284023225,
+          "mae_loss": 0.009457226530796262,
+          "gpad_loss": 0.0038056275364837496,
+          "num_batches": 221.0,
+          "num_samples": 113000.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.003401947215641454,
+          "mae_loss": 0.0032472769173367295,
+          "gpad_loss": 0.001546702885376763,
+          "num_batches": 118.0,
+          "num_samples": 60000.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 5,
+      "stage_kind": "retention_noise",
+      "stage_round": 1,
+      "dataset_names": [
+        "flowers102",
+        "dtd"
+      ],
+      "results": [
+        {
+          "loss": 0.01517518621403724,
+          "mae_loss": 0.014674494159407914,
+          "gpad_loss": 0.005006920197047293,
+          "num_batches": 16.0,
+          "num_samples": 8189.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.013663073070347309,
+          "mae_loss": 0.012611264828592539,
+          "gpad_loss": 0.010518084047362208,
+          "num_batches": 12.0,
+          "num_samples": 5640.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 5,
+      "stage_kind": "retention_noise",
+      "stage_round": 2,
+      "dataset_names": [
+        "flowers102",
+        "dtd"
+      ],
+      "results": [
+        {
+          "loss": 0.015080486016813666,
+          "mae_loss": 0.014645950344856828,
+          "gpad_loss": 0.004345356108387932,
+          "num_batches": 16.0,
+          "num_samples": 8189.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.014312827261164784,
+          "mae_loss": 0.012836796386788288,
+          "gpad_loss": 0.01476030983030796,
+          "num_batches": 12.0,
+          "num_samples": 5640.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    },
+    {
+      "stage": 5,
+      "stage_kind": "retention_noise",
+      "stage_round": 3,
+      "dataset_names": [
+        "flowers102",
+        "dtd"
+      ],
+      "results": [
+        {
+          "loss": 0.015018000500276685,
+          "mae_loss": 0.014611712074838579,
+          "gpad_loss": 0.004062884108861908,
+          "num_batches": 16.0,
+          "num_samples": 8189.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        },
+        {
+          "loss": 0.012987282825633883,
+          "mae_loss": 0.011964680549378196,
+          "gpad_loss": 0.010226022374505797,
+          "num_batches": 12.0,
+          "num_samples": 5640.0,
+          "anchored_fraction": 1.0,
+          "local_match_fraction": 0.0,
+          "novel_fraction": 0.0,
+          "buffer_cluster_events": 0.0,
+          "merged_prototypes": 0.0,
+          "added_prototypes": 0.0,
+          "prototype_count": 5.0,
+          "novelty_buffer_size": 0.0
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "dataset_order": [
+    "eurosat",
+    "gtsrb",
+    "oxfordiiitpet",
+    "fgvcaircraft"
+  ],
+  "dataset_results": {
+    "eurosat": {
+      "accuracy": 0.6616,
+      "num_train_samples": 22000,
+      "num_eval_samples": 5000
+    },
+    "gtsrb": {
+      "accuracy": 0.24813935075217736,
+      "num_train_samples": 26640,
+      "num_eval_samples": 12630
+    },
+    "oxfordiiitpet": {
+      "accuracy": 0.11038430089942763,
+      "num_train_samples": 3680,
+      "num_eval_samples": 3669
+    },
+    "fgvcaircraft": {
+      "accuracy": 0.027002700270027002,
+      "num_train_samples": 6667,
+      "num_eval_samples": 3333
+    }
+  },
+  "average_accuracy": 0.261781587980408
+}
