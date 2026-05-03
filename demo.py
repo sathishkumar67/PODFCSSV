@@ -1,25 +1,20 @@
-"""Run single-image reconstruction with the saved baseline and federated adapters.
+"""Run a federated checkpoint reconstruction check for one image.
 
-The script rebuilds the same frozen ViT-MAE-Base backbone used during training,
-loads the adapter-only checkpoints from the ``runs`` folder, and evaluates one
-input image with both final models. For each mode it prints the MAE
-reconstruction loss, prints a full-image MSE for easier comparison, and saves
-the reconstructed image to ``demo_outputs``.
-
-Usage:
-    python demo.py path/to/image.jpg
-    python demo.py path/to/image.jpg --device cuda
+This script keeps the demo intentionally small and terminal-only. It loads the
+federated adapter checkpoint from the `runs` folder, prepares a single image in
+the same image size used by the training pipeline, runs the MAE reconstruction
+forward pass, and prints only the federated reconstruction metrics.
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any
 
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageDraw
+from PIL import Image
 from torchvision import transforms
 from transformers import ViTMAEForPreTraining
 
@@ -27,291 +22,243 @@ from src.mae_with_adapter import inject_adapters
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-RUNS_ROOT = PROJECT_ROOT / "runs"
-OUTPUT_ROOT = PROJECT_ROOT / "demo_outputs"
-
+DEFAULT_CHECKPOINT_PATH = PROJECT_ROOT / "runs" / "federated" / "federated_checkpoint.pt"
 DEFAULT_MODEL_NAME = "facebook/vit-mae-base"
 DEFAULT_IMAGE_SIZE = 224
 DEFAULT_ADAPTER_BOTTLENECK = 256
 
 
-CHECKPOINT_CANDIDATES = {
-    "baseline": [
-        RUNS_ROOT / "baseline" / "baseline_checkpoint.pt",
-        RUNS_ROOT / "baseline" / "checkpoints" / "final_model.pt",
-        PROJECT_ROOT / "baseline_outputs" / "checkpoints" / "final_model.pt",
-    ],
-    "federated": [
-        RUNS_ROOT / "federated" / "federated_checkpoint.pt",
-        RUNS_ROOT / "federated" / "checkpoints" / "final_model.pt",
-        PROJECT_ROOT / "multidataset_outputs_2client" / "checkpoints" / "final_model.pt",
-    ],
-}
-
-
 def parse_args() -> argparse.Namespace:
+    """Collect the image path and optional runtime settings from the terminal."""
+
     parser = argparse.ArgumentParser(
-        description="Reconstruct one image with baseline and federated checkpoints."
+        description="Print federated MAE reconstruction metrics for one image."
     )
     parser.add_argument("image_path", type=Path, help="Path to the input image.")
     parser.add_argument(
-        "--runs-root",
+        "--checkpoint",
         type=Path,
-        default=RUNS_ROOT,
-        help="Root folder containing baseline/federated run outputs.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=OUTPUT_ROOT,
-        help="Folder where reconstructed images will be saved.",
+        default=DEFAULT_CHECKPOINT_PATH,
+        help="Path to the federated checkpoint saved in the runs folder.",
     )
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to run inference on, for example cpu, cuda, or cuda:0.",
+        help="Device used for inference, for example cuda, cuda:0, or cpu.",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Seed used for the MAE random mask during inference.",
+        help="Seed used to make the MAE masking pattern reproducible.",
     )
     return parser.parse_args()
 
 
-def first_existing_path(paths: Iterable[Path]) -> Path:
-    for path in paths:
-        if path.exists():
-            return path
-    candidates = "\n".join(f"  - {path}" for path in paths)
-    raise FileNotFoundError(f"No checkpoint found. Checked:\n{candidates}")
+def load_checkpoint(checkpoint_path: Path) -> dict[str, Any]:
+    """Load the checkpoint while remaining compatible with older PyTorch builds."""
 
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Federated checkpoint not found: {checkpoint_path}")
 
-def load_checkpoint(path: Path, device: torch.device) -> Dict[str, Any]:
     try:
-        checkpoint = torch.load(path, map_location=device, weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     except TypeError:
-        checkpoint = torch.load(path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
     if not isinstance(checkpoint, dict):
-        raise TypeError(f"Expected checkpoint dictionary at {path}, got {type(checkpoint)!r}.")
+        raise TypeError("Checkpoint must be a dictionary saved by the training pipeline.")
+
     return checkpoint
 
 
-def checkpoint_config(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
+def get_checkpoint_config(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Return the serialized training config when it exists."""
+
     config = checkpoint.get("config", {})
-    return config if isinstance(config, dict) else {}
+    if isinstance(config, dict):
+        return config
+    return {}
 
 
-def checkpoint_state_dict(checkpoint: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-    for key in ("model_state_dict", "adapter_state_dict", "state_dict"):
-        state = checkpoint.get(key)
-        if isinstance(state, dict):
-            return state
-    raise KeyError(
-        "Checkpoint does not contain model_state_dict, adapter_state_dict, or state_dict."
-    )
+def get_model_state(checkpoint: dict[str, Any]) -> dict[str, torch.Tensor]:
+    """Extract the adapter model state saved by the federated training run."""
+
+    state = checkpoint.get("model_state_dict")
+    if state is None:
+        state = checkpoint.get("global_model_state_dict")
+    if state is None:
+        state = checkpoint.get("adapter_state_dict")
+    if not isinstance(state, dict):
+        raise KeyError(
+            "Checkpoint does not contain model_state_dict, "
+            "global_model_state_dict, or adapter_state_dict."
+        )
+    return state
 
 
-def build_model_from_checkpoint(
-    checkpoint: Dict[str, Any],
-    device: torch.device,
-) -> ViTMAEForPreTraining:
-    config = checkpoint_config(checkpoint)
+def build_federated_model(checkpoint: dict[str, Any], device: torch.device) -> ViTMAEForPreTraining:
+    """Create the MAE base model, inject adapters, and load federated weights."""
+
+    config = get_checkpoint_config(checkpoint)
     model_name = str(config.get("pretrained_model_name", DEFAULT_MODEL_NAME))
     bottleneck_dim = int(config.get("adapter_bottleneck_dim", DEFAULT_ADAPTER_BOTTLENECK))
 
     model = ViTMAEForPreTraining.from_pretrained(model_name)
-    model = inject_adapters(model, bottleneck_dim=bottleneck_dim)
-    model.load_state_dict(checkpoint_state_dict(checkpoint), strict=False)
+    inject_adapters(model, bottleneck_dim=bottleneck_dim)
+
+    checkpoint_state = get_model_state(checkpoint)
+    if not any("adapter" in key.lower() for key in checkpoint_state):
+        raise RuntimeError("The federated checkpoint does not contain adapter weights.")
+
+    missing_keys, unexpected_keys = model.load_state_dict(checkpoint_state, strict=False)
+    if unexpected_keys:
+        raise RuntimeError(f"Unexpected checkpoint keys: {unexpected_keys}")
+
+    missing_adapter_keys = [key for key in missing_keys if "adapter" in key.lower()]
+    if missing_adapter_keys:
+        raise RuntimeError(f"Missing adapter keys after checkpoint load: {missing_adapter_keys}")
+
     model.to(device=device, dtype=torch.float32)
     model.eval()
     return model
 
 
-def image_size_from_checkpoint(checkpoint: Dict[str, Any]) -> int:
-    config = checkpoint_config(checkpoint)
-    return int(config.get("image_size", DEFAULT_IMAGE_SIZE))
-
-
 def load_image_tensor(image_path: Path, image_size: int, device: torch.device) -> torch.Tensor:
+    """Read one RGB image and convert it to a float32 tensor in the model format."""
+
     if not image_path.exists():
-        raise FileNotFoundError(f"Input image does not exist: {image_path}")
+        raise FileNotFoundError(f"Input image not found: {image_path}")
 
     transform = transforms.Compose(
         [
-            transforms.Lambda(lambda image: image.convert("RGB")),
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
         ]
     )
-    image = Image.open(image_path)
-    tensor = transform(image).unsqueeze(0).to(device=device, dtype=torch.float32)
-    return tensor
+    image = Image.open(image_path).convert("RGB")
+    tensor = transform(image).unsqueeze(0)
+    return tensor.to(device=device, dtype=torch.float32)
 
 
-def unpatchify(logits: torch.Tensor, model: ViTMAEForPreTraining) -> torch.Tensor:
-    patch_size = int(model.config.patch_size)
-    channels = int(model.config.num_channels)
-    num_patches = logits.shape[1]
-    grid_size = int(num_patches**0.5)
-    if grid_size * grid_size != num_patches:
-        raise ValueError(f"Cannot unpatchify {num_patches} patches into a square image.")
+def patchify(images: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Split an image tensor into flattened non-overlapping MAE patches."""
 
-    images = logits.reshape(
-        logits.shape[0],
-        grid_size,
-        grid_size,
+    batch_size, channels, height, width = images.shape
+    if height != width:
+        raise ValueError("MAE reconstruction expects square images.")
+    if height % patch_size != 0:
+        raise ValueError("Image size must be divisible by the model patch size.")
+
+    patches_per_side = height // patch_size
+    patches = images.reshape(
+        batch_size,
+        channels,
+        patches_per_side,
+        patch_size,
+        patches_per_side,
+        patch_size,
+    )
+    patches = patches.permute(0, 2, 4, 3, 5, 1)
+    return patches.reshape(batch_size, patches_per_side * patches_per_side, patch_size**2 * channels)
+
+
+def unpatchify(patches: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Rebuild an image tensor from flattened MAE patch predictions."""
+
+    batch_size, num_patches, patch_dim = patches.shape
+    channels = patch_dim // (patch_size**2)
+    patches_per_side = int(num_patches**0.5)
+    if patches_per_side * patches_per_side != num_patches:
+        raise ValueError("Number of patches must form a square grid.")
+
+    images = patches.reshape(
+        batch_size,
+        patches_per_side,
+        patches_per_side,
         patch_size,
         patch_size,
         channels,
     )
     images = images.permute(0, 5, 1, 3, 2, 4)
     return images.reshape(
-        logits.shape[0],
+        batch_size,
         channels,
-        grid_size * patch_size,
-        grid_size * patch_size,
+        patches_per_side * patch_size,
+        patches_per_side * patch_size,
     )
 
 
-def patchify(images: torch.Tensor, model: ViTMAEForPreTraining) -> torch.Tensor:
-    patch_size = int(model.config.patch_size)
-    channels = int(model.config.num_channels)
-    if images.shape[2] != images.shape[3] or images.shape[2] % patch_size != 0:
-        raise ValueError("Expected square images with side length divisible by patch size.")
-
-    grid_size = images.shape[2] // patch_size
-    patches = images.reshape(
-        images.shape[0],
-        channels,
-        grid_size,
-        patch_size,
-        grid_size,
-        patch_size,
-    )
-    patches = patches.permute(0, 2, 4, 3, 5, 1)
-    return patches.reshape(images.shape[0], grid_size * grid_size, patch_size**2 * channels)
-
-
-def logits_to_image(
-    logits: torch.Tensor,
-    original_image: torch.Tensor,
+def logits_to_reconstruction(
     model: ViTMAEForPreTraining,
+    pixel_values: torch.Tensor,
+    logits: torch.Tensor,
 ) -> torch.Tensor:
+    """Convert MAE patch logits into a full reconstructed image tensor."""
+
+    patch_size = int(model.config.patch_size)
+    predicted_patches = logits.to(dtype=torch.float32)
+
     if bool(getattr(model.config, "norm_pix_loss", False)):
-        target_patches = patchify(original_image, model)
+        target_patches = patchify(pixel_values, patch_size)
         patch_mean = target_patches.mean(dim=-1, keepdim=True)
-        patch_std = target_patches.var(dim=-1, keepdim=True).add(1e-6).sqrt()
-        logits = logits * patch_std + patch_mean
-    return unpatchify(logits, model)
+        patch_var = target_patches.var(dim=-1, keepdim=True)
+        predicted_patches = predicted_patches * (patch_var + 1e-6).sqrt() + patch_mean
 
-
-def tensor_to_pil(image: torch.Tensor) -> Image.Image:
-    image = image.detach().cpu().squeeze(0).clamp(0.0, 1.0)
-    return transforms.ToPILImage()(image)
+    return unpatchify(predicted_patches, patch_size)
 
 
 @torch.inference_mode()
-def run_reconstruction(
-    mode: str,
-    checkpoint_path: Path,
+def run_federated_reconstruction(
     image_path: Path,
-    output_dir: Path,
+    checkpoint_path: Path,
     device: torch.device,
     seed: int,
-) -> Dict[str, Any]:
-    checkpoint = load_checkpoint(checkpoint_path, device)
-    image_size = image_size_from_checkpoint(checkpoint)
-    image = load_image_tensor(image_path, image_size, device)
-    model = build_model_from_checkpoint(checkpoint, device)
+) -> dict[str, Any]:
+    """Run the federated model once and return reconstruction metrics."""
 
     torch.manual_seed(seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
 
-    outputs = model(pixel_values=image)
-    loss = getattr(outputs, "loss", None)
-    logits = getattr(outputs, "logits", None)
-    if loss is None or logits is None:
-        raise RuntimeError(f"{mode} model did not return both loss and logits.")
+    checkpoint = load_checkpoint(checkpoint_path)
+    config = get_checkpoint_config(checkpoint)
+    image_size = int(config.get("image_size", DEFAULT_IMAGE_SIZE))
 
-    reconstruction = logits_to_image(logits, image, model)
-    full_image_mse = F.mse_loss(reconstruction.clamp(0.0, 1.0), image).item()
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{image_path.stem}_{mode}_reconstruction.png"
-    tensor_to_pil(reconstruction).save(output_path)
-
-    del model
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    model = build_federated_model(checkpoint, device)
+    pixel_values = load_image_tensor(image_path, image_size, device)
+    outputs = model(pixel_values=pixel_values)
+    reconstruction = logits_to_reconstruction(model, pixel_values, outputs.logits).clamp(0.0, 1.0)
 
     return {
-        "mode": mode,
-        "checkpoint": checkpoint_path,
-        "loss": float(loss.detach().cpu().item()),
-        "full_image_mse": float(full_image_mse),
-        "reconstruction_path": output_path,
-        "input_tensor": image.detach().cpu(),
-        "reconstruction_tensor": reconstruction.detach().cpu(),
+        "checkpoint": str(checkpoint_path),
+        "image": str(image_path),
+        "device": str(device),
+        "image_size": image_size,
+        "mae_reconstruction_loss": float(outputs.loss.detach().cpu().item()),
+        "full_image_mse": float(F.mse_loss(reconstruction, pixel_values).detach().cpu().item()),
     }
-
-
-def save_comparison_image(results: list[Dict[str, Any]], image_path: Path, output_dir: Path) -> Path:
-    panels: list[tuple[str, Image.Image]] = [
-        ("Input", tensor_to_pil(results[0]["input_tensor"])),
-    ]
-    for result in results:
-        panels.append((result["mode"].title(), tensor_to_pil(result["reconstruction_tensor"])))
-
-    width, height = panels[0][1].size
-    label_height = 30
-    canvas = Image.new("RGB", (width * len(panels), height + label_height), color="white")
-    draw = ImageDraw.Draw(canvas)
-    for index, (label, image) in enumerate(panels):
-        x = index * width
-        canvas.paste(image.convert("RGB"), (x, label_height))
-        draw.text((x + 8, 8), label, fill=(0, 0, 0))
-
-    comparison_path = output_dir / f"{image_path.stem}_baseline_vs_federated.png"
-    canvas.save(comparison_path)
-    return comparison_path
 
 
 def main() -> None:
+    """Print only the federated reconstruction result for the requested image."""
+
     args = parse_args()
     device = torch.device(args.device)
-    checkpoint_paths = {
-        mode: first_existing_path(
-            [
-                args.runs_root / mode / f"{mode}_checkpoint.pt",
-                args.runs_root / mode / "checkpoints" / "final_model.pt",
-                *CHECKPOINT_CANDIDATES[mode],
-            ]
-        )
-        for mode in ("baseline", "federated")
-    }
+    result = run_federated_reconstruction(
+        image_path=args.image_path,
+        checkpoint_path=args.checkpoint,
+        device=device,
+        seed=args.seed,
+    )
 
-    results = []
-    for mode in ("baseline", "federated"):
-        result = run_reconstruction(
-            mode=mode,
-            checkpoint_path=checkpoint_paths[mode],
-            image_path=args.image_path,
-            output_dir=args.output_dir,
-            device=device,
-            seed=args.seed,
-        )
-        results.append(result)
-        print(f"{mode.title()} checkpoint: {result['checkpoint']}")
-        print(f"{mode.title()} MAE reconstruction loss: {result['loss']:.8f}")
-        print(f"{mode.title()} full-image MSE: {result['full_image_mse']:.8f}")
-        print(f"{mode.title()} reconstruction: {result['reconstruction_path']}")
-        print()
-
-    comparison_path = save_comparison_image(results, args.image_path, args.output_dir)
-    print(f"Comparison image: {comparison_path}")
+    print("Federated reconstruction result")
+    print(f"checkpoint: {result['checkpoint']}")
+    print(f"image: {result['image']}")
+    print(f"device: {result['device']}")
+    print(f"image_size: {result['image_size']}")
+    print(f"mae_reconstruction_loss: {result['mae_reconstruction_loss']:.8f}")
+    print(f"full_image_mse: {result['full_image_mse']:.8f}")
 
 
 if __name__ == "__main__":
