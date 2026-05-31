@@ -97,6 +97,15 @@ def get_model_state(checkpoint: dict[str, Any]) -> dict[str, torch.Tensor]:
     return state
 
 
+def build_baseline_model(model_name: str, device: torch.device) -> ViTMAEForPreTraining:
+    """Load the vanilla pretrained MAE without any adapter injection."""
+
+    model = ViTMAEForPreTraining.from_pretrained(model_name)
+    model.to(device=device, dtype=torch.float32)
+    model.eval()
+    return model
+
+
 def build_federated_model(checkpoint: dict[str, Any], device: torch.device) -> ViTMAEForPreTraining:
     """Create the MAE base model, inject adapters, and load federated weights."""
 
@@ -122,6 +131,27 @@ def build_federated_model(checkpoint: dict[str, Any], device: torch.device) -> V
     model.to(device=device, dtype=torch.float32)
     model.eval()
     return model
+
+
+def extract_encoder_features(
+    model: ViTMAEForPreTraining,
+    pixel_values: torch.Tensor,
+) -> torch.Tensor:
+    """Extract mean-pooled encoder features from the MAE backbone.
+
+    The encoder is run without masking so that every patch token contributes.
+    The CLS token (position 0) is excluded from the mean pool to match the
+    standard frozen-feature extraction used in downstream probing.
+    """
+
+    encoder = model.vit
+    # noise=None disables random masking so every patch is encoded
+    vit_outputs = encoder(pixel_values=pixel_values, noise=None)
+    hidden_states = vit_outputs.last_hidden_state  # (B, 1+num_patches, D)
+    # Mean-pool over patch tokens, excluding the CLS token at position 0
+    patch_features = hidden_states[:, 1:, :]  # (B, num_patches, D)
+    pooled = patch_features.mean(dim=1)  # (B, D)
+    return pooled
 
 
 def load_image_tensor(image_path: Path, image_size: int, device: torch.device) -> torch.Tensor:
@@ -215,7 +245,7 @@ def run_federated_reconstruction(
     device: torch.device,
     seed: int,
 ) -> dict[str, Any]:
-    """Run the federated model once and return reconstruction metrics."""
+    """Run both baseline and federated models, return metrics and features."""
 
     torch.manual_seed(seed)
     if device.type == "cuda":
@@ -224,11 +254,23 @@ def run_federated_reconstruction(
     checkpoint = load_checkpoint(checkpoint_path)
     config = get_checkpoint_config(checkpoint)
     image_size = int(config.get("image_size", DEFAULT_IMAGE_SIZE))
+    model_name = str(config.get("pretrained_model_name", DEFAULT_MODEL_NAME))
 
-    model = build_federated_model(checkpoint, device)
+    # --- baseline (vanilla pretrained MAE, no adapters) ---
+    baseline_model = build_baseline_model(model_name, device)
     pixel_values = load_image_tensor(image_path, image_size, device)
-    outputs = model(pixel_values=pixel_values)
-    reconstruction = logits_to_reconstruction(model, pixel_values, outputs.logits).clamp(0.0, 1.0)
+    baseline_features = extract_encoder_features(baseline_model, pixel_values)
+    del baseline_model  # free memory before loading the federated model
+
+    # --- federated (adapters injected + checkpoint loaded) ---
+    federated_model = build_federated_model(checkpoint, device)
+    federated_features = extract_encoder_features(federated_model, pixel_values)
+
+    # reconstruction metrics come from the federated model
+    outputs = federated_model(pixel_values=pixel_values)
+    reconstruction = logits_to_reconstruction(
+        federated_model, pixel_values, outputs.logits
+    ).clamp(0.0, 1.0)
 
     return {
         "checkpoint": str(checkpoint_path),
@@ -237,11 +279,23 @@ def run_federated_reconstruction(
         "image_size": image_size,
         "mae_reconstruction_loss": float(outputs.loss.detach().cpu().item()),
         "full_image_mse": float(F.mse_loss(reconstruction, pixel_values).detach().cpu().item()),
+        "baseline_features": baseline_features.detach().cpu(),
+        "federated_features": federated_features.detach().cpu(),
     }
 
 
+def _print_feature_info(label: str, features: torch.Tensor) -> None:
+    """Print the shape and first 5 feature indices for a feature tensor."""
+
+    print(f"\n{label} features")
+    print(f"  shape: {tuple(features.shape)}")
+    first_five = features[0, :5]  # first sample, first 5 feature dimensions
+    formatted = ", ".join(f"{v:.6f}" for v in first_five.tolist())
+    print(f"  indices [0:5]: [{formatted}]")
+
+
 def main() -> None:
-    """Print only the federated reconstruction result for the requested image."""
+    """Print federated reconstruction metrics and feature shapes."""
 
     args = parse_args()
     device = torch.device(args.device)
@@ -259,6 +313,9 @@ def main() -> None:
     print(f"image_size: {result['image_size']}")
     print(f"mae_reconstruction_loss: {result['mae_reconstruction_loss']:.8f}")
     print(f"full_image_mse: {result['full_image_mse']:.8f}")
+
+    _print_feature_info("Baseline", result["baseline_features"])
+    _print_feature_info("Federated", result["federated_features"])
 
 
 if __name__ == "__main__":
